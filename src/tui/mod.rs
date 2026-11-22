@@ -58,9 +58,11 @@ pub struct Analytics {
 #[derive(Debug, Clone)]
 pub struct SeatRow {
     pub label: String,
+    /// The confirmed account (None while a new login is unconfirmed).
     pub account: Option<String>,
     pub login: Option<String>,
     pub live: usize,
+    pub state: crate::vault::SeatState,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -276,6 +278,15 @@ pub fn record(
     Ok(())
 }
 
+/// Modification times of every seat's credentials and `.claude.json`: two `stat`s per seat.
+fn login_files_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
+    ctx.seats
+        .iter()
+        .flat_map(|s| [s.credentials_file(), s.claude_json.clone()])
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect()
+}
+
 fn reload_seat_info(ctx: &mut Ctx) {
     ctx.seat_info = ctx
         .seats
@@ -289,6 +300,7 @@ fn reload_seat_info(ctx: &mut Ctx) {
             }
         })
         .collect();
+    ctx.drop_unconfirmed();
 }
 
 fn worker(
@@ -348,6 +360,7 @@ fn worker(
     let mut disk_cache: Vec<(String, u64)> = Vec::new();
     let mut tick = 0u64;
     let mut last_full = Instant::now();
+    let mut login_stamp = login_files_stamp(&ctx);
     let mut last_power = Instant::now();
     let mut last_procs = Instant::now() - Duration::from_secs(60);
     let mut slow: Option<(Instant, Vec<Row>, Vec<(String, String, f64)>)> = None;
@@ -372,7 +385,13 @@ fn worker(
         if std::env::var_os("AGENTMANA_DEBUG").is_some() {
             eprintln!("procs {:?} ({} nodes)", tp.elapsed(), ctx.procs.nodes.len());
         }
-        if last_info.elapsed() > Duration::from_secs(20) {
+        // A login file changed (a refresh, a /login, a copied backup): re-read at once.
+        let stamp = login_files_stamp(&ctx);
+        if stamp != login_stamp || last_info.elapsed() > Duration::from_secs(20) {
+            if stamp != login_stamp {
+                wants.lock().unwrap().refresh_analytics = true;
+                login_stamp = stamp;
+            }
             reload_seat_info(&mut ctx);
             last_info = Instant::now();
         }
@@ -539,18 +558,28 @@ fn analytics(
     }
     let mut vault_logins = Vec::new();
     let mut seats = Vec::new();
-    if let Ok(v) = Vault::open(&ctx.dirs.vault_dir()) {
+    let mut states = std::collections::BTreeMap::new();
+    if let Ok(mut v) = Vault::open(&ctx.dirs.vault_dir()) {
+        states = v.seat_states(&ctx.seats).unwrap_or_default();
         vault_logins = v.logins().to_vec();
     }
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
+        let state = states.get(&s.label).cloned().unwrap_or_default();
         seats.push(SeatRow {
             label: s.label.clone(),
-            account: si.account.as_ref().map(|a| a.account_uuid.clone()),
-            login: vault_logins
-                .iter()
-                .find(|l| l.mounted.as_deref() == Some(&s.label))
-                .map(|l| l.label.clone()),
+            account: if state.unverified_since.is_some() {
+                None
+            } else {
+                si.account.as_ref().map(|a| a.account_uuid.clone())
+            },
+            login: state.saved_as.clone().or_else(|| {
+                vault_logins
+                    .iter()
+                    .find(|l| l.mounted.as_deref() == Some(&s.label))
+                    .map(|l| l.label.clone())
+            }),
             live: registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs).len(),
+            state,
         });
     }
     let dbg = std::env::var_os("AGENTMANA_DEBUG").is_some();

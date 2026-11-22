@@ -1577,30 +1577,42 @@ fn vault(f: &mut Frame, app: &App, area: Rect) {
     ))];
     for (i, seat) in app.seats.iter().enumerate() {
         let row = an.seats.iter().find(|r| r.label == seat.label);
-        let login = v
-            .logins
-            .iter()
-            .find(|l| l.mounted.as_deref() == Some(&seat.label))
-            .map(|l| l.label.clone());
+        let state = row.map(|r| r.state.clone()).unwrap_or_default();
+        let login = row.and_then(|r| r.login.clone());
         let account = row.and_then(|r| r.account.clone());
-        let acct_name = account
-            .as_deref()
-            .map(|a| {
-                an.limits
-                    .iter()
-                    .find(|r| r.account_uuid == a)
-                    .map(|r| r.name.clone())
-                    .unwrap_or_else(|| format!("acct-{}", &a[..8.min(a.len())]))
-            })
-            .unwrap_or_else(|| "(logged out)".into());
+        let unconfirmed = state.unverified_since.is_some();
+        let acct_name = match (
+            &state.unverified_since,
+            account.as_deref(),
+            &state.fingerprint,
+        ) {
+            (Some(t), _, _) => format!(
+                "? new login {}",
+                t.with_timezone(&Local).format("%d %b %H:%M")
+            ),
+            (None, Some(a), _) => an
+                .limits
+                .iter()
+                .find(|r| r.account_uuid == a)
+                .map(|r| r.name.clone())
+                .unwrap_or_else(|| format!("acct-{}", &a[..8.min(a.len())])),
+            (None, None, Some(_)) => "(unknown)".into(),
+            (None, None, None) => "(logged out)".into(),
+        };
         let sel = focus_seats && i == v.seat_sel;
         let mut sp = vec![
             Span::styled(if sel { "▸ " } else { "  " }, th.bold(th.accent)),
             Span::styled(fit(&seat.label, 14), th.bold(th.fg)),
-            Span::styled(
-                format!(" {}", fit(login.as_deref().unwrap_or("(not saved)"), 16)),
-                Style::new().fg(if login.is_some() { th.fg } else { th.dim }),
-            ),
+            match (&login, &state.fingerprint) {
+                (Some(l), _) => Span::styled(
+                    format!(" {}", fit(&format!("{l} ✓"), 16)),
+                    Style::new().fg(th.good),
+                ),
+                (None, Some(_)) => {
+                    Span::styled(format!(" {}", fit("not saved", 16)), th.bold(th.warn))
+                }
+                (None, None) => Span::styled(format!(" {}", fit("-", 16)), Style::new().fg(th.dim)),
+            },
             Span::styled(
                 format!(
                     " {}",
@@ -1613,7 +1625,7 @@ fn vault(f: &mut Frame, app: &App, area: Rect) {
                         24
                     )
                 ),
-                Style::new().fg(th.dim),
+                Style::new().fg(if unconfirmed { th.warn } else { th.dim }),
             ),
             Span::raw(" "),
         ];
@@ -1739,10 +1751,10 @@ fn vault(f: &mut Frame, app: &App, area: Rect) {
 
     let hints = match v.focus {
         Focus::Seats => {
-            " ↑↓ seat · → logins · Enter put a login here · c save this seat's login · a add login"
+            " ↑↓ seat · → logins · Enter put a login here · c save this seat's login · a add · R refresh"
         }
         Focus::Logins => {
-            " ↑↓ login · ← seats · Enter put into a seat · r rename · d forget · a add login"
+            " ↑↓ login · ← seats · Enter put into a seat · r rename · d forget · a add · R refresh"
         }
     };
     f.render_widget(

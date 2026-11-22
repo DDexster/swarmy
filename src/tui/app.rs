@@ -246,6 +246,16 @@ impl App {
             }
             Msg::Analytics(a) => {
                 self.limit_alerts(&a);
+                // The worker re-reads the vault with every analytics pass (and at once when a
+                // login file changes), so the VAULT screen follows changes made elsewhere.
+                if self.vault.modal.is_none() {
+                    self.vault.logins = a.logins.clone();
+                    self.vault.loaded = true;
+                    self.vault.login_sel = self
+                        .vault
+                        .login_sel
+                        .min(self.vault.logins.len().saturating_sub(1));
+                }
                 self.analytics = *a;
             }
             Msg::Timeline(k, t) => self.timeline = (k, t),

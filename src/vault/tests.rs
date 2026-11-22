@@ -1,5 +1,6 @@
 //! Vault behaviour on throwaway seats. Never touches a real config dir.
 
+use chrono::Utc;
 use serde_json::{Value, json};
 
 use super::*;
@@ -106,64 +107,94 @@ fn capture_switch_and_back() {
     );
 }
 
+fn write_creds(s: &Seat, access: &str, refresh: &str) {
+    let creds =
+        json!({"mcpOAuth": {}, "claudeAiOauth": {"accessToken": access, "refreshToken": refresh}});
+    std::fs::write(s.credentials_file(), creds.to_string()).unwrap();
+}
+
 #[test]
-fn rotated_tokens_are_taken_back_before_switching() {
+fn a_fresh_access_token_is_followed() {
     let t = tempfile::tempdir().unwrap();
     let work = seat(t.path(), "work");
-    write_seat(&work, "r-alice-1", "alice");
+    write_seat(&work, "r-alice", "alice");
     let mut v = Vault::open(&t.path().join("vault")).unwrap();
     v.capture(&work, Some("alice")).unwrap();
-    let bob = Secret::new(json!({"refreshToken": "r-bob"}));
-    v.put(
-        &bob,
-        Some(json!({"accountUuid": "bob"})),
-        None,
-        Some("bob"),
-        None,
-    )
-    .unwrap();
-
-    // Claude Code refreshes: the refresh token in the seat rotates.
-    write_seat(&work, "r-alice-2", "alice");
-    v.switch(&work, "bob", false).unwrap();
-    let alice = v.find("alice").unwrap();
+    // Claude Code refreshes the access token and keeps the refresh token.
+    write_creds(&work, "acc-new", "r-alice");
+    v.sync(std::slice::from_ref(&work)).unwrap();
+    let alice = v.find("alice").unwrap().clone();
+    assert_eq!(alice.mounted.as_deref(), Some("work"));
     assert_eq!(
-        alice.meta.fingerprint,
-        credentials::fingerprint("r-alice-2"),
-        "the fresh token was saved, not the stale one"
-    );
-    assert_eq!(
-        v.logins().len(),
-        2,
-        "rotation updates the entry instead of adding one"
-    );
-    assert_eq!(
-        v.store.get(&alice.id).unwrap().unwrap().expose()["refreshToken"],
-        "r-alice-2"
+        v.store.get(&alice.id).unwrap().unwrap().expose()["accessToken"],
+        "acc-new"
     );
 }
 
 #[test]
-fn sync_follows_rotation_and_notices_foreign_logins() {
+fn a_new_login_never_overwrites_the_saved_one() {
     let t = tempfile::tempdir().unwrap();
     let work = seat(t.path(), "work");
-    write_seat(&work, "r1", "alice");
+    write_seat(&work, "r-alice", "alice");
     let mut v = Vault::open(&t.path().join("vault")).unwrap();
     v.capture(&work, Some("alice")).unwrap();
-    write_seat(&work, "r2", "alice");
-    v.sync(std::slice::from_ref(&work)).unwrap();
-    assert_eq!(
-        v.find("alice").unwrap().meta.fingerprint,
-        credentials::fingerprint("r2")
+    v.seat_states(std::slice::from_ref(&work)).unwrap();
+    // A backup of another account is copied in; the profile still names alice.
+    write_creds(&work, "acc-bob", "r-bob");
+    let states = v.seat_states(std::slice::from_ref(&work)).unwrap();
+    let st = &states["work"];
+    assert!(
+        st.unverified_since.is_some(),
+        "account not confirmed: {st:?}"
     );
-    // The user ran /login with another account in that seat.
-    write_seat(&work, "r9", "mallory");
-    v.sync(std::slice::from_ref(&work)).unwrap();
-    assert_eq!(v.find("alice").unwrap().mounted, None);
+    assert_eq!(st.account_uuid, None);
+    assert_eq!(st.saved_as, None);
+    let alice = v.find("alice").unwrap().clone();
+    assert_eq!(alice.mounted, None);
     assert_eq!(
-        v.find("alice").unwrap().meta.fingerprint,
-        credentials::fingerprint("r2"),
-        "alice's tokens are kept"
+        v.store.get(&alice.id).unwrap().unwrap().expose()["refreshToken"],
+        "r-alice",
+        "alice keeps her tokens"
+    );
+    // Saving it creates a separate login without borrowing alice's account.
+    v.capture(&work, Some("bob")).unwrap();
+    let bob = v.find("bob").unwrap();
+    assert_eq!(bob.account_uuid, None);
+    assert_eq!(bob.mounted.as_deref(), Some("work"));
+    assert_eq!(v.logins().len(), 2);
+    // Claude Code re-reads the profile: now the account is known.
+    let cj = json!({"oauthAccount": {"accountUuid": "bob", "emailAddress": "bob@example.com", "profileFetchedAt": Utc::now().timestamp_millis()}});
+    std::fs::write(&work.claude_json, cj.to_string()).unwrap();
+    let st = &v.seat_states(std::slice::from_ref(&work)).unwrap()["work"];
+    assert_eq!(st.unverified_since, None);
+    assert_eq!(st.account_uuid.as_deref(), Some("bob"));
+    assert_eq!(st.saved_as.as_deref(), Some("bob"));
+}
+
+#[test]
+fn switching_away_from_an_unsaved_login_keeps_it() {
+    let t = tempfile::tempdir().unwrap();
+    let work = seat(t.path(), "work");
+    write_seat(&work, "r-alice", "alice");
+    let mut v = Vault::open(&t.path().join("vault")).unwrap();
+    v.capture(&work, Some("alice")).unwrap();
+    v.seat_states(std::slice::from_ref(&work)).unwrap();
+    write_creds(&work, "acc-x", "r-unknown");
+    let rep = v.switch(&work, "alice", false).unwrap();
+    assert_eq!(rep.auto_saved.as_deref(), Some("work"));
+    assert_eq!(
+        read_json(&work.credentials_file())["claudeAiOauth"]["refreshToken"],
+        "r-alice"
+    );
+    let kept = v
+        .logins()
+        .iter()
+        .find(|l| l.label == "work")
+        .expect("the unknown login was saved under the seat's name");
+    assert_eq!(kept.account_uuid, None);
+    assert_eq!(
+        v.store.get(&kept.id).unwrap().unwrap().expose()["refreshToken"],
+        "r-unknown"
     );
 }
 

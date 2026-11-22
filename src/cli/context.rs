@@ -61,7 +61,7 @@ impl Ctx {
             });
         }
         config.apply_prices(&mut prices);
-        Ok(Ctx {
+        let mut ctx = Ctx {
             dirs,
             config,
             seats,
@@ -71,7 +71,29 @@ impl Ctx {
             painter,
             mask,
             now: Utc::now(),
-        })
+        };
+        ctx.drop_unconfirmed();
+        Ok(ctx)
+    }
+
+    /// Seats whose current login is not confirmed lose the stale profile, so they are not merged
+    /// into another account and do not borrow its limit reading.
+    pub fn drop_unconfirmed(&mut self) {
+        let Ok(mut v) = crate::vault::Vault::open(&self.dirs.vault_dir()) else {
+            return;
+        };
+        let Ok(states) = v.seat_states(&self.seats) else {
+            return;
+        };
+        for si in &mut self.seat_info {
+            if states
+                .get(&si.label)
+                .is_some_and(|st| st.unverified_since.is_some())
+            {
+                si.account = None;
+                si.utilization = None;
+            }
+        }
     }
 
     /// A context over the demo world only: no discovery, its own index and vault.

@@ -124,7 +124,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     v.sync(&ctx.seats)?;
     let p = &ctx.painter;
     match a.cmd.clone().unwrap_or(AccountsCmd::List) {
-        AccountsCmd::List => list(ctx, &v),
+        AccountsCmd::List => list(ctx, &mut v),
         AccountsCmd::Capture { seat: key, label } => {
             let s = seat(ctx, &key)?;
             match v.capture(s, label.as_deref())? {
@@ -199,6 +199,9 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 rep.from.as_deref().unwrap_or("(nothing)"),
                 p.paint(&rep.to, Tone::Bold)
             );
+            if let Some(saved) = &rep.auto_saved {
+                println!("{}", p.paint(&format!("  the seat's previous login was not in the vault; saved it as '{saved}'"), Tone::Accent));
+            }
             if let Some(b) = rep.backup {
                 println!(
                     "{}",
@@ -269,7 +272,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     }
 }
 
-fn list(ctx: &Ctx, v: &Vault) -> anyhow::Result<()> {
+fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
+    let states = v.seat_states(&ctx.seats)?;
     let p = &ctx.painter;
     println!(
         "{} {}",
@@ -288,10 +292,7 @@ fn list(ctx: &Ctx, v: &Vault) -> anyhow::Result<()> {
         ("LIVE", Align::Right),
     ]);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let login = v
-            .logins()
-            .iter()
-            .find(|l| l.mounted.as_deref() == Some(&s.label));
+        let st = states.get(&s.label).cloned().unwrap_or_default();
         let acct = si.account.as_ref().map(|a| a.account_uuid.clone());
         let w = weekly(ctx, acct.as_deref());
         let (week, tone, resets) = match w {
@@ -309,15 +310,22 @@ fn list(ctx: &Ctx, v: &Vault) -> anyhow::Result<()> {
         };
         t.row(vec![
             Cell::tone(&s.label, Tone::Bold),
-            match login {
-                Some(l) => Cell::new(l.label.clone()),
-                None => Cell::tone("(not saved)", Tone::Dim),
+            match (&st.saved_as, &st.fingerprint) {
+                (Some(l), _) => Cell::tone(format!("{l} ✓"), Tone::Good),
+                (None, Some(_)) => Cell::tone("not saved", Tone::Warn),
+                (None, None) => Cell::tone("-", Tone::Dim),
             },
-            Cell::new(
-                acct.as_deref()
-                    .map(|a| ctx.account_name(a))
-                    .unwrap_or_else(|| "(logged out)".into()),
-            ),
+            match (&st.unverified_since, acct.as_deref()) {
+                (Some(t), _) => Cell::tone(
+                    format!(
+                        "? new login {} (open Claude Code there to confirm)",
+                        t.with_timezone(&Local).format("%d %b %H:%M")
+                    ),
+                    Tone::Warn,
+                ),
+                (None, Some(a)) => Cell::new(ctx.account_name(a)),
+                (None, None) => Cell::tone("(logged out)", Tone::Dim),
+            },
             Cell::tone(week, tone),
             Cell::tone(resets, Tone::Dim),
             Cell::new(live_in(ctx, s).to_string()),

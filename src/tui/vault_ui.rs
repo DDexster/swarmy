@@ -136,6 +136,13 @@ impl App {
                 Tone::Info,
             ),
             Ok(r) => {
+                if let Some(saved) = &r.auto_saved {
+                    self.log_event(
+                        "⚿",
+                        format!("seat {}'s previous login auto-saved as '{saved}'", r.seat),
+                        Tone::Good,
+                    );
+                }
                 self.log_event(
                     "⚿",
                     format!(
@@ -333,6 +340,12 @@ impl App {
                         action: InputAction::Capture(s),
                     });
                 }
+                true
+            }
+            KeyCode::Char('R') => {
+                self.vault_reload();
+                self.request_analytics();
+                self.toast("re-reading seats and logins…", Tone::Info);
                 true
             }
             KeyCode::Char('a') => {

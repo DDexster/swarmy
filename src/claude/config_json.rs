@@ -26,6 +26,8 @@ pub struct Account {
     pub plan: Option<String>,
     pub rate_limit_tier: Option<String>,
     pub billing_type: Option<String>,
+    /// When Claude Code last fetched this profile; a login newer than this is not yet confirmed.
+    pub profile_fetched_at: Option<DateTime<Utc>>,
 }
 
 impl Account {
@@ -45,6 +47,10 @@ impl Account {
             plan: s("planDisplayName").or_else(|| s("seatTier")),
             rate_limit_tier: s("userRateLimitTier").or_else(|| s("organizationRateLimitTier")),
             billing_type: s("billingType"),
+            profile_fetched_at: v
+                .get("profileFetchedAt")
+                .and_then(Value::as_i64)
+                .and_then(|ms| Utc.timestamp_millis_opt(ms).single()),
         })
     }
 }

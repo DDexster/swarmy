@@ -120,10 +120,17 @@ agentmana accounts switch work alice               # and back
 agentmana accounts import old-backup.json --label carol
 ```
 
-A switch first saves the seat's current tokens (Claude Code rotates refresh tokens, so an old copy
-goes stale), backs up both files, writes `claudeAiOauth` atomically while keeping the seat's MCP
-tokens, and restores the account shown by Claude Code. One login is never mounted in two seats
-unless you insist (`--share`): when one of them refreshes, the other breaks.
+A switch first saves whatever the seat holds — a login that is not in the vault yet is saved
+automatically under the seat's name, so switching never loses a token — then backs up both files,
+writes `claudeAiOauth` atomically while keeping the seat's MCP tokens, and restores the account
+shown by Claude Code. One login is never mounted in two seats unless you insist (`--share`).
+
+The vault follows the seats on its own. Claude Code refreshes the access token every few hours and
+keeps the refresh token: the saved copy just takes the new access token. A different refresh token
+means another login (a `/login`, a copied backup): the saved login is left untouched, the seat is
+shown as *not saved*, and — until Claude Code re-reads the profile in that seat — its account as
+*unconfirmed*, so it is not mixed up with the account the stale profile names. In the dashboard the
+VAULT screen updates as soon as a login file changes; `R` forces a re-read.
 
 Secrets are kept in `~/.local/share/agentmana/vault/secrets.json` with mode 0600 — the same
 protection Claude Code gives the same tokens in `.credentials.json`. On macOS, where Claude Code

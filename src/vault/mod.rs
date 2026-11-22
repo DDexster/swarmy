@@ -41,7 +41,35 @@ pub struct Login {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Index {
     logins: Vec<Login>,
+    /// What was last seen in each seat, to tell a token refresh from a new login.
+    #[serde(default)]
+    seats: std::collections::BTreeMap<String, SeatSeen>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct SeatSeen {
+    fingerprint: String,
+    account_uuid: Option<String>,
+    profile_at: Option<DateTime<Utc>>,
+    /// The refresh token changed and Claude Code has not re-read the profile since.
+    unverified_since: Option<DateTime<Utc>>,
+}
+
+/// What a seat holds, as the vault sees it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SeatState {
+    pub fingerprint: Option<String>,
+    /// The account from Claude Code's profile, when it is known to belong to the current login.
+    pub account_uuid: Option<String>,
+    /// The login changed after the profile was read: the account behind it is not known yet.
+    pub unverified_since: Option<DateTime<Utc>>,
+    /// The saved login that holds exactly these tokens.
+    pub saved_as: Option<String>,
+}
+
+/// Refresh tokens are issued for 30 days: a token issued after the profile was read means a new
+/// login the profile does not describe yet.
+const REFRESH_LIFETIME_DAYS: i64 = 30;
 
 pub struct Vault {
     dir: PathBuf,
@@ -53,6 +81,8 @@ pub struct Vault {
 #[derive(Debug, Clone)]
 pub struct SeatLogin {
     pub secret: Option<Secret>,
+    /// When the credentials file was last written.
+    pub written_at: Option<DateTime<Utc>>,
     pub oauth_account: Option<Value>,
     pub account: Option<config_json::Account>,
 }
@@ -74,8 +104,13 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
         }
     };
     let cj = config_json::read(&seat.claude_json).unwrap_or_default();
+    let written_at = std::fs::metadata(seat.credentials_file())
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from);
     Ok(SeatLogin {
         secret,
+        written_at,
         oauth_account: cj.oauth_account_raw,
         account: cj.account,
     })
@@ -235,17 +270,12 @@ impl Vault {
 
     /// Takes the seat's current login into the vault.
     pub fn capture(&mut self, seat: &Seat, label: Option<&str>) -> anyhow::Result<Option<String>> {
+        self.sync(std::slice::from_ref(seat))?;
         let s = read_seat(seat)?;
-        let Some(secret) = s.secret else {
+        let Some(secret) = s.secret.clone() else {
             return Ok(None);
         };
-        let id = self.put(
-            &secret,
-            s.oauth_account,
-            s.account.as_ref(),
-            label,
-            Some(&seat.label),
-        )?;
+        let id = self.save_seat_login(seat, &s, &secret, label)?;
         self.journal(&format!(
             "capture seat={} login={}",
             seat.label,
@@ -254,7 +284,143 @@ impl Vault {
         Ok(Some(id))
     }
 
-    /// Keeps the vault copy of every mounted login current with its seat (tokens rotate).
+    /// Saves the login a seat holds. When the account behind it is not confirmed yet, it is saved
+    /// without one (labelled after the seat), never under the stale profile's name.
+    fn save_seat_login(
+        &mut self,
+        seat: &Seat,
+        s: &SeatLogin,
+        secret: &Secret,
+        label: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let state = self.observe(seat, s);
+        if state.unverified_since.is_some() {
+            let base = label
+                .map(str::to_string)
+                .unwrap_or_else(|| seat.label.clone());
+            let label = if label.is_some() {
+                base
+            } else {
+                self.unique_label(&base)
+            };
+            return self.put(secret, None, None, Some(&label), Some(&seat.label));
+        }
+        // Not in the vault yet and no label given: name it after the seat.
+        let label =
+            match label {
+                Some(l) => Some(l.to_string()),
+                None if !self.index.logins.iter().any(|l| {
+                    l.meta.fingerprint == state.fingerprint.clone().unwrap_or_default()
+                }) =>
+                {
+                    Some(self.unique_label(&seat.label))
+                }
+                None => None,
+            };
+        self.put(
+            secret,
+            s.oauth_account.clone(),
+            s.account.as_ref(),
+            label.as_deref(),
+            Some(&seat.label),
+        )
+    }
+
+    /// Compares a seat with what was seen there before. A new refresh token with no newer
+    /// profile means a new login (or a restored backup) whose account is not known yet.
+    fn observe(&mut self, seat: &Seat, s: &SeatLogin) -> SeatState {
+        let Some(sec) = &s.secret else {
+            self.index.seats.remove(&seat.label);
+            return SeatState::default();
+        };
+        let meta = sec.meta();
+        let fp = meta.fingerprint.clone();
+        let profile_at = s.account.as_ref().and_then(|a| a.profile_fetched_at);
+        let account = s.account.as_ref().map(|a| a.account_uuid.clone());
+        let prev = self.index.seats.get(&seat.label).cloned();
+        let unverified_since = match &prev {
+            // First sight: a refresh token issued after the profile was read is a newer login;
+            // a file written after the profile with an access token already expired at that time
+            // was copied in (Claude Code only writes fresh tokens).
+            None => {
+                let issued = meta
+                    .refresh_expires_at
+                    .map(|t| t - chrono::Duration::days(REFRESH_LIFETIME_DAYS));
+                let copied_in = match (s.written_at, meta.access_expires_at, profile_at) {
+                    (Some(w), Some(exp), Some(p))
+                        if w > p && exp + chrono::Duration::minutes(5) < w =>
+                    {
+                        Some(w)
+                    }
+                    _ => None,
+                };
+                match (issued, profile_at) {
+                    (Some(i), Some(p)) if i > p + chrono::Duration::minutes(10) => Some(i),
+                    _ => copied_in,
+                }
+            }
+            Some(p) if p.fingerprint != fp => {
+                if profile_at > p.profile_at {
+                    None
+                } else {
+                    Some(Utc::now())
+                }
+            }
+            Some(p) => p.unverified_since.filter(|_| profile_at <= p.profile_at),
+        };
+        let seen = SeatSeen {
+            fingerprint: fp.clone(),
+            account_uuid: account.clone(),
+            profile_at: if unverified_since.is_some() {
+                prev.as_ref().and_then(|p| p.profile_at).or(profile_at)
+            } else {
+                profile_at
+            },
+            unverified_since,
+        };
+        if prev.as_ref() != Some(&seen) {
+            self.index.seats.insert(seat.label.clone(), seen);
+            let _ = self.save();
+        }
+        let saved_as = self
+            .index
+            .logins
+            .iter()
+            .find(|l| l.meta.fingerprint == fp)
+            .map(|l| l.label.clone());
+        SeatState {
+            fingerprint: Some(fp),
+            account_uuid: if unverified_since.is_some() {
+                None
+            } else {
+                account
+            },
+            unverified_since,
+            saved_as,
+        }
+    }
+
+    /// The state of every seat (also brings the vault up to date, see `sync`).
+    pub fn seat_states(
+        &mut self,
+        seats: &[Seat],
+    ) -> anyhow::Result<std::collections::BTreeMap<String, SeatState>> {
+        self.sync(seats)?;
+        let mut out = std::collections::BTreeMap::new();
+        for seat in seats {
+            if let Ok(s) = read_seat(seat) {
+                out.insert(seat.label.clone(), self.observe(seat, &s));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Keeps the vault copy of every mounted login current with its seat.
+    ///
+    /// Claude Code refreshes the access token every few hours and keeps the refresh token: the
+    /// saved copy simply takes the new access token. A different refresh token is another login
+    /// (a `/login`, a restored backup): the saved login is left untouched and no longer counts as
+    /// mounted there, so its tokens are never overwritten by someone else's.
     pub fn sync(&mut self, seats: &[Seat]) -> anyhow::Result<()> {
         for seat in seats {
             let Some(mounted) = self
@@ -268,24 +434,27 @@ impl Vault {
             };
             let Ok(s) = read_seat(seat) else { continue };
             match s.secret {
-                Some(sec) if sec.meta().fingerprint != mounted.meta.fingerprint => {
-                    let same_account = match (&s.account, &mounted.account_uuid) {
-                        (Some(a), Some(m)) => a.account_uuid == *m,
-                        _ => true,
-                    };
-                    if same_account {
-                        self.put(
-                            &sec,
-                            s.oauth_account,
-                            s.account.as_ref(),
-                            None,
-                            Some(&seat.label),
-                        )?;
-                    } else if let Some(l) = self.find_mut(&mounted.id) {
-                        // Someone logged in with another account in that seat: it is no longer ours.
+                Some(sec) if sec.meta().fingerprint == mounted.meta.fingerprint => {
+                    // Same grant, maybe a fresher access token: keep the copy current.
+                    if self.store.get(&mounted.id)?.as_ref() != Some(&sec) {
+                        self.store.put(&mounted.id, &sec)?;
+                        if let Some(l) = self.find_mut(&mounted.id) {
+                            l.meta = sec.meta();
+                            l.updated_at = Utc::now();
+                        }
+                        self.save()?;
+                    }
+                }
+                Some(_) => {
+                    // Another login now lives in that seat; ours keeps its own tokens.
+                    if let Some(l) = self.find_mut(&mounted.id) {
                         l.mounted = None;
                         self.save()?;
                     }
+                    self.journal(&format!(
+                        "seat={} has a new login; '{}' kept unchanged",
+                        seat.label, mounted.label
+                    ));
                 }
                 None => {
                     if let Some(l) = self.find_mut(&mounted.id) {
@@ -324,19 +493,26 @@ impl Vault {
         })?;
 
         // 1. Save what the seat holds now.
+        self.sync(std::slice::from_ref(seat))?;
         let before = read_seat(seat)?;
+        let known_before = before.secret.as_ref().is_some_and(|sec| {
+            self.index
+                .logins
+                .iter()
+                .any(|l| l.meta.fingerprint == sec.meta().fingerprint)
+        });
         let previous = match &before.secret {
-            Some(sec) => Some(self.put(
-                sec,
-                before.oauth_account.clone(),
-                before.account.as_ref(),
-                None,
-                Some(&seat.label),
-            )?),
+            Some(sec) => Some(self.save_seat_login(seat, &before, sec, None)?),
             None => None,
         };
+        let auto_saved = previous
+            .as_ref()
+            .filter(|_| !known_before)
+            .and_then(|id| self.index.logins.iter().find(|l| l.id == *id))
+            .map(|l| l.label.clone());
         if previous.as_deref() == Some(target.id.as_str()) {
             return Ok(SwitchReport {
+                auto_saved: None,
                 seat: seat.label.clone(),
                 from: Some(target.label.clone()),
                 to: target.label,
@@ -397,6 +573,7 @@ impl Vault {
             target.label
         ));
         Ok(SwitchReport {
+            auto_saved,
             seat: seat.label.clone(),
             from: from_label,
             to: target.label,
@@ -440,6 +617,8 @@ impl Vault {
 
 #[derive(Debug)]
 pub struct SwitchReport {
+    /// The seat held a login that was not in the vault; it was saved under this label.
+    pub auto_saved: Option<String>,
     pub seat: String,
     pub from: Option<String>,
     pub to: String,
