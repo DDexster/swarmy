@@ -210,7 +210,7 @@ impl Index {
 
         // Tokens and dollars by kind, per model (prices differ).
         let mut st = c.prepare(
-            "SELECT model, SUM(input), SUM(cw5), SUM(cw1h), SUM(cread), SUM(output), SUM(MAX(cost, 0))
+            "SELECT model, SUM(input), SUM(cw5), SUM(cw1h), SUM(cread), SUM(output), TOTAL(cost)
              FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY model",
         )?;
         let day = span.end.date_naive();
@@ -249,7 +249,7 @@ impl Index {
             "SELECT CASE WHEN a.kind = 'main' THEN 'main thread' ELSE COALESCE(a.agent_type, a.kind) END,
                     COUNT(*), SUM(CASE WHEN a.kind != 'main' AND a.finished = 0 THEN 1 ELSE 0 END),
                     AVG(a.last_ts - a.first_ts), SUM(a.last_ts - a.first_ts),
-                    SUM((SELECT SUM(MAX(r.cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id
+                    SUM((SELECT TOTAL(r.cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id
                          AND r.agent_id = a.agent_id AND r.ts >= ?1 AND r.ts < ?2))
              FROM agents a WHERE a.last_ts >= ?1 AND a.first_ts < ?2 GROUP BY 1",
         )?;
@@ -345,7 +345,7 @@ impl Index {
     /// Spend per local day and model (for stacked daily bars).
     pub fn days_by_model(&self, span: Span) -> anyhow::Result<Vec<(String, String, f64)>> {
         let mut st = self.conn.prepare(
-            "SELECT ts / 3600000, model, SUM(MAX(cost, 0)) FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY 1, 2",
+            "SELECT ts / 3600000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY 1, 2",
         )?;
         let mut acc: std::collections::BTreeMap<(String, String), f64> = Default::default();
         for row in st.query_map(params![ms(span.start), ms(span.end)], |r| {

@@ -18,6 +18,14 @@ pub enum WindowKind {
 }
 
 impl WindowKind {
+    /// Every kind; the index's `CHECK` on `readings.kind` is generated from it.
+    pub const ALL: [WindowKind; 4] = [
+        WindowKind::FiveHour,
+        WindowKind::SevenDay,
+        WindowKind::SevenDayOpus,
+        WindowKind::SevenDaySonnet,
+    ];
+
     pub fn from_key(k: &str) -> Option<Self> {
         Some(match k {
             "five_hour" => WindowKind::FiveHour,

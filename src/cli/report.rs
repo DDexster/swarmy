@@ -187,6 +187,9 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     if total.unpriced > 0 {
         println!("{}", p.paint(&format!("! {} requests use models without a known price (counted as $0); see `swarmy prices`", total.unpriced), Tone::Warn));
     }
+    if total.pending > 0 {
+        println!("{}", p.paint(&format!("! {} requests are being priced right now and are not in these totals yet; run again in a moment", total.pending), Tone::Warn));
+    }
     println!(
         "{}",
         p.paint(

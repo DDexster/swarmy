@@ -12,15 +12,18 @@ use super::context::Ctx;
 
 pub fn run(ctx: &Ctx, format: Format) -> anyhow::Result<()> {
     let today = ctx.now.with_timezone(&chrono::Local).date_naive();
+    // Claude Code's prices carry the day the index first saw them.
+    let prices =
+        crate::index::Index::open(&ctx.dirs.index_file())?.dated_prices(&ctx.prices, ctx.now)?;
     let mut models: BTreeMap<String, ()> = BTreeMap::new();
-    for e in ctx.prices.entries() {
+    for e in prices.entries() {
         if !e.model.ends_with('*') {
             models.insert(e.model.clone(), ());
         }
     }
     let rows: Vec<_> = models
         .keys()
-        .filter_map(|m| ctx.prices.lookup(m, today).map(|e| (m.clone(), e.clone())))
+        .filter_map(|m| prices.lookup(m, today).map(|e| (m.clone(), e.clone())))
         .collect();
     if format == Format::Json {
         println!(

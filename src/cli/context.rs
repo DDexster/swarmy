@@ -54,16 +54,16 @@ impl Ctx {
             env_dirs,
             configured: config.seat_paths(&dirs.home),
         });
-        let mut prices = PriceBook::builtin();
         let mut seat_info = Vec::new();
+        let mut caches = Vec::new();
         for s in &seats {
             let (info, costs) = seat_info_of(s, &dirs.data);
-            if let Some(costs) = &costs {
-                prices.merge_claude_code_cache(&s.label, costs);
+            if let Some(costs) = costs {
+                caches.push((s.label.clone(), costs));
             }
             seat_info.push(info);
         }
-        config.apply_prices(&mut prices);
+        let prices = price_book(&caches, &config, Utc::now())?;
         let mut ctx = Ctx {
             dirs,
             config,
@@ -79,6 +79,34 @@ impl Ctx {
         };
         ctx.drop_unconfirmed();
         Ok(ctx)
+    }
+
+    /// Re-reads what every seat says about itself (account, limit readings, Claude Code's cached
+    /// prices) and the `[[price]]` overrides of `config.toml`. The price book is replaced when its
+    /// fingerprint changed, so the next refresh reprices the index with the same book a CLI run
+    /// would build now. Returns whether the prices changed; an invalid config is an error and
+    /// keeps the prices in force.
+    pub fn reload_seat_info(&mut self) -> anyhow::Result<bool> {
+        let mut caches = Vec::new();
+        self.seat_info = self
+            .seats
+            .iter()
+            .map(|s| {
+                let (info, costs) = seat_info_of(s, &self.dirs.data);
+                if let Some(costs) = costs {
+                    caches.push((s.label.clone(), costs));
+                }
+                info
+            })
+            .collect();
+        self.drop_unconfirmed();
+        self.config.price = Config::load(&self.dirs)?.price;
+        let prices = price_book(&caches, &self.config, self.now)?;
+        if prices.fingerprint() == self.prices.fingerprint() {
+            return Ok(false);
+        }
+        self.prices = prices;
+        Ok(true)
     }
 
     /// Seats whose current login is not confirmed lose the stale profile, so they are not merged
@@ -100,7 +128,7 @@ impl Ctx {
                 }
             }
         }
-        let Ok(states) = v.seat_states(&self.seats) else {
+        let Ok(states) = v.edit(|tx| tx.seat_states(&self.seats)) else {
             return;
         };
         for si in &mut self.seat_info {
@@ -122,12 +150,12 @@ impl Ctx {
             config: root.join("swarmy-config"),
             home: base.home,
         };
-        let mut prices = PriceBook::builtin();
         let mut seat_info = Vec::new();
+        let mut caches = Vec::new();
         for s in &seats {
             let cj = config_json::read(&s.claude_json).unwrap_or_default();
-            if let Some(costs) = &cj.model_costs {
-                prices.merge_claude_code_cache(&s.label, costs);
+            if let Some(costs) = cj.model_costs {
+                caches.push((s.label.clone(), costs));
             }
             seat_info.push(SeatInfo {
                 label: s.label.clone(),
@@ -135,9 +163,11 @@ impl Ctx {
                 utilization: cj.utilization,
             });
         }
+        let config = Config::default();
+        let prices = price_book(&caches, &config, Utc::now())?;
         let mut ctx = Ctx {
             dirs,
-            config: Config::default(),
+            config,
             seats,
             seat_info,
             prices,
@@ -298,6 +328,22 @@ impl Ctx {
             None => p.to_string(),
         }
     }
+}
+
+/// The prices in force: the built-in table, Claude Code's cached prices of every seat (in seat
+/// order), then the user's `[[price]]` overrides. The CLI and the dashboard build it the same way,
+/// so they agree on the fingerprint and never reprice the index back and forth.
+pub fn price_book(
+    caches: &[(String, serde_json::Value)],
+    config: &Config,
+    now: DateTime<Utc>,
+) -> anyhow::Result<PriceBook> {
+    let mut prices = PriceBook::builtin();
+    for (seat, costs) in caches {
+        prices.merge_claude_code_cache(seat, costs);
+    }
+    config.apply_prices(&mut prices, now.with_timezone(&chrono::Local).date_naive())?;
+    Ok(prices)
 }
 
 /// What a seat says about itself: its account from `.claude.json`, and its limit readings — the

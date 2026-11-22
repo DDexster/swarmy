@@ -107,8 +107,12 @@ pub struct Row {
     pub label: String,
     pub requests: u64,
     pub usage: Usage,
+    /// USD of the priced requests.
     pub cost: f64,
+    /// Requests of models without a known price (not in `cost`).
     pub unpriced: u64,
+    /// Requests not priced yet: just read, or being repriced by another process (not in `cost`).
+    pub pending: u64,
 }
 
 /// `FROM requests r` with only the joins the other parts of the query refer to: SQLite does not
@@ -176,10 +180,14 @@ fn where_clause(span: Span, f: &Filter, args: &mut Vec<rusqlite::types::Value>) 
     format!("WHERE {}", w.join(" AND "))
 }
 
+/// Request count, token sums, then cost (NULL costs left out), unpriced and pending counts.
 const SUMS: &str = "COUNT(*), SUM(r.input), SUM(r.cw5), SUM(r.cw1h), SUM(r.cread), SUM(r.output), SUM(r.thinking), SUM(r.web),
-  SUM(MAX(r.cost, 0)), SUM(1 - r.priced)";
+  TOTAL(r.cost), SUM(r.priced = 0), SUM(r.priced IS NULL)";
 
-fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<(u64, Usage, f64, u64)> {
+/// (requests, usage, cost, unpriced, pending)
+type Sums = (u64, Usage, f64, u64, u64);
+
+fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Sums> {
     let g = |i: usize| -> rusqlite::Result<u64> {
         Ok(r.get::<_, Option<i64>>(at + i)?.unwrap_or(0) as u64)
     };
@@ -194,13 +202,14 @@ fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<(u64, Usage, f64,
             thinking: g(6)?,
             web_search: g(7)?,
         },
-        r.get::<_, Option<f64>>(at + 8)?.unwrap_or(0.0),
+        r.get::<_, f64>(at + 8)?,
         g(9)?,
+        g(10)?,
     ))
 }
 
-/// One UTC hour: (hour number, requests, usage, cost, unpriced requests).
-type HourRow = (i64, u64, Usage, f64, u64);
+/// One UTC hour: (hour number, requests, usage, cost, unpriced, pending).
+type HourRow = (i64, u64, Usage, f64, u64, u64);
 
 impl Index {
     pub fn spend_by(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
@@ -210,12 +219,12 @@ impl Index {
         let (key, label) = dim.exprs();
         let mut args = Vec::new();
         let wh = where_clause(span, f, &mut args);
-        let order = if dim.is_time() { "1 ASC" } else { "11 DESC" };
+        let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
         let from = from_for(&[key, label, &wh]);
         let sql = format!("SELECT {key}, {label}, {SUMS} {from} {wh} GROUP BY 1 ORDER BY {order}");
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params_from_iter(args), |r| {
-            let (requests, usage, cost, unpriced) = row_usage(r, 2)?;
+            let (requests, usage, cost, unpriced, pending) = row_usage(r, 2)?;
             Ok(Row {
                 key: r.get(0)?,
                 label: r.get(1)?,
@@ -223,6 +232,7 @@ impl Index {
                 usage,
                 cost,
                 unpriced,
+                pending,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -237,8 +247,8 @@ impl Index {
         let sql = format!("SELECT r.ts / 3600000, {SUMS} {from} {wh} GROUP BY 1");
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params_from_iter(args), |r| {
-            let (n, u, c, up) = row_usage(r, 1)?;
-            Ok((r.get::<_, i64>(0)?, n, u, c, up))
+            let (n, u, c, up, pe) = row_usage(r, 1)?;
+            Ok((r.get::<_, i64>(0)?, n, u, c, up, pe))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -254,7 +264,7 @@ impl Index {
 
     fn spend_by_time(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
         let mut acc: BTreeMap<String, Row> = BTreeMap::new();
-        for (h, n, u, c, up) in self.hourly(span, f)? {
+        for (h, n, u, c, up, pe) in self.hourly(span, f)? {
             let k = Self::time_key(dim, h);
             let e = acc.entry(k.clone()).or_insert_with(|| Row {
                 key: k.clone(),
@@ -263,11 +273,13 @@ impl Index {
                 usage: Usage::default(),
                 cost: 0.0,
                 unpriced: 0,
+                pending: 0,
             });
             e.requests += n;
             e.usage.add(&u);
             e.cost += c;
             e.unpriced += up;
+            e.pending += pe;
         }
         Ok(acc.into_values().collect())
     }
@@ -282,7 +294,7 @@ impl Index {
     ) -> anyhow::Result<Vec<(String, String, f64)>> {
         if a.is_time() && b.is_time() {
             let mut acc: BTreeMap<(String, String), f64> = BTreeMap::new();
-            for (h, _, _, c, _) in self.hourly(span, f)? {
+            for (h, _, _, c, _, _) in self.hourly(span, f)? {
                 *acc.entry((Self::time_key(a, h), Self::time_key(b, h)))
                     .or_default() += c;
             }
@@ -298,7 +310,7 @@ impl Index {
             format!("MAX({la})")
         };
         let from = from_for(&[&la, kb, ka, &wh]);
-        let sql = format!("SELECT {la}, {kb}, SUM(MAX(r.cost, 0)) {from} {wh} GROUP BY {ka}, {kb}");
+        let sql = format!("SELECT {la}, {kb}, TOTAL(r.cost) {from} {wh} GROUP BY {ka}, {kb}");
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params_from_iter(args), |r| {
             Ok((
@@ -311,21 +323,17 @@ impl Index {
     }
 
     pub fn total(&self, span: Span, f: &Filter) -> anyhow::Result<Row> {
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
-        let from = from_for(&[&wh]);
-        let sql = format!("SELECT {SUMS} {from} {wh}");
-        Ok(self.conn.query_row(&sql, params_from_iter(args), |r| {
-            let (requests, usage, cost, unpriced) = row_usage(r, 0)?;
-            Ok(Row {
-                key: "total".into(),
-                label: "total".into(),
-                requests,
-                usage,
-                cost,
-                unpriced,
-            })
-        })?)
+        total_on(&self.conn, span, f)
+    }
+
+    /// `total` together with the price fingerprint its costs were computed with, read in one
+    /// snapshot (so a reprice committed in between cannot pair new costs with the old prices).
+    pub fn total_priced(&self, span: Span, f: &Filter) -> anyhow::Result<(Row, Option<String>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let fp = super::schema::meta(&tx, "price_fp")?;
+        let row = total_on(&tx, span, f)?;
+        tx.commit()?;
+        Ok((row, fp))
     }
 
     /// Requests whose model differs from the one asked for.
@@ -398,7 +406,7 @@ impl Index {
     /// (sessions, claude code USD, transcript USD).
     pub fn cost_crosscheck(&self, span: Span) -> anyhow::Result<(u64, f64, f64)> {
         let sql = "SELECT COUNT(*), SUM(cs.total_usd), SUM(t.cost) FROM cost_states cs
-                   JOIN (SELECT seat, session_id, SUM(MAX(cost, 0)) AS cost, MAX(ts) AS last FROM requests GROUP BY 1, 2) t
+                   JOIN (SELECT seat, session_id, TOTAL(cost) AS cost, MAX(ts) AS last FROM requests GROUP BY 1, 2) t
                      ON t.seat = cs.seat AND t.session_id = cs.session_id
                    WHERE t.last >= ?1 AND t.last < ?2";
         Ok(self.conn.query_row(
@@ -464,7 +472,7 @@ impl Index {
             .ceil()
             .max(1.0) as usize;
         let sql = format!(
-            "SELECT (r.ts - {start}) / {bucket}, SUM(MAX(r.cost, 0)) {} {wh} GROUP BY 1",
+            "SELECT (r.ts - {start}) / {bucket}, TOTAL(r.cost) {} {wh} GROUP BY 1",
             from_for(&[&wh])
         );
         let mut st = self.conn.prepare(&sql)?;
@@ -483,4 +491,23 @@ impl Index {
         }
         Ok(out)
     }
+}
+
+fn total_on(conn: &rusqlite::Connection, span: Span, f: &Filter) -> anyhow::Result<Row> {
+    let mut args = Vec::new();
+    let wh = where_clause(span, f, &mut args);
+    let from = from_for(&[&wh]);
+    let sql = format!("SELECT {SUMS} {from} {wh}");
+    Ok(conn.query_row(&sql, params_from_iter(args), |r| {
+        let (requests, usage, cost, unpriced, pending) = row_usage(r, 0)?;
+        Ok(Row {
+            key: "total".into(),
+            label: "total".into(),
+            requests,
+            usage,
+            cost,
+            unpriced,
+            pending,
+        })
+    })?)
 }

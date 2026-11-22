@@ -317,7 +317,7 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
     // 2. Saved logins.
     if !a.remove && !a.no_vault {
         let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
-        let states = v.seat_states(&ctx.seats)?;
+        let states = v.edit(|tx| tx.seat_states(&ctx.seats))?;
         let unsaved: Vec<&Seat> = ctx
             .seats
             .iter()
@@ -340,7 +340,7 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
                     &format!("Save the login of seat '{}' in the vault?", s.label),
                     a.yes,
                 ) {
-                    match v.capture(s, None)? {
+                    match v.edit(|tx| tx.capture(s, None))? {
                         Some(id) => println!(
                             "  {} saved as '{}'",
                             p.paint("✓", Tone::Good),

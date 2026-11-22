@@ -216,9 +216,13 @@ swarmy accounts import old-backup.json --label carol
 ```
 
 A switch first saves whatever the seat holds — a login that is not in the vault yet is saved
-automatically under the seat's name, so switching never loses a token — then backs up both files,
-writes `claudeAiOauth` atomically while keeping the seat's MCP tokens, and restores the account
-shown by Claude Code. One login is never mounted in two seats unless you insist (`--share`).
+automatically under the seat's name, so switching never loses a token — then backs up both files
+(the last 20 per seat, in `vault/backups/seats/<seat>/`), writes `claudeAiOauth` atomically while
+keeping the seat's MCP tokens, and restores the account shown by Claude Code, merged into
+`.claude.json` as Claude Code last wrote it. One login is never mounted in two seats unless you
+insist (`--share`). Every change to the vault holds an OS lock, so a dashboard and a CLI run at the
+same time never lose each other's logins; the vault's own `logins.json` and `secrets.json` are
+backed up before each change (the last 30 of each, in `vault/backups/vault/`). Labels are unique.
 
 The vault follows the seats on its own. Claude Code refreshes the access token every few hours and
 keeps the refresh token: the saved copy just takes the new access token. A different refresh token

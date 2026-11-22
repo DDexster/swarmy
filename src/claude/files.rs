@@ -20,11 +20,15 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    pub fn tag(&self) -> &str {
+    /// Every tag `tag` returns; the index's `CHECK` on `files.kind` and `agents.kind` is
+    /// generated from it.
+    pub const TAGS: [&'static str; 3] = ["main", "subagent", "workflow"];
+
+    pub fn tag(&self) -> &'static str {
         match self {
-            FileKind::Main => "main",
-            FileKind::Subagent => "subagent",
-            FileKind::Workflow(_) => "workflow",
+            FileKind::Main => Self::TAGS[0],
+            FileKind::Subagent => Self::TAGS[1],
+            FileKind::Workflow(_) => Self::TAGS[2],
         }
     }
 }

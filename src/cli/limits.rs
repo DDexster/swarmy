@@ -81,39 +81,52 @@ fn current_window(r: &Reading, now: chrono::DateTime<chrono::Utc>) -> Span {
     w
 }
 
-/// USD per point from every stored reading of this account and window kind (median).
 /// Spend of an account over a span. Spans that ended more than five minutes ago do not change,
-/// so they are remembered for the life of the process (the dashboard asks every few seconds).
+/// so they are remembered for the life of the process (the dashboard asks every few seconds),
+/// keyed by the index file and the price fingerprint the costs were computed with: a reprice
+/// (here or in another process) is never cached away, and a total with requests still waiting
+/// for a price is not remembered at all.
 fn total_cached(idx: &Index, account: &str, span: Span) -> anyhow::Result<f64> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    type Memo = Mutex<HashMap<(String, i64, i64), f64>>;
-    static MEMO: OnceLock<Memo> = OnceLock::new();
-    let key = (
-        account.to_string(),
-        span.start.timestamp_millis(),
-        span.end.timestamp_millis(),
-    );
+    type Key = (String, String, String, i64, i64);
+    static MEMO: OnceLock<Mutex<HashMap<Key, f64>>> = OnceLock::new();
     let settled = span.end < chrono::Utc::now() - Duration::minutes(5);
+    let key = |fp: &str| {
+        (
+            idx.path().unwrap_or(":memory:").to_string(),
+            fp.to_string(),
+            account.to_string(),
+            span.start.timestamp_millis(),
+            span.end.timestamp_millis(),
+        )
+    };
     let memo = MEMO.get_or_init(Default::default);
-    if settled && let Some(v) = memo.lock().unwrap().get(&key) {
+    if settled
+        && let Some(fp) = idx.meta("price_fp")?
+        && let Some(v) = memo.lock().unwrap().get(&key(&fp))
+    {
         return Ok(*v);
     }
     let filter = Filter {
         account: Some(account.to_string()),
         ..Default::default()
     };
-    let v = idx.total(span, &filter)?.cost;
-    if settled {
+    let (row, fp) = idx.total_priced(span, &filter)?;
+    if settled
+        && row.pending == 0
+        && let Some(fp) = fp
+    {
         let mut m = memo.lock().unwrap();
         if m.len() > 4096 {
             m.clear();
         }
-        m.insert(key, v);
+        m.insert(key(&fp), row.cost);
     }
-    Ok(v)
+    Ok(row.cost)
 }
 
+/// USD per point from every stored reading of this account and window kind (median).
 pub fn own_usd_per_point(idx: &Index, account: &str, r: &Reading) -> anyhow::Result<Option<f64>> {
     let mut samples = Vec::new();
     let mut history = idx.readings(account, r.kind)?;
@@ -565,5 +578,119 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
     }
     for line in t.render(p).lines() {
         println!("    {line}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::procs::ProcTable;
+    use crate::config::{Config, Dirs};
+    use crate::core::pricing::PriceBook;
+    use crate::index::SeatInfo;
+    use crate::index::scenarios::{World, account, assistant, at, owner, weekly};
+    use crate::ui::style::{ColorChoice, Painter};
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn a_weekly_window_by_hand() {
+        // Account acc-a on seat "work", Claude Sonnet 5.5 ($2 per MTok of input), so 500 000
+        // input tokens cost $1. The week runs 11-17 00:00 → 11-24 00:00 (UTC).
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        let req = |id: &str, ts: &str, cwd: &str, usd: u64| {
+            assistant(id, ts, m, cwd, (usd * 500_000, 0), &[])
+        };
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                req("q1", "2026-11-17T06:00:00Z", "/w/shop", 4),
+                req("q2", "2026-11-19T06:00:00Z", "/w/shop", 6),
+                req("q3", "2026-11-19T08:00:00Z", "/w/docs", 4),
+                req("q4", "2026-11-20T06:00:00Z", "/w/docs", 2),
+                req("q5", "2026-11-20T11:30:00Z", "/w/shop", 3),
+            ],
+        );
+        let resets = "2026-11-24T00:00:00Z";
+        let seat = |used: f64, fetched: &str| SeatInfo {
+            label: "work".into(),
+            account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            utilization: Some(weekly("acc-a", fetched, used, resets)),
+        };
+        // Two readings stored over time: 10% at 11-18 00:00, 30% at 11-20 00:00.
+        let mut idx = w.index("i.sqlite");
+        w.refresh(
+            &mut idx,
+            &[seat(10.0, "2026-11-18T00:00:00Z")],
+            &PriceBook::builtin(),
+        );
+        let now_seat = seat(30.0, "2026-11-20T00:00:00Z");
+        w.refresh(
+            &mut idx,
+            std::slice::from_ref(&now_seat),
+            &PriceBook::builtin(),
+        );
+        let reading = now_seat.utilization.as_ref().unwrap().readings[0];
+        let ctx = Ctx {
+            dirs: Dirs {
+                data: w.dir.path().join("data"),
+                config: w.dir.path().join("config"),
+                home: w.dir.path().to_path_buf(),
+            },
+            config: Config::default(),
+            seats: w.seats.clone(),
+            seat_info: vec![now_seat],
+            prices: PriceBook::builtin(),
+            procs: ProcTable::empty(),
+            painter: Painter::new(ColorChoice::Never),
+            mask: false,
+            now: at("2026-11-20T12:00:00Z"),
+            login_labels: Default::default(),
+            login_tiers: Default::default(),
+        };
+        let rep = analyze(&ctx, &idx, "acc-a", None, &[reading], &HashMap::new()).unwrap();
+        let win = &rep.windows[0];
+        assert!(!win.reset_passed);
+        assert_eq!(win.window.start, at("2026-11-17T00:00:00Z"));
+        assert_eq!(win.manual_reset, None);
+        // $/point per reading, from the window start to the reading:
+        //   10% at 11-18: q1 = $4            → 0.4
+        //   30% at 11-20: q1 + q2 + q3 = $14 → 14/30
+        // median of the two = (12/30 + 14/30) / 2 = 13/30.
+        let upp = 13.0 / 30.0;
+        assert!(close(win.own_usd_per_point.unwrap(), upp));
+        assert!(close(win.usd_per_point.unwrap(), upp));
+        assert_eq!(win.reference, None);
+        // Now: 30 + (q4 + q5 = $5) / (13/30) = 30 + 150/13 = 540/13 ≈ 41.54%.
+        assert!(
+            close(win.estimate_now, 540.0 / 13.0),
+            "{}",
+            win.estimate_now
+        );
+        // In the window: 4 + 6 + 4 + 2 + 3 = $19; that explains 570/13 points, more than the
+        // estimate, so everything is visible here and nothing comes from elsewhere.
+        assert!(close(win.cost_in_window, 19.0));
+        assert!(close(win.visible_points.unwrap(), 540.0 / 13.0));
+        assert!(close(win.outside_points.unwrap(), 0.0));
+        // Burn over the last hour: q5 = $3/h → 3 / (13/30) = 90/13 points per hour.
+        assert!(close(win.burn_usd_per_hour, 3.0));
+        assert!(close(win.points_per_hour.unwrap(), 90.0 / 13.0));
+        // Empty in (100 − 540/13) / (90/13) = 760/90 h = 30 400 s, before the reset.
+        let eta = win.eta_seconds.unwrap();
+        assert!((30_399..=30_400).contains(&eta), "{eta}");
+        // A full window ≈ 100 × 13/30 = $43.33.
+        assert!(close(win.window_usd.unwrap(), 1300.0 / 30.0));
+        // Shares of the visible 540/13 points: shop $13 of $19, docs $6 of $19.
+        assert_eq!(win.shares.len(), 2);
+        assert_eq!(win.shares[0].key, "shop");
+        assert!(close(win.shares[0].cost, 13.0));
+        assert!(close(win.shares[0].limit_points, 540.0 / 19.0));
+        assert_eq!(win.shares[1].key, "docs");
+        assert!(close(win.shares[1].limit_points, 3240.0 / 247.0));
     }
 }

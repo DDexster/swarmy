@@ -192,7 +192,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
                 for s in &ctx.seats {
-                    v.capture(s, Some(&format!("alex-{}", s.label)))?;
+                    v.edit(|tx| tx.capture(s, Some(&format!("alex-{}", s.label))))?;
                 }
                 let spare = crate::claude::credentials::Secret::new(serde_json::json!({
                     "accessToken": "demo-access-spare", "refreshToken": "demo-refresh-spare",
@@ -203,7 +203,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     email: Some("alex+spare@example.com".into()),
                     ..Default::default()
                 };
-                v.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None)?;
+                v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
             }
             // Account names come from the saved logins just made.
             ctx.drop_unconfirmed();

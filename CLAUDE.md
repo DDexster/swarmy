@@ -10,7 +10,9 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - **English only**: UI text, docs, code, commits.
 - **Offline and read-only.** No network calls, no telemetry. Claude Code's directories are only read;
   the single write is an explicit vault switch (`src/vault`), which saves the seat's current login
-  first, backs up both files, writes atomically and keeps `mcpOAuth`.
+  first, backs up both files, writes atomically, merges only `oauthAccount` into `.claude.json` as
+  it is right before the write, and keeps `mcpOAuth`. Every vault change goes through
+  `Vault::edit` (OS lock, re-read under it, backup, atomic writes); never write vault files elsewhere.
 - **No personal data in git**: no real home paths, user names, emails, account UUIDs or real config
   dir names in code, tests, fixtures, docs or screenshots. Tests use synthetic data; screenshots and
   GIFs come only from `swarmy demo`. Check the staged diff before every commit.
@@ -32,7 +34,15 @@ logins. Users run it in a spare terminal, mostly on laptops.
   (SYSTEM open) run rarely or on demand. `.claude.json` is rewritten by Claude Code every few
   seconds — never trigger heavy work on its mtime.
 - Prices are versioned data (`src/core/pricing.rs`, overridable by Claude Code's cache and
-  `config.toml`), never ad-hoc constants. Money numbers in tests are computed by hand in comments.
+  `config.toml`), never ad-hoc constants. Built-in prices carry their model's date; each version
+  of Claude Code's cached prices applies from the day the index first saw it; an override derives
+  what it leaves out from the entry it overrides (`Rates::derive`). Money numbers in tests are
+  computed by hand in comments.
+- The index schema (`src/index/schema.rs`) has cache tables (rebuilt from transcripts when
+  `CACHE_VERSION` changes) and fact tables that nothing else records (`seat_accounts`, `accounts`,
+  `readings`, `observed_prices`: migrated by `FACTS_VERSION` steps, never dropped). A new table
+  goes into exactly one list; data rules are `CHECK`s, enum lists generated from the Rust enums.
+  `cost` is NULL until priced (`priced` NULL) or when no price is known (`priced = 0`).
 
 ## Layout
 
@@ -40,7 +50,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 |---|---|
 | `src/core/` | pure domain: usage, pricing, periods, limits math (no I/O) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
-| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts) |
+| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats |
 | `src/live/` | live agent states for the dashboard |
 | `src/vault/` | login vault and switching |
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices |

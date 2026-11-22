@@ -427,16 +427,6 @@ fn fleet_of(
     f
 }
 
-fn reload_seat_info(ctx: &mut Ctx) {
-    let data = ctx.dirs.data.clone();
-    ctx.seat_info = ctx
-        .seats
-        .iter()
-        .map(|s| crate::cli::context::seat_info_of(s, &data).0)
-        .collect();
-    ctx.drop_unconfirmed();
-}
-
 /// Modification times of the seats' status-line readings (one `stat` per seat).
 fn statusline_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
     ctx.seats
@@ -548,7 +538,9 @@ fn worker(
         if sl != sl_stamp && last_sl.elapsed() > Duration::from_secs(5) {
             sl_stamp = sl;
             last_sl = Instant::now();
-            reload_seat_info(&mut ctx);
+            if let Err(e) = ctx.reload_seat_info() {
+                send(Msg::Error(format!("{e:#}")));
+            }
             last_info = Instant::now();
             seats_changed = true;
         }
@@ -559,7 +551,9 @@ fn worker(
                 seats_changed = true;
                 login_stamp = stamp;
             }
-            reload_seat_info(&mut ctx);
+            if let Err(e) = ctx.reload_seat_info() {
+                send(Msg::Error(format!("{e:#}")));
+            }
             last_info = Instant::now();
         }
         marks.push(("seatinfo", Instant::now()));
@@ -698,7 +692,9 @@ fn worker(
             }
             if wants.lock().unwrap().refresh_analytics {
                 // A login may have just changed: re-read the seats' accounts.
-                reload_seat_info(&mut ctx);
+                if let Err(e) = ctx.reload_seat_info() {
+                    send(Msg::Error(format!("{e:#}")));
+                }
             }
             wants.lock().unwrap().refresh_analytics = false;
             let ta = Instant::now();
@@ -854,7 +850,7 @@ fn analytics(
     let mut seats = Vec::new();
     let mut states = std::collections::BTreeMap::new();
     if let Ok(mut v) = Vault::open(&ctx.dirs.vault_dir()) {
-        states = v.seat_states(&ctx.seats).unwrap_or_default();
+        states = v.edit(|tx| tx.seat_states(&ctx.seats)).unwrap_or_default();
         vault_logins = v.logins().to_vec();
     }
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
@@ -951,6 +947,7 @@ fn analytics(
                             usage: Default::default(),
                             cost: p.prev,
                             unpriced: 0,
+                            pending: 0,
                         })
                         .collect();
                     upsert(rows, &|p, r| p.prev = r.cost);

@@ -9,7 +9,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::claude::project::Alias;
-use crate::core::pricing::{PriceBook, PriceEntry, PriceSource, Rates};
+use crate::core::pricing::{PriceBook, RateOverrides, Rates};
 
 #[derive(Debug, Clone)]
 pub struct Dirs {
@@ -105,7 +105,13 @@ impl Config {
     pub fn load(dirs: &Dirs) -> anyhow::Result<Config> {
         let p = dirs.config_file();
         match std::fs::read_to_string(&p) {
-            Ok(text) => toml::from_str(&text).with_context(|| format!("invalid {}", p.display())),
+            Ok(text) => {
+                let c: Config =
+                    toml::from_str(&text).with_context(|| format!("invalid {}", p.display()))?;
+                c.validate()
+                    .map_err(|e| anyhow::anyhow!("invalid {}: {e}", p.display()))?;
+                Ok(c)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(e).with_context(|| format!("cannot read {}", p.display())),
         }
@@ -122,25 +128,35 @@ impl Config {
             .collect()
     }
 
-    pub fn apply_prices(&self, book: &mut PriceBook) {
+    /// Rules TOML cannot express: prices are finite and not negative.
+    pub fn validate(&self) -> Result<(), String> {
         for p in &self.price {
-            book.push(PriceEntry {
-                model: p.model.clone(),
-                from: p
-                    .from
-                    .unwrap_or(NaiveDate::from_ymd_opt(2023, 1, 1).unwrap()),
-                rates: Rates {
-                    input: p.input,
-                    output: p.output,
-                    cache_write_5m: p.cache_write_5m.unwrap_or(p.input * 1.25),
-                    cache_write_1h: p.cache_write_1h.unwrap_or(p.input * 2.0),
-                    cache_read: p.cache_read.unwrap_or(p.input * 0.1),
-                    web_search: p.web_search.unwrap_or(0.01),
-                    fast_multiplier: p.fast_multiplier,
-                    long_context: None,
-                },
-                source: PriceSource::User,
-            });
+            Rates::derive(p.input, p.output, &p.overrides(), None)
+                .validate()
+                .map_err(|e| format!("[[price]] {}: {e}", p.model))?;
+        }
+        Ok(())
+    }
+
+    /// Adds the `[[price]]` overrides to `book`; what an override leaves out is derived from the
+    /// entry it overrides (`PriceBook::push_override`).
+    pub fn apply_prices(&self, book: &mut PriceBook, today: NaiveDate) -> anyhow::Result<()> {
+        for p in &self.price {
+            book.push_override(&p.model, p.from, p.input, p.output, &p.overrides(), today)
+                .map_err(|e| anyhow::anyhow!("[[price]] {}: {e}", p.model))?;
+        }
+        Ok(())
+    }
+}
+
+impl PriceConf {
+    fn overrides(&self) -> RateOverrides {
+        RateOverrides {
+            cache_write_5m: self.cache_write_5m,
+            cache_write_1h: self.cache_write_1h,
+            cache_read: self.cache_read,
+            web_search: self.web_search,
+            fast_multiplier: self.fast_multiplier,
         }
     }
 }
@@ -188,8 +204,14 @@ mod tests {
             PathBuf::from("/h/cc-work")
         );
         let mut b = PriceBook::default();
-        c.apply_prices(&mut b);
+        c.apply_prices(&mut b, NaiveDate::from_ymd_opt(2026, 11, 22).unwrap())
+            .unwrap();
         assert_eq!(b.entries()[0].rates.cache_write_1h, 6.0);
+        let bad: Config =
+            toml::from_str("[[price]]\nmodel = \"claude-opus-5-5\"\ninput = -3\noutput = nan\n")
+                .unwrap();
+        let e = bad.validate().unwrap_err();
+        assert!(e.contains("claude-opus-5-5") && e.contains("input"), "{e}");
         assert!(
             toml::from_str::<Config>("bogus = 1").is_err(),
             "typos are reported"

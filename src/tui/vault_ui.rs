@@ -68,7 +68,7 @@ pub struct VaultUi {
 impl App {
     pub fn vault_reload(&mut self) {
         match Vault::open(&self.vault_dir).and_then(|mut v| {
-            v.sync(&self.seats)?;
+            v.edit(|tx| tx.sync(&self.seats))?;
             Ok(v.logins().to_vec())
         }) {
             Ok(l) => {
@@ -143,13 +143,15 @@ impl App {
 
     fn do_switch(&mut self, seat: &str, login: &str) {
         let res = Vault::open(&self.vault_dir).and_then(|mut v| {
-            v.sync(&self.seats)?;
-            let s = self
-                .seats
-                .iter()
-                .find(|s| s.label == seat)
-                .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
-            v.switch(s, login, false)
+            v.edit(|tx| {
+                tx.sync(&self.seats)?;
+                let s = self
+                    .seats
+                    .iter()
+                    .find(|s| s.label == seat)
+                    .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
+                tx.switch(s, login, false)
+            })
         });
         match res {
             Ok(r) if r.unchanged => self.toast(
@@ -187,14 +189,16 @@ impl App {
     fn do_capture(&mut self, seat: &str, label: &str) {
         let label = label.trim();
         let res = Vault::open(&self.vault_dir).and_then(|mut v| {
-            v.sync(&self.seats)?;
-            let s = self
-                .seats
-                .iter()
-                .find(|s| s.label == seat)
-                .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
-            v.capture(s, (!label.is_empty()).then_some(label))?
-                .ok_or_else(|| anyhow::anyhow!("seat '{seat}' has no login"))
+            v.edit(|tx| {
+                tx.sync(&self.seats)?;
+                let s = self
+                    .seats
+                    .iter()
+                    .find(|s| s.label == seat)
+                    .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
+                tx.capture(s, (!label.is_empty()).then_some(label))?
+                    .ok_or_else(|| anyhow::anyhow!("seat '{seat}' has no login"))
+            })
         });
         match res {
             Ok(_) => {
@@ -356,7 +360,7 @@ impl App {
                         InputAction::Capture(seat) => self.do_capture(&seat, &value),
                         InputAction::Rename(old) => {
                             let res = Vault::open(&self.vault_dir)
-                                .and_then(|mut v| v.rename(&old, value.trim()));
+                                .and_then(|mut v| v.edit(|tx| tx.rename(&old, value.trim())));
                             match res {
                                 Ok(()) => {
                                     self.toast(format!("renamed to '{}'", value.trim()), Tone::Good)
@@ -401,7 +405,7 @@ impl App {
                         ConfirmAction::Switch { seat, login } => self.do_switch(&seat, &login),
                         ConfirmAction::Remove(login) => {
                             let res = Vault::open(&self.vault_dir)
-                                .and_then(|mut v| v.remove(&login, true));
+                                .and_then(|mut v| v.edit(|tx| tx.remove(&login, true)));
                             match res {
                                 Ok(l) => self.toast(format!("forgot '{}'", l.label), Tone::Good),
                                 Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
@@ -443,14 +447,15 @@ impl App {
             let secret = s
                 .secret
                 .ok_or_else(|| anyhow::anyhow!("no login was made"))?;
-            let mut v = Vault::open(&self.vault_dir)?;
-            v.put(
-                &secret,
-                s.oauth_account,
-                s.account.as_ref(),
-                Some(label),
-                None,
-            )?;
+            Vault::open(&self.vault_dir)?.edit(|tx| {
+                tx.put(
+                    &secret,
+                    s.oauth_account,
+                    s.account.as_ref(),
+                    Some(label),
+                    None,
+                )
+            })?;
             Ok(())
         })();
         let _ = std::fs::remove_dir_all(&scratch);

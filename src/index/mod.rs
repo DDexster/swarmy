@@ -1,11 +1,15 @@
-//! The local index: an SQLite cache of every transcript, filled incrementally.
+//! The local index: an SQLite cache of every transcript, filled incrementally, next to the facts
+//! swarmy observed over time (logins per seat, limit readings, price versions; see `schema`).
 //!
 //! Transcripts are append-only, so each file is read from where the previous run stopped
 //! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
 //! start. The first run reads everything in parallel.
 
 pub mod insights;
+mod prices;
 pub mod query;
+#[cfg(test)]
+pub(crate) mod scenarios;
 pub mod schema;
 
 use std::collections::HashMap;
@@ -23,7 +27,6 @@ use crate::claude::project::Resolver;
 use crate::claude::seats::Seat;
 use crate::claude::transcript::{self, Event, TitleKind};
 use crate::core::pricing::PriceBook;
-use crate::core::usage::Usage;
 
 /// The account of a request from its seat's login history (see `seat_accounts`).
 const SEAT_ACCOUNT_AT: &str = "COALESCE((SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1), requests.account_uuid)";
@@ -36,6 +39,8 @@ pub struct Index {
     /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
     /// again only when a file was added to it.
     session_dirs: HashMap<(String, String), ListedDirs>,
+    /// The last price book dated by `dated_prices`, by the fingerprint of the undated one.
+    dated: Option<(String, PriceBook)>,
 }
 
 /// The dirs a session's files were listed from (with their mtimes), and the files.
@@ -116,39 +121,27 @@ impl Index {
         conn.busy_timeout(Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-        )?;
-        let idx = Index {
+        // Facts migrate, the cache is rebuilt when its version changed; requests read again
+        // then follow their seat's login history like any new request (`post_pass`).
+        schema::migrate(&conn)?;
+        Ok(Index {
             conn,
             session_dirs: HashMap::new(),
-        };
-        if idx.meta("schema_version")?.as_deref() != Some(schema::VERSION) {
-            for t in schema::TABLES {
-                idx.conn
-                    .execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?;
-            }
-            idx.conn.execute_batch(schema::SQL)?;
-            idx.set_meta("schema_version", schema::VERSION)?;
-            idx.conn
-                .execute("DELETE FROM meta WHERE key = 'price_fp'", [])?;
-        }
-        // Tables added without a version bump (all `IF NOT EXISTS`), then extra indexes.
-        idx.conn.execute_batch(schema::SQL)?;
-        idx.conn.execute_batch(schema::EXTRA_INDEXES)?;
-        Ok(idx)
+            dated: None,
+        })
     }
 
     pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
-        Ok(self
-            .conn
-            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
-            .optional()?)
+        Ok(schema::meta(&self.conn, key)?)
     }
 
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
-        self.conn.execute("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
-        Ok(())
+        Ok(schema::set_meta(&self.conn, key, value)?)
+    }
+
+    /// The database file (`None` in memory): tells two indexes apart in a process-wide memo.
+    pub fn path(&self) -> Option<&str> {
+        self.conn.path()
     }
 
     /// Brings the index up to date with every seat's transcripts.
@@ -333,6 +326,12 @@ impl Index {
         let before: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
+        // Rows added by this refresh have a larger rowid (requests are never deleted).
+        let last_rowid: i64 =
+            self.conn
+                .query_row("SELECT COALESCE(MAX(rowid), 0) FROM requests", [], |r| {
+                    r.get(0)
+                })?;
         let mut type_counts: HashMap<String, u64> = HashMap::new();
         let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
         for batch in work.chunks(48) {
@@ -369,7 +368,7 @@ impl Index {
             prices,
             &type_counts,
             &cwds,
-            files_total > 0,
+            (files_total > 0).then_some(last_rowid),
         )?;
         let after: i64 = self
             .conn
@@ -387,7 +386,7 @@ impl Index {
         prices: &PriceBook,
         types: &HashMap<String, u64>,
         new_cwds: &std::collections::HashSet<String>,
-        changed: bool,
+        new_after_rowid: Option<i64>,
     ) -> anyhow::Result<()> {
         let now = ms(Utc::now());
         let tx = self.conn.transaction()?;
@@ -404,7 +403,8 @@ impl Index {
             if let Some(u) = &si.utilization {
                 for r in &u.readings {
                     tx.execute(
-                        "INSERT OR IGNORE INTO readings(account_uuid, kind, fetched_at, utilization, resets_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        "INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING",
                         params![u.account_uuid, r.kind.key(), ms(r.fetched_at), r.utilization, ms(r.resets_at)],
                     )?;
                 }
@@ -433,13 +433,14 @@ impl Index {
                         params![si.label, ts],
                         |r| r.get(0),
                     )
-                    .ok();
+                    .optional()?;
                 // Only changes are kept: readings arrive after every response.
                 if before.as_deref() == Some(acc) {
                     continue;
                 }
                 let added = tx.execute(
-                    "INSERT OR IGNORE INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(seat, ts) DO NOTHING",
                     params![si.label, ts, acc],
                 )?;
                 if added > 0 {
@@ -453,26 +454,19 @@ impl Index {
                 params![seat, ts],
             )?;
         }
-        let rev_ok = tx
-            .query_row(
-                "SELECT value FROM meta WHERE key = 'projects_rev'",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .as_deref()
-            == Some(PROJECTS_REV);
-        if !changed && rev_ok {
+        let rev_ok = schema::meta(&tx, "projects_rev")?.as_deref() == Some(PROJECTS_REV);
+        let Some(new_after_rowid) = new_after_rowid.or((!rev_ok).then_some(i64::MAX)) else {
             tx.commit()?;
-            return Ok(());
-        }
-        // New requests follow their seat too (only when something new arrived).
+            return self.price_all(prices);
+        };
+        // New requests follow their seat's login history too: requests read for the first time,
+        // which after a cache rebuild is all of them.
         tx.execute(
             &format!(
                 "UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT}
-                 WHERE ts >= ?1 AND EXISTS (SELECT 1 FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts)"
+                 WHERE rowid > ?1 AND EXISTS (SELECT 1 FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts)"
             ),
-            params![now - 30 * 60_000],
+            params![new_after_rowid],
         )?;
         // The account of subagent requests comes from the session's owner at that time.
         tx.execute_batch(
@@ -573,54 +567,13 @@ impl Index {
             }
         }
         if !rev_ok {
-            tx.execute("INSERT INTO meta(key, value) VALUES ('projects_rev', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [PROJECTS_REV])?;
+            schema::set_meta(&tx, "projects_rev", PROJECTS_REV)?;
         }
         for (t, n) in types {
             tx.execute("INSERT INTO record_types(type, count) VALUES (?1, ?2) ON CONFLICT(type) DO UPDATE SET count = count + excluded.count", params![t, *n as i64])?;
         }
         tx.commit()?;
         self.price_all(prices)?;
-        Ok(())
-    }
-
-    /// Re-prices every request when any price changed, and prices new requests otherwise.
-    pub fn price_all(&mut self, prices: &PriceBook) -> anyhow::Result<()> {
-        let fp = prices.fingerprint();
-        if self.meta("price_fp")?.as_deref() != Some(fp.as_str()) {
-            self.conn.execute("UPDATE requests SET cost = -1", [])?;
-        }
-        let tx = self.conn.transaction()?;
-        {
-            let mut sel = tx.prepare("SELECT msg_id, model, ts, fast, input, cw5, cw1h, cread, output, thinking, web FROM requests WHERE cost < 0")?;
-            let mut upd =
-                tx.prepare("UPDATE requests SET cost = ?1, priced = ?2 WHERE msg_id = ?3")?;
-            let rows: Vec<(String, String, i64, bool, Usage)> = sel
-                .query_map([], |r| {
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get::<_, i64>(3)? != 0,
-                        Usage {
-                            input: r.get::<_, i64>(4)? as u64,
-                            cache_write_5m: r.get::<_, i64>(5)? as u64,
-                            cache_write_1h: r.get::<_, i64>(6)? as u64,
-                            cache_read: r.get::<_, i64>(7)? as u64,
-                            output: r.get::<_, i64>(8)? as u64,
-                            thinking: r.get::<_, i64>(9)? as u64,
-                            web_search: r.get::<_, i64>(10)? as u64,
-                        },
-                    ))
-                })?
-                .collect::<Result<_, _>>()?;
-            for (id, model, ts, fast, usage) in rows {
-                let day = from_ms(ts).with_timezone(&chrono::Local).date_naive();
-                let c = prices.cost(&model, day, &usage, fast);
-                upd.execute(params![c.usd, c.priced as i64, id])?;
-            }
-        }
-        tx.commit()?;
-        self.set_meta("price_fp", &fp)?;
         Ok(())
     }
 }
@@ -644,11 +597,22 @@ fn write_file(
     let f = &w.file;
     let main = f.kind == FileKind::Main;
     if w.reset {
+        // The file is read again from the start: forget what it added, so nothing counts twice.
+        // (Request rows merge by `MAX`; tool counts and compactions are sums.)
         tx.execute(
-            "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2",
-            params![f.seat, f.session_id],
-        )
-        .ok();
+            "UPDATE requests SET tools = 0 WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+            params![f.seat, f.session_id, f.agent_id],
+        )?;
+        if main {
+            tx.execute(
+                "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2",
+                params![f.seat, f.session_id],
+            )?;
+            tx.execute(
+                "UPDATE sessions SET compactions = 0 WHERE seat = ?1 AND session_id = ?2",
+                params![f.seat, f.session_id],
+            )?;
+        }
         tx.execute(
             "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
             params![f.seat, f.session_id, f.agent_id],
@@ -659,23 +623,24 @@ fn write_file(
     let mut agg = FileAgg::default();
     let mut ins_req = tx.prepare_cached(
         "INSERT INTO requests(msg_id, seat, session_id, agent_id, account_uuid, ts, model, requested_model, effort, fast, cwd,
-                              input, cw5, cw1h, cread, output, thinking, web, tools, cost)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, -1)
+                              input, cw5, cw1h, cread, output, thinking, web, tools)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(msg_id) DO UPDATE SET
            input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
            cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
            web = MAX(web, excluded.web), tools = tools + excluded.tools,
-           account_uuid = COALESCE(account_uuid, excluded.account_uuid), cost = -1",
+           account_uuid = COALESCE(account_uuid, excluded.account_uuid), cost = NULL, priced = NULL",
     )?;
     let mut ins_tool = tx.prepare_cached(
-        "INSERT OR IGNORE INTO tool_calls(id, msg_id, seat, session_id, agent_id, ts, name, summary, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO tool_calls(id, msg_id, seat, session_id, agent_id, ts, name, summary, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(id) DO NOTHING",
     )?;
     let mut upd_tool =
         tx.prepare_cached("UPDATE tool_calls SET done_ts = ?1, is_error = ?2 WHERE id = ?3")?;
     for ev in chunk.events {
         match ev {
             Event::Owner { account_uuid } => {
-                tx.execute("INSERT OR IGNORE INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4)", params![f.seat, f.session_id, last_ts, account_uuid])?;
+                tx.execute("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![f.seat, f.session_id, last_ts, account_uuid])?;
                 account = Some(account_uuid);
             }
             Event::Request(r) => {

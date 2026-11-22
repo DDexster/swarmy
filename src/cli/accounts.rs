@@ -121,13 +121,13 @@ fn weekly(ctx: &Ctx, account: Option<&str>) -> Option<(f64, chrono::DateTime<chr
 
 pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     let mut v = Vault::open(&ctx.dirs.vault_dir())?;
-    v.sync(&ctx.seats)?;
+    v.edit(|tx| tx.sync(&ctx.seats))?;
     let p = &ctx.painter;
     match a.cmd.clone().unwrap_or(AccountsCmd::List) {
         AccountsCmd::List => list(ctx, &mut v),
         AccountsCmd::Capture { seat: key, label } => {
             let s = seat(ctx, &key)?;
-            match v.capture(s, label.as_deref())? {
+            match v.edit(|tx| tx.capture(s, label.as_deref()))? {
                 Some(id) => {
                     let l = v.logins().iter().find(|l| l.id == id).unwrap();
                     println!(
@@ -151,7 +151,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 .with_context(|| format!("cannot read {}", file.display()))?;
             let secret =
                 credentials::parse_login(&text)?.context("no claudeAiOauth object in that file")?;
-            v.put(&secret, None, None, Some(&label), None)?;
+            v.edit(|tx| tx.put(&secret, None, None, Some(&label), None))?;
             println!(
                 "{} imported '{label}' ({})",
                 p.paint("[ OK ]", Tone::Good),
@@ -182,7 +182,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                     s.label
                 );
             }
-            let rep = v.switch(s, &login, share)?;
+            let rep = v.edit(|tx| tx.switch(s, &login, share))?;
             if rep.unchanged {
                 println!(
                     "{} seat '{}' already uses '{}'",
@@ -242,13 +242,15 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 };
                 let s = vault::read_seat(&tmp)?;
                 let secret = s.secret.context("no login was made in the scratch seat")?;
-                v.put(
-                    &secret,
-                    s.oauth_account,
-                    s.account.as_ref(),
-                    Some(&label),
-                    None,
-                )?;
+                v.edit(|tx| {
+                    tx.put(
+                        &secret,
+                        s.oauth_account,
+                        s.account.as_ref(),
+                        Some(&label),
+                        None,
+                    )
+                })?;
                 println!(
                     "{} saved '{label}' ({})",
                     p.paint("[ OK ]", Tone::Good),
@@ -260,12 +262,12 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             result
         }
         AccountsCmd::Rename { login, new_label } => {
-            v.rename(&login, &new_label)?;
+            v.edit(|tx| tx.rename(&login, &new_label))?;
             println!("{} renamed to '{new_label}'", p.paint("[ OK ]", Tone::Good));
             Ok(())
         }
         AccountsCmd::Rm { login, force } => {
-            let l = v.remove(&login, force)?;
+            let l = v.edit(|tx| tx.remove(&login, force))?;
             println!("{} forgot '{}'", p.paint("[ OK ]", Tone::Good), l.label);
             Ok(())
         }
@@ -273,7 +275,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
 }
 
 fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
-    let states = v.seat_states(&ctx.seats)?;
+    let states = v.edit(|tx| tx.seat_states(&ctx.seats))?;
     let p = &ctx.painter;
     println!(
         "{} {}",
@@ -339,7 +341,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         p.paint(
             &format!(
                 "· {} · {}",
-                v.store.name(),
+                v.store_name(),
                 ctx.show_path(&ctx.dirs.vault_dir().to_string_lossy())
             ),
             Tone::Dim

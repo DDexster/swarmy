@@ -26,7 +26,7 @@ use crate::index::Progress;
 use crate::index::query::Dim;
 use crate::live::{Agent, Snapshot, State, ToolLine};
 use crate::ui::fmt;
-use crate::vault::Vault;
+use crate::vault::{Vault, VaultTx};
 
 /// Every panel; the number is the key that focuses it and appears in its title.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1370,11 +1370,13 @@ impl App {
 
     fn with_vault<T>(
         &mut self,
-        f: impl FnOnce(&mut Vault, &[Seat]) -> anyhow::Result<T>,
+        f: impl FnOnce(&mut VaultTx<'_>, &[Seat]) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let mut v = Vault::open(&self.vault_dir)?;
-        v.sync(&self.seats)?;
-        f(&mut v, &self.seats)
+        let seats = &self.seats;
+        Vault::open(&self.vault_dir)?.edit(|tx| {
+            tx.sync(seats)?;
+            f(tx, seats)
+        })
     }
 
     pub fn clock(&self) -> String {

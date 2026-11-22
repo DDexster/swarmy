@@ -267,7 +267,7 @@ pub fn build(
         "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid FROM requests
          WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 1",
     )?;
-    let mut totals = conn.prepare("SELECT COUNT(*), SUM(MAX(cost, 0)) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3")?;
+    let mut totals = conn.prepare("SELECT COUNT(*), TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3")?;
     let mut open_tool = conn.prepare(
         "SELECT name, summary, ts FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND done_ts IS NULL AND ts >= ?4
          ORDER BY ts DESC LIMIT 1",
@@ -276,7 +276,7 @@ pub fn build(
         "SELECT MAX(done_ts) FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
     )?;
     let mut spark = conn.prepare(
-        "SELECT (ts - ?4) / 60000, SUM(MAX(cost, 0)) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4 GROUP BY 1",
+        "SELECT (ts - ?4) / 60000, TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4 GROUP BY 1",
     )?;
     let spark_start = ms(now - Duration::minutes(15));
 
@@ -514,7 +514,7 @@ pub fn build(
     } else {
         let hour_ago = ms(now - Duration::hours(1));
         let mut st = conn.prepare(
-            "SELECT SUM(MAX(cost, 0)), SUM(CASE WHEN ts >= ?3 THEN MAX(cost, 0) ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
+            "SELECT TOTAL(cost), SUM(CASE WHEN ts >= ?3 THEN cost ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
         )?;
         for a in agents.iter_mut().filter(|a| a.is_main()) {
             let (total, hour): (Option<f64>, Option<f64>) = st
@@ -538,7 +538,9 @@ pub fn build(
 
     // Burn per minute by family, last 60 minutes.
     let start = ms(now - Duration::minutes(60));
-    let mut st = conn.prepare("SELECT (ts - ?1) / 60000, model, SUM(MAX(cost, 0)) FROM requests WHERE ts >= ?1 GROUP BY 1, 2")?;
+    let mut st = conn.prepare(
+        "SELECT (ts - ?1) / 60000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1, 2",
+    )?;
     let it = st.query_map(params![start], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -568,7 +570,7 @@ pub fn build(
         .unwrap_or(now);
     snap.today_cost = conn
         .query_row(
-            "SELECT SUM(MAX(cost, 0)) FROM requests WHERE ts >= ?1",
+            "SELECT TOTAL(cost) FROM requests WHERE ts >= ?1",
             params![ms(midnight)],
             |r| r.get::<_, Option<f64>>(0),
         )?
@@ -583,7 +585,7 @@ pub fn build(
             .unwrap_or_default();
         let mut st = conn.prepare(
             "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
-                    (SELECT SUM(MAX(cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
                     (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1)
              FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
              WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60",
@@ -657,7 +659,7 @@ pub fn past_events(
     let mut st = conn.prepare(
         "SELECT COALESCE(a.description, a.agent_type, a.agent_id), a.first_ts, a.last_ts, a.finished,
                 (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1),
-                (SELECT SUM(MAX(cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
                 a.effort
          FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))",
     )?;
@@ -897,7 +899,7 @@ pub struct LifePoint {
 /// The agent's requests, oldest first (the last 2000).
 pub fn life(idx: &Index, a: &Agent) -> anyhow::Result<Vec<LifePoint>> {
     let mut st = idx.conn.prepare_cached(
-        "SELECT ts, MAX(cost, 0), input + cw5 + cw1h + cread FROM requests
+        "SELECT ts, COALESCE(cost, 0), input + cw5 + cw1h + cread FROM requests
          WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 2000",
     )?;
     let mut v: Vec<LifePoint> = st

@@ -29,6 +29,83 @@ pub struct Rates {
     pub long_context: Option<LongContext>,
 }
 
+/// The rates a price source may leave out; `Rates::derive` fills them in.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RateOverrides {
+    pub cache_write_5m: Option<f64>,
+    pub cache_write_1h: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub web_search: Option<f64>,
+    pub fast_multiplier: Option<f64>,
+}
+
+impl Rates {
+    /// The one place derived rates are defined. A rate not given comes from `base`, the entry
+    /// being overridden: cache rates keep their ratio to the input rate, the web-search price,
+    /// the fast-mode multiplier and the long-context rule are kept as they are. Without a base,
+    /// Anthropic's general ratios apply: cache writes 1.25× (5 min) and 2× (1 h) the input rate,
+    /// cache reads 0.1×, web search $10 per 1000 requests.
+    pub fn derive(input: f64, output: f64, over: &RateOverrides, base: Option<&Rates>) -> Rates {
+        let base = base.filter(|b| b.input > 0.0);
+        let ratio =
+            |pick: fn(&Rates) -> f64, general: f64| base.map_or(general, |b| pick(b) / b.input);
+        Rates {
+            input,
+            output,
+            cache_write_5m: over
+                .cache_write_5m
+                .unwrap_or_else(|| input * ratio(|b| b.cache_write_5m, 1.25)),
+            cache_write_1h: over
+                .cache_write_1h
+                .unwrap_or_else(|| input * ratio(|b| b.cache_write_1h, 2.0)),
+            cache_read: over
+                .cache_read
+                .unwrap_or_else(|| input * ratio(|b| b.cache_read, 0.1)),
+            web_search: over
+                .web_search
+                .or(base.map(|b| b.web_search))
+                .unwrap_or(0.01),
+            fast_multiplier: over
+                .fast_multiplier
+                .or(base.and_then(|b| b.fast_multiplier)),
+            long_context: base.and_then(|b| b.long_context),
+        }
+    }
+
+    /// Rates are finite and not negative; multipliers are above zero (TOML accepts `nan`, `inf`
+    /// and negative numbers, so this is checked, not assumed).
+    pub fn validate(&self) -> Result<(), String> {
+        let rate = |name: &str, x: f64| {
+            if x.is_finite() && x >= 0.0 {
+                Ok(())
+            } else {
+                Err(format!("{name} must be a finite number ≥ 0 (got {x})"))
+            }
+        };
+        let factor = |name: &str, x: f64| {
+            if x.is_finite() && x > 0.0 {
+                Ok(())
+            } else {
+                Err(format!("{name} must be a finite number > 0 (got {x})"))
+            }
+        };
+        rate("input", self.input)?;
+        rate("output", self.output)?;
+        rate("cache_write_5m", self.cache_write_5m)?;
+        rate("cache_write_1h", self.cache_write_1h)?;
+        rate("cache_read", self.cache_read)?;
+        rate("web_search", self.web_search)?;
+        if let Some(f) = self.fast_multiplier {
+            factor("fast_multiplier", f)?;
+        }
+        if let Some(lc) = self.long_context {
+            factor("long_context input multiplier", lc.input_multiplier)?;
+            factor("long_context output multiplier", lc.output_multiplier)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LongContext {
     /// Prompt tokens (input + cache writes + cache reads) above which the multipliers apply.
@@ -60,7 +137,9 @@ impl PriceSource {
 pub struct PriceEntry {
     /// Exact model id, or a prefix ending in `*`.
     pub model: String,
-    pub from: NaiveDate,
+    /// The first day the entry applies to; `None` = every day (a user override without `from`,
+    /// or a Claude Code price the index has not dated yet).
+    pub from: Option<NaiveDate>,
     pub rates: Rates,
     pub source: PriceSource,
 }
@@ -77,69 +156,179 @@ pub struct PriceBook {
     entries: Vec<PriceEntry>,
 }
 
-const EPOCH: NaiveDate = NaiveDate::from_ymd_opt(2023, 1, 1).unwrap();
+const fn date(y: i32, m: u32, d: u32) -> NaiveDate {
+    match NaiveDate::from_ymd_opt(y, m, d) {
+        Some(x) => x,
+        None => panic!("invalid date in the built-in price table"),
+    }
+}
 
 /// Built-in prices, USD per MTok (anthropic first-party API rates; checked 2026-11-22 against the
 /// Claude API model table and Claude Code's own cache). Cache writes are 1.25x (5 min) and 2x
 /// (1 h) the input rate; cache reads vary by model. Web search is $10 per 1000 requests.
-/// Columns: model, input, output, cache read, fast multiplier.
-const BUILTIN: &[(&str, f64, f64, f64, Option<f64>)] = &[
-    ("claude-fable-5-2", 8.0, 40.0, 0.20, Some(2.0)),
-    ("claude-mythos-5-2", 8.0, 40.0, 0.20, Some(2.0)),
-    ("claude-fable-5-1", 10.0, 50.0, 0.25, None),
-    ("claude-mythos-5-1", 10.0, 50.0, 0.25, None),
-    ("claude-fable-5", 10.0, 50.0, 1.00, None),
-    ("claude-mythos-5", 10.0, 50.0, 1.00, None),
-    ("claude-opus-5-5", 4.0, 20.0, 0.20, Some(2.0)),
-    ("claude-opus-5", 5.0, 25.0, 0.50, Some(2.0)),
-    ("claude-opus-4-8", 5.0, 25.0, 0.50, Some(2.0)),
-    ("claude-opus-4-7", 5.0, 25.0, 0.50, None),
-    ("claude-opus-4-6", 5.0, 25.0, 0.50, None),
-    ("claude-opus-4-5", 5.0, 25.0, 0.50, None),
-    ("claude-opus-4-1", 15.0, 75.0, 1.50, None),
-    ("claude-opus-4", 15.0, 75.0, 1.50, None),
-    ("claude-sonnet-5-5", 2.0, 10.0, 0.10, None),
-    ("claude-sonnet-5", 2.0, 10.0, 0.20, None),
-    ("claude-sonnet-4-6", 3.0, 15.0, 0.30, None),
-    ("claude-sonnet-4-5", 3.0, 15.0, 0.30, None),
-    ("claude-sonnet-4", 3.0, 15.0, 0.30, None),
-    ("claude-3-7-sonnet", 3.0, 15.0, 0.30, None),
-    ("claude-3-5-sonnet", 3.0, 15.0, 0.30, None),
-    ("claude-haiku-5-5", 0.10, 0.50, 0.01, None),
-    ("claude-haiku-4-5", 1.0, 5.0, 0.10, None),
-    ("claude-3-5-haiku", 0.80, 4.0, 0.08, None),
-    ("claude-3-haiku", 0.25, 1.25, 0.03, None),
+///
+/// The date is the first day the price applies: the date of the model's first snapshot (the
+/// suffix of its dated id, a few days before the public launch), or its launch date, so no
+/// request of the model predates it. Rows marked (to verify) carry a safe lower bound instead of
+/// a checked launch date: the launch of the model they succeed (Opus 4.6, 2026-02-05, for the
+/// later Opus and every Fable and Mythos model, which share the Opus 4.7 tokenizer), or for
+/// Opus 5.5 the first day of its knowledge-cutoff month (June 2026). Too early only means the
+/// price covers days without requests; too late would leave requests unpriced.
+/// Columns: model, from, input, output, cache read, fast multiplier.
+type BuiltinRow = (&'static str, NaiveDate, f64, f64, f64, Option<f64>);
+const BUILTIN: &[BuiltinRow] = &[
+    // (to verify) launch dates: lower bounds, see above.
+    (
+        "claude-fable-5-2",
+        date(2026, 2, 5),
+        8.0,
+        40.0,
+        0.20,
+        Some(2.0),
+    ),
+    (
+        "claude-mythos-5-2",
+        date(2026, 2, 5),
+        8.0,
+        40.0,
+        0.20,
+        Some(2.0),
+    ),
+    ("claude-fable-5-1", date(2026, 2, 5), 10.0, 50.0, 0.25, None),
+    (
+        "claude-mythos-5-1",
+        date(2026, 2, 5),
+        10.0,
+        50.0,
+        0.25,
+        None,
+    ),
+    ("claude-fable-5", date(2026, 2, 5), 10.0, 50.0, 1.00, None),
+    ("claude-mythos-5", date(2026, 2, 5), 10.0, 50.0, 1.00, None),
+    (
+        "claude-opus-5-5",
+        date(2026, 6, 1),
+        4.0,
+        20.0,
+        0.20,
+        Some(2.0),
+    ),
+    (
+        "claude-opus-5",
+        date(2026, 2, 5),
+        5.0,
+        25.0,
+        0.50,
+        Some(2.0),
+    ),
+    (
+        "claude-opus-4-8",
+        date(2026, 2, 5),
+        5.0,
+        25.0,
+        0.50,
+        Some(2.0),
+    ),
+    ("claude-opus-4-7", date(2026, 2, 5), 5.0, 25.0, 0.50, None),
+    // Checked launch dates and snapshot dates from here on, unless marked.
+    ("claude-opus-4-6", date(2026, 2, 5), 5.0, 25.0, 0.50, None),
+    ("claude-opus-4-5", date(2025, 11, 1), 5.0, 25.0, 0.50, None),
+    ("claude-opus-4-1", date(2025, 8, 5), 15.0, 75.0, 1.50, None),
+    ("claude-opus-4", date(2025, 5, 14), 15.0, 75.0, 1.50, None),
+    // (to verify) Sonnet 5.5 and 5: lower bound = the Sonnet 4.6 launch.
+    (
+        "claude-sonnet-5-5",
+        date(2026, 2, 17),
+        2.0,
+        10.0,
+        0.10,
+        None,
+    ),
+    ("claude-sonnet-5", date(2026, 2, 17), 2.0, 10.0, 0.20, None),
+    (
+        "claude-sonnet-4-6",
+        date(2026, 2, 17),
+        3.0,
+        15.0,
+        0.30,
+        None,
+    ),
+    (
+        "claude-sonnet-4-5",
+        date(2025, 9, 29),
+        3.0,
+        15.0,
+        0.30,
+        None,
+    ),
+    ("claude-sonnet-4", date(2025, 5, 14), 3.0, 15.0, 0.30, None),
+    (
+        "claude-3-7-sonnet",
+        date(2025, 2, 19),
+        3.0,
+        15.0,
+        0.30,
+        None,
+    ),
+    (
+        "claude-3-5-sonnet",
+        date(2024, 6, 20),
+        3.0,
+        15.0,
+        0.30,
+        None,
+    ),
+    // (to verify) Haiku 5.5: lower bound = the Haiku 4.5 snapshot.
+    (
+        "claude-haiku-5-5",
+        date(2025, 10, 1),
+        0.10,
+        0.50,
+        0.01,
+        None,
+    ),
+    ("claude-haiku-4-5", date(2025, 10, 1), 1.0, 5.0, 0.10, None),
+    (
+        "claude-3-5-haiku",
+        date(2024, 10, 22),
+        0.80,
+        4.0,
+        0.08,
+        None,
+    ),
+    ("claude-3-haiku", date(2024, 3, 7), 0.25, 1.25, 0.03, None),
 ];
 
 impl PriceBook {
     pub fn builtin() -> Self {
         let entries = BUILTIN
             .iter()
-            .map(|&(model, input, output, cache_read, fast)| PriceEntry {
-                model: model.to_string(),
-                from: EPOCH,
-                rates: Rates {
-                    input,
-                    output,
-                    cache_write_5m: input * 1.25,
-                    cache_write_1h: input * 2.0,
-                    cache_read,
-                    web_search: 0.01,
+            .map(|&(model, from, input, output, cache_read, fast)| {
+                let over = RateOverrides {
+                    cache_read: Some(cache_read),
                     fast_multiplier: fast,
-                    // Claude Haiku 5.5: $0.50 / $2.50 above 100K prompt tokens. Whether cache
-                    // rates scale the same way is (to verify); assumed yes.
-                    long_context: (model == "claude-haiku-5-5").then_some(LongContext {
-                        threshold: 100_000,
-                        input_multiplier: 5.0,
-                        output_multiplier: 5.0,
-                    }),
-                },
-                source: PriceSource::Builtin,
+                    ..Default::default()
+                };
+                let mut rates = Rates::derive(input, output, &over, None);
+                // Claude Haiku 5.5: $0.50 / $2.50 above 100K prompt tokens. Whether cache
+                // rates scale the same way is (to verify); assumed yes.
+                rates.long_context = (model == "claude-haiku-5-5").then_some(LongContext {
+                    threshold: 100_000,
+                    input_multiplier: 5.0,
+                    output_multiplier: 5.0,
+                });
+                PriceEntry {
+                    model: model.to_string(),
+                    from: Some(from),
+                    rates,
+                    source: PriceSource::Builtin,
+                }
             })
             .collect();
         PriceBook { entries }
     }
 
+    #[cfg(test)]
     pub fn push(&mut self, e: PriceEntry) {
         self.entries.push(e);
     }
@@ -151,8 +340,9 @@ impl PriceBook {
     /// Merges the `additionalModelCostsCache` object of a `.claude.json`: per model
     /// `{inputTokens, outputTokens, promptCacheWriteTokens, promptCacheWrite1hTokens,
     /// promptCacheReadTokens, webSearchRequests}` in USD per MTok (web search per request).
-    /// Fast-mode and long-context rules are not in that cache, so they are kept from the
-    /// built-in entry of the same model.
+    /// What the cache leaves out (fast mode, long context, a missing cache rate) is derived from
+    /// the built-in entry of the same model. Entries are undated (`from: None`): the index dates
+    /// them by when it first saw them (`Index::dated_prices`). Invalid rates are skipped.
     pub fn merge_claude_code_cache(&mut self, seat: &str, cache: &serde_json::Value) {
         let Some(map) = cache.as_object() else { return };
         for (model, v) in map {
@@ -161,19 +351,19 @@ impl PriceBook {
                 continue;
             };
             let base = self
-                .lookup_source(model, &PriceSource::Builtin)
+                .lookup_where(model, None, |s| *s == PriceSource::Builtin)
                 .map(|e| e.rates);
-            let rates = Rates {
-                input,
-                output,
-                cache_write_5m: f("promptCacheWriteTokens").unwrap_or(input * 1.25),
-                cache_write_1h: f("promptCacheWrite1hTokens").unwrap_or(input * 2.0),
-                cache_read: f("promptCacheReadTokens").unwrap_or(input * 0.1),
-                web_search: f("webSearchRequests").unwrap_or(0.01),
-                fast_multiplier: base.and_then(|b| b.fast_multiplier),
-                long_context: base.and_then(|b| b.long_context),
+            let over = RateOverrides {
+                cache_write_5m: f("promptCacheWriteTokens"),
+                cache_write_1h: f("promptCacheWrite1hTokens"),
+                cache_read: f("promptCacheReadTokens"),
+                web_search: f("webSearchRequests"),
+                fast_multiplier: None,
             };
-            let source = PriceSource::ClaudeCode(seat.to_string());
+            let rates = Rates::derive(input, output, &over, base.as_ref());
+            if rates.validate().is_err() {
+                continue;
+            }
             // Several seats carry the same cache; keep one copy per model and rates.
             if self.entries.iter().any(|e| {
                 e.model == *model
@@ -184,27 +374,90 @@ impl PriceBook {
             }
             self.entries.push(PriceEntry {
                 model: model.clone(),
-                from: EPOCH,
+                from: None,
                 rates,
-                source,
+                source: PriceSource::ClaudeCode(seat.to_string()),
             });
         }
     }
 
-    fn lookup_source(&self, model: &str, source: &PriceSource) -> Option<&PriceEntry> {
-        self.entries
+    /// Adds a user override (`[[price]]` in `config.toml`). Rates it does not give are derived
+    /// from the entry it overrides: for an exact model id, the entry that prices the model on
+    /// `from` (today when the override has no date); a pattern has no single base.
+    pub fn push_override(
+        &mut self,
+        model: &str,
+        from: Option<NaiveDate>,
+        input: f64,
+        output: f64,
+        over: &RateOverrides,
+        today: NaiveDate,
+    ) -> Result<(), String> {
+        let base = (!model.ends_with('*'))
+            .then(|| {
+                self.lookup_where(model, Some(from.unwrap_or(today)), |s| {
+                    *s != PriceSource::User
+                })
+            })
+            .flatten()
+            .map(|e| e.rates);
+        let rates = Rates::derive(input, output, over, base.as_ref());
+        rates.validate()?;
+        self.entries.push(PriceEntry {
+            model: model.to_string(),
+            from,
+            rates,
+            source: PriceSource::User,
+        });
+        Ok(())
+    }
+
+    /// The same book with Claude Code's entries replaced by `observed` (dated versions).
+    pub fn with_observed(&self, observed: Vec<PriceEntry>) -> PriceBook {
+        let mut entries: Vec<PriceEntry> = self
+            .entries
             .iter()
-            .find(|e| e.model == model && e.source == *source)
+            .filter(|e| !matches!(e.source, PriceSource::ClaudeCode(_)))
+            .cloned()
+            .collect();
+        entries.extend(observed);
+        PriceBook { entries }
+    }
+
+    /// Whether a source other than Claude Code's cache prices `model` on `day`.
+    pub fn priced_without_cache(&self, model: &str, day: NaiveDate) -> bool {
+        self.lookup_where(model, Some(day), |s| {
+            !matches!(s, PriceSource::ClaudeCode(_))
+        })
+        .is_some()
     }
 
     /// The entry that prices `model` on `day`: a user entry beats Claude Code's cache, which beats
     /// the built-in table; then the most specific pattern; then the latest `from` not after `day`.
     /// Dated ids (`claude-haiku-4-5-20251001`) fall back to the id without the date.
     pub fn lookup(&self, model: &str, day: NaiveDate) -> Option<&PriceEntry> {
+        self.lookup_where(model, Some(day), |_| true)
+    }
+
+    /// `lookup` over the entries of the sources `keep` accepts; `day: None` ignores dates and
+    /// takes the latest version.
+    fn lookup_where(
+        &self,
+        model: &str,
+        day: Option<NaiveDate>,
+        keep: impl Fn(&PriceSource) -> bool,
+    ) -> Option<&PriceEntry> {
         let undated = strip_date_suffix(model);
-        let mut best: Option<(&PriceEntry, (u8, usize, NaiveDate))> = None;
+        // Source priority, pattern specificity, effective date: the largest wins.
+        type Rank = (u8, usize, Option<NaiveDate>);
+        let mut best: Option<(&PriceEntry, Rank)> = None;
         for e in &self.entries {
-            if e.from > day {
+            if !keep(&e.source) {
+                continue;
+            }
+            if let (Some(day), Some(from)) = (day, e.from)
+                && from > day
+            {
                 continue;
             }
             let specificity = match_score(&e.model, model)
@@ -397,7 +650,7 @@ mod tests {
         );
         b.push(PriceEntry {
             model: "claude-opus-*".into(),
-            from: EPOCH,
+            from: None,
             rates: Rates {
                 input: 1.0,
                 ..e.rates
@@ -417,13 +670,13 @@ mod tests {
         let d = |m, dd| NaiveDate::from_ymd_opt(2026, m, dd).unwrap();
         b.push(PriceEntry {
             model: "m".into(),
-            from: d(1, 1),
+            from: Some(d(1, 1)),
             rates: Rates { input: 1.0, ..r },
             source: PriceSource::User,
         });
         b.push(PriceEntry {
             model: "m".into(),
-            from: d(6, 1),
+            from: Some(d(6, 1)),
             rates: Rates { input: 2.0, ..r },
             source: PriceSource::User,
         });
@@ -432,6 +685,115 @@ mod tests {
         assert!(
             b.lookup("m", NaiveDate::from_ymd_opt(2025, 12, 31).unwrap())
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_user_override_keeps_the_fast_rule_and_the_cache_ratio() {
+        // `[[price]] model = "claude-opus-5-5" input = 3 output = 15`: no fast multiplier and no
+        // cache rates given, so they come from the built-in entry (fast ×2, reads 0.20/4 = 5%).
+        let mut b = PriceBook::builtin();
+        b.push_override(
+            "claude-opus-5-5",
+            None,
+            3.0,
+            15.0,
+            &RateOverrides::default(),
+            day(),
+        )
+        .unwrap();
+        let e = b.lookup("claude-opus-5-5", day()).unwrap();
+        assert_eq!(e.source, PriceSource::User);
+        assert_eq!(e.rates.fast_multiplier, Some(2.0));
+        // Reads at 5% of $3 = $0.15; writes 1.25× and 2× = $3.75 and $6.
+        assert!(close(e.rates.cache_read, 0.15), "{}", e.rates.cache_read);
+        assert!(close(e.rates.cache_write_5m, 3.75));
+        assert!(close(e.rates.cache_write_1h, 6.0));
+        // Fast mode doubles: 1M in + 1M out = (3 + 15) × 2 = $36.
+        let u = Usage {
+            input: 1_000_000,
+            output: 1_000_000,
+            ..Default::default()
+        };
+        assert!(close(b.cost("claude-opus-5-5", day(), &u, true).usd, 36.0));
+        // Haiku 5.5 keeps its long-context rule under an override.
+        b.push_override(
+            "claude-haiku-5-5",
+            None,
+            0.2,
+            1.0,
+            &RateOverrides::default(),
+            day(),
+        )
+        .unwrap();
+        assert!(
+            b.lookup("claude-haiku-5-5", day())
+                .unwrap()
+                .rates
+                .long_context
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn invalid_rates_are_refused() {
+        let mut b = PriceBook::builtin();
+        for (input, over) in [
+            (-1.0, RateOverrides::default()),
+            (f64::NAN, RateOverrides::default()),
+            (
+                1.0,
+                RateOverrides {
+                    cache_read: Some(f64::INFINITY),
+                    ..Default::default()
+                },
+            ),
+            (
+                1.0,
+                RateOverrides {
+                    fast_multiplier: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let r = b.push_override("claude-opus-5-5", None, input, 5.0, &over, day());
+            assert!(r.is_err(), "{input} {over:?}");
+        }
+        assert_eq!(b.entries().len(), PriceBook::builtin().entries().len());
+    }
+
+    #[test]
+    fn a_cache_entry_without_a_read_price_uses_the_models_own_ratio() {
+        // Claude Code's cache gives Fable 5.2 at $8 / $40 with no cache-read price: the built-in
+        // ratio (0.20 / 8 = 2.5%) applies, so reads cost $0.20, not 10% = $0.80.
+        let mut b = PriceBook::builtin();
+        let cache = serde_json::json!({"claude-fable-5-2": {"inputTokens": 8, "outputTokens": 40}});
+        b.merge_claude_code_cache("work", &cache);
+        let e = b.lookup("claude-fable-5-2", day()).unwrap();
+        assert_eq!(e.source, PriceSource::ClaudeCode("work".into()));
+        assert!(close(e.rates.cache_read, 0.2), "{}", e.rates.cache_read);
+        // A model nobody else prices falls back to the general 10%.
+        let cache = serde_json::json!({"claude-new-9": {"inputTokens": 2, "outputTokens": 10}});
+        b.merge_claude_code_cache("work", &cache);
+        let e = b.lookup("claude-new-9", day()).unwrap();
+        assert!(close(e.rates.cache_read, 0.2), "{}", e.rates.cache_read);
+        // Negative prices in a cache are skipped.
+        let cache = serde_json::json!({"claude-bad-1": {"inputTokens": -2, "outputTokens": 10}});
+        b.merge_claude_code_cache("work", &cache);
+        assert!(b.lookup("claude-bad-1", day()).is_none());
+    }
+
+    #[test]
+    fn built_in_prices_start_on_their_models_date() {
+        let b = PriceBook::builtin();
+        // Claude Sonnet 4.5's first snapshot is 2025-09-29.
+        let d = |y, m, dd| NaiveDate::from_ymd_opt(y, m, dd).unwrap();
+        assert!(b.lookup("claude-sonnet-4-5", d(2025, 9, 28)).is_none());
+        assert!(b.lookup("claude-sonnet-4-5", d(2025, 9, 29)).is_some());
+        assert!(
+            b.entries()
+                .iter()
+                .all(|e| e.from.is_some_and(|f| f >= d(2024, 1, 1)))
         );
     }
 }
