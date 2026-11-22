@@ -1,0 +1,676 @@
+//! The local index: an SQLite cache of every transcript, filled incrementally.
+//!
+//! Transcripts are append-only, so each file is read from where the previous run stopped
+//! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
+//! start. The first run reads everything in parallel.
+
+pub mod query;
+pub mod schema;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use anyhow::Context as _;
+use chrono::{DateTime, TimeZone, Utc};
+use rayon::prelude::*;
+use rusqlite::{Connection, OptionalExtension, params};
+
+use crate::claude::config_json::{Account, Utilization};
+use crate::claude::files::{self, FileKind, TranscriptFile};
+use crate::claude::project::Resolver;
+use crate::claude::seats::Seat;
+use crate::claude::transcript::{self, Event, TitleKind};
+use crate::core::pricing::PriceBook;
+use crate::core::usage::Usage;
+
+pub struct Index {
+    pub conn: Connection,
+}
+
+/// What `.claude.json` of a seat says right now.
+#[derive(Debug, Clone, Default)]
+pub struct SeatInfo {
+    pub label: String,
+    pub account: Option<Account>,
+    pub utilization: Option<Utilization>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Progress {
+    pub files_done: usize,
+    pub files_total: usize,
+    pub bytes_done: u64,
+    pub bytes_total: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RefreshStats {
+    pub files_total: usize,
+    pub files_read: usize,
+    pub bytes_read: u64,
+    pub requests_new: u64,
+    pub elapsed: Duration,
+}
+
+struct Work {
+    file: TranscriptFile,
+    start: u64,
+    ino: u64,
+    size: u64,
+    mtime: i64,
+    account: Option<String>,
+    last_ts: i64,
+    reset: bool,
+}
+
+pub fn ms(t: DateTime<Utc>) -> i64 {
+    t.timestamp_millis()
+}
+
+pub fn from_ms(t: i64) -> DateTime<Utc> {
+    Utc.timestamp_millis_opt(t)
+        .single()
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
+}
+
+#[cfg(unix)]
+fn inode(m: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    m.ino()
+}
+
+#[cfg(not(unix))]
+fn inode(_m: &std::fs::Metadata) -> u64 {
+    0
+}
+
+impl Index {
+    pub fn open(path: &Path) -> anyhow::Result<Index> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        let conn =
+            Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+        Self::init(conn)
+    }
+
+    pub fn open_in_memory() -> anyhow::Result<Index> {
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    fn init(conn: Connection) -> anyhow::Result<Index> {
+        conn.busy_timeout(Duration::from_secs(10))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )?;
+        let idx = Index { conn };
+        if idx.meta("schema_version")?.as_deref() != Some(schema::VERSION) {
+            for t in schema::TABLES {
+                idx.conn
+                    .execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?;
+            }
+            idx.conn.execute_batch(schema::SQL)?;
+            idx.set_meta("schema_version", schema::VERSION)?;
+            idx.conn
+                .execute("DELETE FROM meta WHERE key = 'price_fp'", [])?;
+        }
+        idx.conn.execute_batch(schema::EXTRA_INDEXES)?;
+        Ok(idx)
+    }
+
+    pub fn meta(&self, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.conn.execute("INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![key, value])?;
+        Ok(())
+    }
+
+    /// Brings the index up to date with every seat's transcripts.
+    pub fn refresh(
+        &mut self,
+        seats: &[Seat],
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+        progress: &mut dyn FnMut(Progress),
+    ) -> anyhow::Result<RefreshStats> {
+        let all: Vec<TranscriptFile> = seats.iter().flat_map(files::list).collect();
+        self.refresh_files(all, seat_info, resolver, prices, progress)
+    }
+
+    /// A cheap refresh for the live view: only files touched in the last 30 minutes and the files
+    /// of running sessions (including subagents spawned since the last full scan).
+    pub fn refresh_hot(
+        &mut self,
+        seats: &[Seat],
+        live: &[(String, String)],
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+    ) -> anyhow::Result<RefreshStats> {
+        let since = Utc::now().timestamp() - 1800;
+        let mut out: Vec<TranscriptFile> = Vec::new();
+        {
+            let mut st = self.conn.prepare(
+                "SELECT path, seat, session_id, agent_id, kind FROM files WHERE mtime >= ?1",
+            )?;
+            let rows = st.query_map([since], |r| {
+                let kind: String = r.get(4)?;
+                Ok(TranscriptFile {
+                    path: std::path::PathBuf::from(r.get::<_, String>(0)?),
+                    seat: r.get(1)?,
+                    session_id: r.get(2)?,
+                    agent_id: r.get(3)?,
+                    kind: match kind.as_str() {
+                        "main" => FileKind::Main,
+                        "subagent" => FileKind::Subagent,
+                        _ => FileKind::Workflow(String::new()),
+                    },
+                })
+            })?;
+            for r in rows {
+                out.push(r?);
+            }
+        }
+        for (seat_label, sid) in live {
+            let Some(seat) = seats.iter().find(|s| &s.label == seat_label) else {
+                continue;
+            };
+            out.extend(files::list_session(seat, sid));
+        }
+        let mut seen = std::collections::HashSet::new();
+        out.retain(|f| seen.insert(f.path.clone()));
+        let mut quiet = |_p: Progress| {};
+        self.refresh_files(out, seat_info, resolver, prices, &mut quiet)
+    }
+
+    fn refresh_files(
+        &mut self,
+        all: Vec<TranscriptFile>,
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+        progress: &mut dyn FnMut(Progress),
+    ) -> anyhow::Result<RefreshStats> {
+        let started = Instant::now();
+        let mut known: HashMap<String, (u64, u64, u64, Option<String>, i64)> = HashMap::new();
+        {
+            let mut st = self
+                .conn
+                .prepare("SELECT path, ino, size, offset, account_uuid, last_ts FROM files")?;
+            let rows = st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    (
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get::<_, i64>(3)? as u64,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ),
+                ))
+            })?;
+            for row in rows {
+                let (k, v) = row?;
+                known.insert(k, v);
+            }
+        }
+
+        let mut work = Vec::new();
+        for f in all.iter() {
+            let Ok(m) = std::fs::metadata(&f.path) else {
+                continue;
+            };
+            let (ino, size) = (inode(&m), m.len());
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let key = f.path.to_string_lossy().into_owned();
+            let (start, account, last_ts, reset) = match known.get(&key) {
+                Some((kino, ksize, ..)) if *kino == ino && *ksize == size => continue,
+                Some((kino, _, koff, kacc, kts)) if *kino == ino && size >= *koff => {
+                    (*koff, kacc.clone(), *kts, false)
+                }
+                Some(_) => (0, None, 0, true),
+                None => (0, None, 0, false),
+            };
+            work.push(Work {
+                file: f.clone(),
+                start,
+                ino,
+                size,
+                mtime,
+                account,
+                last_ts,
+                reset,
+            });
+        }
+
+        let bytes_total: u64 = work.iter().map(|w| w.size - w.start).sum();
+        let files_total = work.len();
+        let mut stats = RefreshStats {
+            files_total: all.len(),
+            files_read: files_total,
+            ..Default::default()
+        };
+        let mut done = Progress {
+            files_done: 0,
+            files_total,
+            bytes_done: 0,
+            bytes_total,
+        };
+        progress(done);
+
+        // Big files first so the parallel batches stay balanced.
+        work.sort_by(|a, b| (b.size - b.start).cmp(&(a.size - a.start)));
+        let before: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
+        let mut type_counts: HashMap<String, u64> = HashMap::new();
+        let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for batch in work.chunks(48) {
+            let parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = batch
+                .par_iter()
+                .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
+                .collect();
+            let tx = self.conn.transaction()?;
+            for (w, chunk) in parsed {
+                let Ok(chunk) = chunk else { continue };
+                done.bytes_done += chunk.end - w.start;
+                for (t, n) in &chunk.stats.by_type {
+                    *type_counts.entry(t.clone()).or_default() += n;
+                }
+                write_file(&tx, w, chunk, &mut cwds)?;
+            }
+            tx.commit()?;
+            done.files_done += batch.len();
+            progress(done);
+        }
+        stats.bytes_read = done.bytes_done;
+
+        self.post_pass(
+            seat_info,
+            resolver,
+            prices,
+            &type_counts,
+            &cwds,
+            files_total > 0,
+        )?;
+        let after: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
+        stats.requests_new = (after - before).max(0) as u64;
+        stats.elapsed = started.elapsed();
+        self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
+        Ok(stats)
+    }
+
+    fn post_pass(
+        &mut self,
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+        types: &HashMap<String, u64>,
+        new_cwds: &std::collections::HashSet<String>,
+        changed: bool,
+    ) -> anyhow::Result<()> {
+        let now = ms(Utc::now());
+        let tx = self.conn.transaction()?;
+        for si in seat_info {
+            if let Some(a) = &si.account {
+                tx.execute(
+                    "INSERT INTO accounts(account_uuid, email, display_name, org_name, plan, tier, seat, seen_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(account_uuid) DO UPDATE SET email = excluded.email, display_name = excluded.display_name,
+                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at",
+                    params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.label, now],
+                )?;
+            }
+            if let Some(u) = &si.utilization {
+                for r in &u.readings {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO readings(account_uuid, kind, fetched_at, utilization, resets_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![u.account_uuid, r.kind.key(), ms(r.fetched_at), r.utilization, ms(r.resets_at)],
+                    )?;
+                }
+            }
+        }
+        if !changed {
+            tx.commit()?;
+            return Ok(());
+        }
+        // The account of subagent requests comes from the session's owner at that time.
+        tx.execute_batch(
+            "UPDATE requests SET account_uuid = (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat
+               AND o.session_id = requests.session_id AND o.ts <= requests.ts ORDER BY o.ts DESC LIMIT 1)
+             WHERE account_uuid IS NULL;
+             UPDATE requests SET account_uuid = (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat
+               AND o.session_id = requests.session_id ORDER BY o.ts ASC LIMIT 1)
+             WHERE account_uuid IS NULL;",
+        )?;
+        // Transcripts written before Claude Code recorded owners: the seat's current account.
+        for si in seat_info {
+            if let Some(a) = &si.account {
+                tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.label])?;
+            }
+        }
+        // Projects of new working directories.
+        let mut known_cwd = tx.prepare("SELECT 1 FROM projects WHERE cwd = ?1")?;
+        let cwds: Vec<&String> = new_cwds
+            .iter()
+            .filter(|c| !known_cwd.exists([c.as_str()]).unwrap_or(false))
+            .collect();
+        drop(known_cwd);
+        for cwd in cwds {
+            let p = resolver.resolve(&cwd);
+            tx.execute(
+                "INSERT OR REPLACE INTO projects(cwd, key, name, worktree) VALUES (?1, ?2, ?3, ?4)",
+                params![cwd, p.key, p.name, p.worktree],
+            )?;
+        }
+        for (t, n) in types {
+            tx.execute("INSERT INTO record_types(type, count) VALUES (?1, ?2) ON CONFLICT(type) DO UPDATE SET count = count + excluded.count", params![t, *n as i64])?;
+        }
+        tx.commit()?;
+        self.price_all(prices)?;
+        Ok(())
+    }
+
+    /// Re-prices every request when any price changed, and prices new requests otherwise.
+    pub fn price_all(&mut self, prices: &PriceBook) -> anyhow::Result<()> {
+        let fp = prices.fingerprint();
+        if self.meta("price_fp")?.as_deref() != Some(fp.as_str()) {
+            self.conn.execute("UPDATE requests SET cost = -1", [])?;
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut sel = tx.prepare("SELECT msg_id, model, ts, fast, input, cw5, cw1h, cread, output, thinking, web FROM requests WHERE cost < 0")?;
+            let mut upd =
+                tx.prepare("UPDATE requests SET cost = ?1, priced = ?2 WHERE msg_id = ?3")?;
+            let rows: Vec<(String, String, i64, bool, Usage)> = sel
+                .query_map([], |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get::<_, i64>(3)? != 0,
+                        Usage {
+                            input: r.get::<_, i64>(4)? as u64,
+                            cache_write_5m: r.get::<_, i64>(5)? as u64,
+                            cache_write_1h: r.get::<_, i64>(6)? as u64,
+                            cache_read: r.get::<_, i64>(7)? as u64,
+                            output: r.get::<_, i64>(8)? as u64,
+                            thinking: r.get::<_, i64>(9)? as u64,
+                            web_search: r.get::<_, i64>(10)? as u64,
+                        },
+                    ))
+                })?
+                .collect::<Result<_, _>>()?;
+            for (id, model, ts, fast, usage) in rows {
+                let day = from_ms(ts).with_timezone(&chrono::Local).date_naive();
+                let c = prices.cost(&model, day, &usage, fast);
+                upd.execute(params![c.usd, c.priced as i64, id])?;
+            }
+        }
+        tx.commit()?;
+        self.set_meta("price_fp", &fp)?;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FileAgg {
+    first_ts: Option<i64>,
+    last_ts: Option<i64>,
+    cwd: Option<String>,
+    title: Option<String>,
+    ai_title: Option<String>,
+    compactions: i64,
+}
+
+fn write_file(
+    tx: &rusqlite::Transaction,
+    w: &Work,
+    chunk: transcript::Chunk,
+    cwds: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<()> {
+    let f = &w.file;
+    let main = f.kind == FileKind::Main;
+    if w.reset {
+        tx.execute(
+            "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2",
+            params![f.seat, f.session_id],
+        )
+        .ok();
+        tx.execute(
+            "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+            params![f.seat, f.session_id, f.agent_id],
+        )?;
+    }
+    let mut account = w.account.clone();
+    let mut last_ts = w.last_ts;
+    let mut agg = FileAgg::default();
+    let mut ins_req = tx.prepare_cached(
+        "INSERT INTO requests(msg_id, seat, session_id, agent_id, account_uuid, ts, model, requested_model, effort, fast, cwd,
+                              input, cw5, cw1h, cread, output, thinking, web, tools, cost)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, -1)
+         ON CONFLICT(msg_id) DO UPDATE SET
+           input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
+           cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
+           web = MAX(web, excluded.web), tools = tools + excluded.tools,
+           account_uuid = COALESCE(account_uuid, excluded.account_uuid), cost = -1",
+    )?;
+    let mut ins_tool = tx.prepare_cached(
+        "INSERT OR IGNORE INTO tool_calls(id, msg_id, seat, session_id, agent_id, ts, name, summary, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+    )?;
+    let mut upd_tool =
+        tx.prepare_cached("UPDATE tool_calls SET done_ts = ?1, is_error = ?2 WHERE id = ?3")?;
+    for ev in chunk.events {
+        match ev {
+            Event::Owner { account_uuid } => {
+                tx.execute("INSERT OR IGNORE INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4)", params![f.seat, f.session_id, last_ts, account_uuid])?;
+                account = Some(account_uuid);
+            }
+            Event::Request(r) => {
+                let t = ms(r.ts);
+                last_ts = last_ts.max(t);
+                agg.first_ts = Some(agg.first_ts.map_or(t, |x| x.min(t)));
+                agg.last_ts = Some(agg.last_ts.map_or(t, |x| x.max(t)));
+                if r.cwd.is_some() {
+                    agg.cwd = r.cwd.clone();
+                    if let Some(c) = &r.cwd
+                        && !cwds.contains(c)
+                    {
+                        cwds.insert(c.clone());
+                    }
+                }
+                let u = r.usage;
+                ins_req.execute(params![
+                    r.msg_id,
+                    f.seat,
+                    f.session_id,
+                    f.agent_id,
+                    if main { account.clone() } else { None },
+                    t,
+                    r.model,
+                    r.requested_model,
+                    r.effort,
+                    r.fast as i64,
+                    r.cwd,
+                    u.input as i64,
+                    u.cache_write_5m as i64,
+                    u.cache_write_1h as i64,
+                    u.cache_read as i64,
+                    u.output as i64,
+                    u.thinking as i64,
+                    u.web_search as i64,
+                    r.tool_uses.len() as i64,
+                ])?;
+                for tu in &r.tool_uses {
+                    if !tu.id.is_empty() {
+                        ins_tool.execute(params![
+                            tu.id,
+                            r.msg_id,
+                            f.seat,
+                            f.session_id,
+                            f.agent_id,
+                            t,
+                            tu.name,
+                            tu.summary,
+                            tu.target
+                        ])?;
+                    }
+                }
+            }
+            Event::ToolResult {
+                tool_use_id,
+                ts,
+                is_error,
+            } => {
+                if let Some(t) = ts {
+                    last_ts = last_ts.max(ms(t));
+                }
+                upd_tool.execute(params![ts.map(ms), is_error as i64, tool_use_id])?;
+            }
+            Event::Prompt { ts, text } => {
+                if let Some(t) = ts {
+                    last_ts = last_ts.max(ms(t));
+                    if main {
+                        tx.execute("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4)", params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
+                    }
+                }
+            }
+            Event::Title { kind, text } => match kind {
+                TitleKind::Custom => agg.title = Some(text),
+                TitleKind::Ai => agg.ai_title = Some(text),
+                TitleKind::AgentName => {
+                    agg.title.get_or_insert(text);
+                }
+            },
+            Event::TurnEnd { ts, .. } => {
+                if let Some(t) = ts {
+                    last_ts = last_ts.max(ms(t));
+                }
+            }
+            Event::Compact { .. } => agg.compactions += 1,
+            Event::AgentLaunch { .. } => {}
+            Event::CostState { total_usd, models } => {
+                // Cumulative per process; a resumed session starts a new count, so keep the largest.
+                tx.execute(
+                    "INSERT INTO cost_states(seat, session_id, total_usd, models) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(seat, session_id) DO UPDATE SET total_usd = excluded.total_usd, models = excluded.models
+                     WHERE excluded.total_usd >= cost_states.total_usd",
+                    params![f.seat, f.session_id, total_usd, serde_json::to_string(&models).unwrap_or_default()],
+                )?;
+            }
+            Event::ApiError { ts, kind, text } => {
+                let t = ts.map(ms).unwrap_or(last_ts);
+                tx.execute(
+                    "INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![f.seat, f.session_id, f.agent_id, t, kind, text],
+                )?;
+            }
+        }
+    }
+
+    if main {
+        if let Some(dir) = f.path.parent().map(|p| p.join(&f.session_id))
+            && let Some(t) = files::read_custom_title(&dir)
+        {
+            agg.title = Some(t);
+        }
+        tx.execute(
+            "INSERT INTO sessions(seat, session_id, title, ai_title, cwd, first_ts, last_ts, compactions) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(seat, session_id) DO UPDATE SET
+               title = COALESCE(excluded.title, title), ai_title = COALESCE(excluded.ai_title, ai_title), cwd = COALESCE(excluded.cwd, cwd),
+               first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
+               last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
+               compactions = compactions + excluded.compactions",
+            params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts, agg.compactions],
+        )?;
+    }
+    let meta = f
+        .meta_path()
+        .and_then(|p| files::read_meta(&p))
+        .unwrap_or_default();
+    let workflow_run = match &f.kind {
+        FileKind::Workflow(r) => Some(r.clone()),
+        _ => None,
+    };
+    tx.execute(
+        "INSERT INTO agents(seat, session_id, agent_id, kind, workflow_run, agent_type, description, tool_use_id, parent_agent_id, depth,
+                            requested_model, effort, finished, first_ts, last_ts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ON CONFLICT(seat, session_id, agent_id) DO UPDATE SET
+           agent_type = COALESCE(excluded.agent_type, agent_type), description = COALESCE(excluded.description, description),
+           tool_use_id = COALESCE(excluded.tool_use_id, tool_use_id), parent_agent_id = COALESCE(excluded.parent_agent_id, parent_agent_id),
+           depth = COALESCE(excluded.depth, depth), requested_model = COALESCE(excluded.requested_model, requested_model),
+           effort = COALESCE(excluded.effort, effort), finished = excluded.finished,
+           first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
+           last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts))",
+        params![
+            f.seat,
+            f.session_id,
+            f.agent_id,
+            f.kind.tag(),
+            workflow_run,
+            meta.agent_type,
+            meta.description,
+            meta.tool_use_id,
+            meta.parent_agent_id,
+            meta.spawn_depth.map(|d| d as i64).or(if main { Some(0) } else { None }),
+            meta.model,
+            meta.effort,
+            (meta.finished || main) as i64,
+            agg.first_ts,
+            agg.last_ts,
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO files(path, seat, session_id, agent_id, kind, ino, size, mtime, offset, last_ts, account_uuid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(path) DO UPDATE SET ino = excluded.ino, size = excluded.size, mtime = excluded.mtime, offset = excluded.offset,
+           last_ts = excluded.last_ts, account_uuid = excluded.account_uuid",
+        params![
+            f.path.to_string_lossy(),
+            f.seat,
+            f.session_id,
+            f.agent_id,
+            f.kind.tag(),
+            w.ino as i64,
+            w.size as i64,
+            w.mtime,
+            chunk.end as i64,
+            last_ts,
+            account,
+        ],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_index_opens_and_reopens() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("i.sqlite");
+        let i = Index::open(&p).unwrap();
+        assert_eq!(i.count("requests").unwrap(), 0);
+        drop(i);
+        assert!(Index::open(&p).is_ok());
+    }
+}

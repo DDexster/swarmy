@@ -1,0 +1,490 @@
+//! `agentmana demo`: a made-up world of Claude Code config dirs, so the dashboard can be tried
+//! (and recorded for the README) without anyone's real data.
+//!
+//! Two seats on two accounts, four projects, two weeks of history, and a background thread that
+//! keeps a swarm of agents busy: tools start and finish, agents spawn and complete, one session
+//! asks for permission now and then.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use chrono::{DateTime, Duration, Utc};
+use serde_json::json;
+
+use crate::claude::procs::proc_start_ticks;
+use crate::claude::seats::Seat;
+
+fn rnd(a: u64, b: u64) -> u64 {
+    crate::tui::hash(a, b, 0x5eed)
+}
+
+fn frac(a: u64, b: u64) -> f64 {
+    (rnd(a, b) % 10_000) as f64 / 10_000.0
+}
+
+const PROJECTS: &[&str] = &["storefront", "payments-api", "ml-pipeline", "docs-site"];
+const MODELS: &[(&str, &str)] = &[
+    ("claude-opus-5-5", "high"),
+    ("claude-fable-5-2", "xhigh"),
+    ("claude-sonnet-5-5", "medium"),
+    ("claude-haiku-5-5", "low"),
+];
+
+const TOOLS: &[(&str, &str, &str)] = &[
+    ("Bash", "command", "cargo test --workspace --no-fail-fast"),
+    ("Bash", "command", "npm run build && npm run lint"),
+    ("Bash", "command", "pytest -q tests/test_checkout.py"),
+    ("Bash", "command", "git diff --stat origin/main"),
+    (
+        "Edit",
+        "file_path",
+        "/home/dev/work/storefront/src/cart/pricing.rs",
+    ),
+    (
+        "Edit",
+        "file_path",
+        "/home/dev/work/payments-api/handlers/refund.go",
+    ),
+    (
+        "Read",
+        "file_path",
+        "/home/dev/work/ml-pipeline/train/config.yaml",
+    ),
+    ("Grep", "pattern", "fn apply_discount"),
+    ("Glob", "pattern", "**/*.test.ts"),
+    ("WebSearch", "query", "stripe idempotency keys retries"),
+    (
+        "Write",
+        "file_path",
+        "/home/dev/work/docs-site/content/api/webhooks.md",
+    ),
+];
+
+const AGENT_NAMES: &[&str] = &[
+    "Fix flaky checkout tests",
+    "Refund flow: idempotency",
+    "Profile feature pipeline",
+    "Audit pricing rounding",
+    "Write webhook docs",
+    "Migrate cart to new API",
+    "Review payment retries",
+    "Speed up CI cache",
+    "Port tokenizer to Rust",
+    "Triage lint warnings",
+];
+
+pub struct Demo {
+    pub root: PathBuf,
+    pub seats: Vec<Seat>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Demo {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+struct SeatDef {
+    label: &'static str,
+    account: &'static str,
+    email: &'static str,
+    utilization: f64,
+    resets_in_h: i64,
+}
+
+const SEATS: &[SeatDef] = &[
+    SeatDef {
+        label: "personal",
+        account: "acc-demo-personal",
+        email: "alex@example.com",
+        utilization: 71.0,
+        resets_in_h: 77,
+    },
+    SeatDef {
+        label: "work",
+        account: "acc-demo-work",
+        email: "alex@acme.example",
+        utilization: 38.0,
+        resets_in_h: 130,
+    },
+];
+
+fn usage(seed: u64, model: &str) -> serde_json::Value {
+    let big = model.contains("opus") || model.contains("fable");
+    let cr = 40_000 + rnd(seed, 1) % if big { 260_000 } else { 90_000 };
+    let cw = 300 + rnd(seed, 2) % 6_000;
+    let out = 80 + rnd(seed, 3) % if big { 2_600 } else { 900 };
+    json!({"input_tokens": 2 + rnd(seed, 4) % 8, "cache_creation_input_tokens": cw, "cache_read_input_tokens": cr,
+           "output_tokens": out, "output_tokens_details": {"thinking_tokens": out * (20 + rnd(seed, 5) % 40) / 100}, "cache_creation": {"ephemeral_1h_input_tokens": cw, "ephemeral_5m_input_tokens": 0},
+           "speed": "standard"})
+}
+
+fn ts(t: DateTime<Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn assistant(
+    seed: u64,
+    t: DateTime<Utc>,
+    model: &str,
+    effort: &str,
+    cwd: &str,
+    agent: Option<&str>,
+    tool: usize,
+) -> (serde_json::Value, String) {
+    let (name, key, val) = TOOLS[tool % TOOLS.len()];
+    let tool_id = format!("toolu_demo{seed:x}");
+    let mut v = json!({
+        "type": "assistant", "timestamp": ts(t), "cwd": cwd, "effort": effort, "requestedModel": model,
+        "message": {"id": format!("msg_demo{seed:x}"), "model": model,
+                    "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {key: val}}],
+                    "stop_reason": "tool_use", "usage": usage(seed, model)}
+    });
+    if let Some(a) = agent {
+        v["agentId"] = json!(a);
+        v["isSidechain"] = json!(true);
+    }
+    (v, tool_id)
+}
+
+fn tool_result(t: DateTime<Utc>, tool_id: &str) -> serde_json::Value {
+    json!({"type": "user", "timestamp": ts(t),
+           "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}]},
+           "toolUseResult": {"stdout": "ok"}})
+}
+
+fn append(path: &Path, lines: &[serde_json::Value]) {
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        for l in lines {
+            let _ = writeln!(f, "{l}");
+        }
+    }
+}
+
+fn project_dir(seat_dir: &Path, project: &str) -> PathBuf {
+    seat_dir
+        .join("projects")
+        .join(format!("-home-dev-work-{project}"))
+}
+
+fn cwd(project: &str) -> String {
+    format!("/home/dev/work/{project}")
+}
+
+/// Builds the demo world under `root` (wiped first) and starts the agents.
+pub fn start(root: &Path) -> anyhow::Result<Demo> {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root)?;
+    let now = Utc::now();
+    let mut seats = Vec::new();
+    for (si, s) in SEATS.iter().enumerate() {
+        let dir = root.join(format!(".claude-{}", s.label));
+        std::fs::create_dir_all(dir.join("projects"))?;
+        std::fs::create_dir_all(dir.join("sessions"))?;
+        let cj = json!({
+            "oauthAccount": {"accountUuid": s.account, "emailAddress": s.email, "displayName": "Alex Demo",
+                             "userRateLimitTier": "default_claude_max_20x"},
+            "cachedUsageUtilization": {"fetchedAtMs": (now - Duration::minutes(4)).timestamp_millis(), "accountUuid": s.account,
+                "utilization": {"seven_day": {"utilization": s.utilization, "resets_at": ts(now + Duration::hours(s.resets_in_h))},
+                                "five_hour": {"utilization": 22.0 + si as f64 * 15.0, "resets_at": ts(now + Duration::minutes(130 + si as i64 * 60))}}}
+        });
+        std::fs::write(dir.join(".claude.json"), serde_json::to_string_pretty(&cj)?)?;
+        std::fs::write(
+            dir.join(".credentials.json"),
+            json!({"claudeAiOauth": {"accessToken": format!("demo-access-{}", s.label), "refreshToken": format!("demo-refresh-{}", s.label),
+                   "expiresAt": (now + Duration::hours(6)).timestamp_millis(), "refreshTokenExpiresAt": (now + Duration::days(25)).timestamp_millis()}})
+            .to_string(),
+        )?;
+        history(&dir, s, si as u64, now);
+        seats.push(Seat {
+            label: s.label.into(),
+            claude_json: dir.join(".claude.json"),
+            dir,
+            is_default: false,
+            found_by: vec!["demo"],
+        });
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    let seat_dirs: Vec<PathBuf> = seats.iter().map(|s| s.dir.clone()).collect();
+    std::thread::spawn(move || live(seat_dirs, st));
+    Ok(Demo {
+        root: root.to_path_buf(),
+        seats,
+        stop,
+    })
+}
+
+/// Two weeks of finished sessions with subagents, busier on weekdays and in working hours.
+fn history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
+    for day in 0..15i64 {
+        let weekday = (now - Duration::days(day))
+            .format("%u")
+            .to_string()
+            .parse::<u64>()
+            .unwrap_or(1);
+        let load = if weekday >= 6 { 0.35 } else { 1.0 } * (0.6 + frac(si * 100 + day as u64, 9));
+        for (pi, project) in PROJECTS.iter().enumerate() {
+            if si == 1 && pi == 3 || si == 0 && pi == 2 {
+                continue;
+            }
+            let seed0 = si * 10_000 + day as u64 * 100 + pi as u64;
+            let sid = format!("{:08x}-demo-{}-{day}-{pi}", rnd(seed0, 7) as u32, s.label);
+            let pdir = project_dir(dir, project);
+            let start = if day == 0 {
+                now - Duration::minutes(55 + (rnd(seed0, 8) % 120) as i64)
+            } else {
+                now - Duration::days(day) + Duration::hours(-14 + (rnd(seed0, 8) % 6) as i64)
+            };
+            let mut main = vec![
+                json!({"type": "session-owner", "accountUuid": s.account, "sessionId": sid}),
+                json!({"type": "custom-title", "customTitle": format!("{project} sprint"), "sessionId": sid}),
+                json!({"type": "user", "timestamp": ts(start), "message": {"role": "user", "content": "Plan and run today's tasks"}}),
+            ];
+            let n_main = (20.0 * load) as u64 + 5;
+            for i in 0..n_main {
+                let seed = seed0 * 1000 + i;
+                let t = start + Duration::minutes(i as i64 * 3);
+                let (a, tid) = assistant(
+                    seed,
+                    t,
+                    "claude-opus-5-5",
+                    "high",
+                    &cwd(project),
+                    None,
+                    i as usize,
+                );
+                main.push(a);
+                main.push(tool_result(t + Duration::seconds(20), &tid));
+            }
+            append(&pdir.join(format!("{sid}.jsonl")), &main);
+            let n_agents = (4.0 * load) as u64 + 1;
+            for k in 0..n_agents {
+                let aid = format!("ad{:015x}", rnd(seed0, 50 + k) >> 4);
+                let (model, effort) =
+                    MODELS[(rnd(seed0, 60 + k) % if pi == 2 { 4 } else { 3 }) as usize];
+                let sub = pdir.join(&sid).join("subagents");
+                let meta = json!({"agentType": if k % 3 == 0 { "Explore" } else { "general-purpose" },
+                                  "description": AGENT_NAMES[((seed0 + k) % AGENT_NAMES.len() as u64) as usize],
+                                  "model": model, "effort": effort, "spawnDepth": 1, "finished": true});
+                let _ = std::fs::create_dir_all(&sub);
+                let _ =
+                    std::fs::write(sub.join(format!("agent-{aid}.meta.json")), meta.to_string());
+                let mut lines = Vec::new();
+                let n = (30.0 * load) as u64 + 8;
+                for i in 0..n {
+                    let seed = seed0 * 100_000 + k * 1000 + i;
+                    let t = start
+                        + Duration::minutes(5 + k as i64 * 7)
+                        + Duration::seconds(i as i64 * 40);
+                    let (a, tid) = assistant(
+                        seed,
+                        t,
+                        model,
+                        effort,
+                        &cwd(project),
+                        Some(&aid),
+                        (k + i) as usize,
+                    );
+                    lines.push(a);
+                    lines.push(tool_result(t + Duration::seconds(15), &tid));
+                }
+                append(&sub.join(format!("agent-{aid}.jsonl")), &lines);
+            }
+        }
+    }
+}
+
+struct LiveAgent {
+    path: PathBuf,
+    meta: PathBuf,
+    id: String,
+    model: &'static str,
+    effort: &'static str,
+    project: &'static str,
+    open_tool: Option<(String, DateTime<Utc>)>,
+    steps_left: u64,
+    seed: u64,
+}
+
+/// Keeps the demo agents working until stopped.
+fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
+    let pid = std::process::id();
+    let start = proc_start_ticks(pid);
+    let now = Utc::now();
+    let sessions = [
+        (
+            0usize,
+            "storefront",
+            "a1b2c3d4-demo-live-storefront",
+            "checkout-revamp",
+        ),
+        (1, "payments-api", "e5f6a7b8-demo-live-payments", "refunds"),
+    ];
+    // Main threads with a little recent history, and the registry entries.
+    for (si, project, sid, name) in sessions {
+        let dir = &seat_dirs[si];
+        let p = project_dir(dir, project).join(format!("{sid}.jsonl"));
+        let mut lines = vec![
+            json!({"type": "session-owner", "accountUuid": SEATS[si].account, "sessionId": sid}),
+            json!({"type": "custom-title", "customTitle": name, "sessionId": sid}),
+        ];
+        for i in 0..12u64 {
+            let t = now - Duration::minutes(40 - i as i64 * 3);
+            let (a, tid) = assistant(
+                9_000 + i + si as u64 * 50,
+                t,
+                "claude-opus-5-5",
+                "high",
+                &cwd(project),
+                None,
+                i as usize,
+            );
+            lines.push(a);
+            lines.push(tool_result(t + Duration::seconds(30), &tid));
+        }
+        append(&p, &lines);
+        write_registry(dir, pid, start.as_deref(), sid, project, name, "busy");
+    }
+    // A stalled agent from 40 minutes ago.
+    {
+        let sub = project_dir(&seat_dirs[0], "storefront")
+            .join(sessions[0].2)
+            .join("subagents");
+        let _ = std::fs::create_dir_all(&sub);
+        let _ = std::fs::write(
+            sub.join("agent-adstalled0000001.meta.json"),
+            json!({"agentType": "general-purpose", "description": "Bisect the cart regression", "model": "claude-opus-5-5", "effort": "high", "spawnDepth": 1, "finished": false}).to_string(),
+        );
+        let t = now - Duration::minutes(41);
+        let (a, _) = assistant(
+            77_777,
+            t,
+            "claude-opus-5-5",
+            "high",
+            &cwd("storefront"),
+            Some("adstalled0000001"),
+            0,
+        );
+        append(&sub.join("agent-adstalled0000001.jsonl"), &[a]);
+    }
+    let mut agents: Vec<LiveAgent> = Vec::new();
+    let mut tick: u64 = 0;
+    let mut spawned: u64 = 0;
+    while !stop.load(Ordering::Relaxed) {
+        let now = Utc::now();
+        // Keep 5–7 agents running.
+        let want = 5 + (tick / 7 % 3);
+        while (agents.len() as u64) < want {
+            spawned += 1;
+            let (si, project, sid, _) = sessions[(spawned % 2) as usize];
+            let (model, effort) = MODELS[(spawned * 7 % 3) as usize];
+            let id = format!("adlive{spawned:011x}");
+            let sub = project_dir(&seat_dirs[si], project)
+                .join(sid)
+                .join("subagents");
+            let _ = std::fs::create_dir_all(&sub);
+            let meta = sub.join(format!("agent-{id}.meta.json"));
+            let desc = AGENT_NAMES[(spawned as usize * 3) % AGENT_NAMES.len()];
+            let _ = std::fs::write(&meta, json!({"agentType": if spawned % 4 == 0 { "Explore" } else { "general-purpose" }, "description": desc, "model": model, "effort": effort, "spawnDepth": 1, "finished": false}).to_string());
+            agents.push(LiveAgent {
+                path: sub.join(format!("agent-{id}.jsonl")),
+                meta,
+                id,
+                model,
+                effort,
+                project,
+                open_tool: None,
+                steps_left: 6 + spawned % 9,
+                seed: 1_000_000 + spawned * 1000,
+            });
+        }
+        for a in agents.iter_mut() {
+            a.seed += 1;
+            match &a.open_tool {
+                Some((tid, since)) if (now - *since).num_seconds() as u64 >= 2 + a.seed % 5 => {
+                    append(&a.path, &[tool_result(now, tid)]);
+                    a.open_tool = None;
+                    a.steps_left = a.steps_left.saturating_sub(1);
+                }
+                None if a.seed % 3 != 0 => {
+                    let (v, tid) = assistant(
+                        a.seed,
+                        now,
+                        a.model,
+                        a.effort,
+                        &cwd(a.project),
+                        Some(&a.id),
+                        (a.seed % 11) as usize,
+                    );
+                    append(&a.path, &[v]);
+                    a.open_tool = Some((tid, now));
+                }
+                _ => {}
+            }
+        }
+        // Finished agents.
+        agents.retain(|a| {
+            if a.steps_left == 0 && a.open_tool.is_none() {
+                if let Ok(text) = std::fs::read_to_string(&a.meta)
+                    && let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    v["finished"] = json!(true);
+                    let _ = std::fs::write(&a.meta, v.to_string());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        // The payments session asks for permission every so often.
+        let waiting = tick % 30 >= 22;
+        let (si, project, sid, name) = sessions[1];
+        write_registry(
+            &seat_dirs[si],
+            pid,
+            start.as_deref(),
+            sid,
+            project,
+            name,
+            if waiting { "waiting" } else { "busy" },
+        );
+        tick += 1;
+        std::thread::sleep(std::time::Duration::from_millis(700));
+    }
+}
+
+fn write_registry(
+    dir: &Path,
+    pid: u32,
+    start: Option<&str>,
+    sid: &str,
+    project: &str,
+    name: &str,
+    status: &str,
+) {
+    let mut v = json!({"pid": pid, "sessionId": sid, "cwd": cwd(project), "startedAt": Utc::now().timestamp_millis() - 3_600_000,
+                       "version": "demo", "kind": "interactive", "name": name, "status": status,
+                       "statusUpdatedAt": Utc::now().timestamp_millis()});
+    if status == "waiting" {
+        v["waitingFor"] = json!("permission: Bash git push");
+    }
+    if let Some(s) = start {
+        v["procStart"] = json!(s);
+    }
+    // One file per session: the registry is keyed by pid, so use a per-session name.
+    let _ = std::fs::write(
+        dir.join("sessions").join(format!("{pid}.json")),
+        v.to_string(),
+    );
+}
