@@ -1,0 +1,413 @@
+//! Typed reads for the live view (`crate::live`): the SQL over the index tables stays here, so the
+//! schema has one owner. Times are epoch milliseconds, as stored.
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
+use rusqlite::{OptionalExtension, params};
+
+use super::{Index, ms};
+
+/// One agent (or main thread, `agent_id` empty) with its session's title and directory.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AgentRow {
+    pub seat: String,
+    pub session_id: String,
+    pub agent_id: String,
+    pub kind: String,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+    pub parent_agent_id: Option<String>,
+    pub depth: Option<i64>,
+    pub requested_model: Option<String>,
+    pub effort: Option<String>,
+    pub finished: bool,
+    pub last_ts: Option<i64>,
+    pub first_ts: Option<i64>,
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+}
+
+/// Which agent a per-agent read is about.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentKey<'a> {
+    pub seat: &'a str,
+    pub session_id: &'a str,
+    pub agent_id: &'a str,
+}
+
+/// The agent's latest request.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LastRequest {
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub ts: Option<i64>,
+    /// Prompt size: input plus cache writes and reads.
+    pub context_tokens: Option<i64>,
+    pub account: Option<String>,
+}
+
+/// A tool call that has not finished.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenTool {
+    pub name: String,
+    pub summary: Option<String>,
+    pub ts: i64,
+}
+
+/// A finished agent, for the recently-done list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoneAgent {
+    pub name: String,
+    pub cwd: Option<String>,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+    pub cost: Option<f64>,
+    pub model: Option<String>,
+}
+
+/// An agent spawned or finished since some time, for the event log.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentEventRow {
+    pub name: String,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+    pub finished: bool,
+    /// The model of its first request.
+    pub model: Option<String>,
+    pub cost: Option<f64>,
+    pub effort: Option<String>,
+}
+
+/// One request of an agent: time, cost (0 when unpriced) and prompt size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RequestPoint {
+    pub ts: i64,
+    pub cost: f64,
+    pub context: i64,
+}
+
+/// One tool call of an agent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolCallRow {
+    pub ts: i64,
+    pub name: String,
+    pub summary: Option<String>,
+    pub done_ts: Option<i64>,
+    pub is_error: bool,
+}
+
+impl Index {
+    /// Agents active since `recent`, unfinished ones active since `unfinished_since`, and every
+    /// main thread (the caller keeps the ones that matter).
+    pub fn live_agent_rows(
+        &self,
+        recent: DateTime<Utc>,
+        unfinished_since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<AgentRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
+                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts
+             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
+             WHERE a.last_ts >= ?1 OR (a.finished = 0 AND a.last_ts >= ?2) OR a.agent_id = ''",
+        )?;
+        let rows = st.query_map(params![ms(recent), ms(unfinished_since)], |r| {
+            Ok(AgentRow {
+                seat: r.get(0)?,
+                session_id: r.get(1)?,
+                agent_id: r.get(2)?,
+                kind: r.get(3)?,
+                agent_type: r.get(4)?,
+                description: r.get(5)?,
+                parent_agent_id: r.get(6)?,
+                depth: r.get(7)?,
+                requested_model: r.get(8)?,
+                effort: r.get(9)?,
+                finished: r.get::<_, i64>(10)? != 0,
+                last_ts: r.get(11)?,
+                title: r.get(12)?,
+                cwd: r.get(13)?,
+                first_ts: r.get(14)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Project name by working directory.
+    pub fn project_names(&self) -> anyhow::Result<HashMap<String, String>> {
+        let mut st = self.conn.prepare_cached("SELECT cwd, name FROM projects")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn last_request(&self, a: AgentKey) -> anyhow::Result<Option<LastRequest>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid FROM requests
+             WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 1",
+        )?;
+        Ok(st
+            .query_row(params![a.seat, a.session_id, a.agent_id], |x| {
+                Ok(LastRequest {
+                    model: x.get(0)?,
+                    effort: x.get(1)?,
+                    ts: x.get(2)?,
+                    context_tokens: x.get(3)?,
+                    account: x.get(4)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// Requests and their total cost.
+    pub fn agent_totals(&self, a: AgentKey) -> anyhow::Result<(u64, f64)> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT COUNT(*), TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+        )?;
+        let (n, cost): (i64, f64) = st
+            .query_row(params![a.seat, a.session_id, a.agent_id], |x| {
+                Ok((x.get(0)?, x.get(1)?))
+            })?;
+        Ok((n.max(0) as u64, cost))
+    }
+
+    /// The newest tool call started at or after `since_ms` that has not finished.
+    pub fn open_tool(&self, a: AgentKey, since_ms: i64) -> anyhow::Result<Option<OpenTool>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT name, summary, ts FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND done_ts IS NULL AND ts >= ?4
+             ORDER BY ts DESC LIMIT 1",
+        )?;
+        Ok(st
+            .query_row(params![a.seat, a.session_id, a.agent_id, since_ms], |x| {
+                Ok(OpenTool {
+                    name: x.get(0)?,
+                    summary: x.get(1)?,
+                    ts: x.get(2)?,
+                })
+            })
+            .optional()?)
+    }
+
+    /// When the agent's last tool call finished.
+    pub fn last_tool_done(&self, a: AgentKey) -> anyhow::Result<Option<i64>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT MAX(done_ts) FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+        )?;
+        Ok(st.query_row(params![a.seat, a.session_id, a.agent_id], |x| x.get(0))?)
+    }
+
+    /// Spend per minute since `start`: (minute index from `start`, cost).
+    pub fn agent_spend_per_minute(
+        &self,
+        a: AgentKey,
+        start: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(i64, f64)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT (ts - ?4) / 60000, TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4 GROUP BY 1",
+        )?;
+        let rows = st.query_map(params![a.seat, a.session_id, a.agent_id, ms(start)], |x| {
+            Ok((x.get(0)?, x.get(1)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Times of the agent's requests since `start`.
+    pub fn agent_request_times(
+        &self,
+        a: AgentKey,
+        start: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<i64>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT ts FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4",
+        )?;
+        let rows = st.query_map(params![a.seat, a.session_id, a.agent_id, ms(start)], |r| {
+            r.get(0)
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Tool calls running at some point since `start`: (started, finished or `now`, tool name).
+    pub fn agent_tool_spans(
+        &self,
+        a: AgentKey,
+        start: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT ts, COALESCE(done_ts, ?5), name FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3
+             AND COALESCE(done_ts, ?5) >= ?4",
+        )?;
+        let rows = st.query_map(
+            params![a.seat, a.session_id, a.agent_id, ms(start), ms(now)],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// A whole session's spend, and its spend since `since`.
+    pub fn session_spend(
+        &self,
+        seat: &str,
+        session_id: &str,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<(f64, f64)> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT TOTAL(cost), TOTAL(CASE WHEN ts >= ?3 THEN cost ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
+        )?;
+        Ok(st.query_row(params![seat, session_id, ms(since)], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?)
+    }
+
+    /// Spend per minute and model since `start`: (minute index from `start`, model, cost).
+    pub fn spend_per_minute_by_model(
+        &self,
+        start: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(i64, String, f64)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT (ts - ?1) / 60000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1, 2",
+        )?;
+        let rows = st.query_map(params![ms(start)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Everything spent since `since`.
+    pub fn spend_since(&self, since: DateTime<Utc>) -> anyhow::Result<f64> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT TOTAL(cost) FROM requests WHERE ts >= ?1")?;
+        Ok(st.query_row(params![ms(since)], |r| r.get(0))?)
+    }
+
+    /// Agents that finished since `since`, newest first (at most 60).
+    pub fn recently_done(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<DoneAgent>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
+                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1)
+             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
+             WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60",
+        )?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok(DoneAgent {
+                name: r.get(0)?,
+                cwd: r.get(1)?,
+                first_ts: r.get(2)?,
+                last_ts: r.get(3)?,
+                cost: r.get(4)?,
+                model: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// API errors since `since`, counted by kind.
+    pub fn api_error_counts(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<(String, u64)>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 GROUP BY 1")?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok((r.get(0)?, r.get::<_, i64>(1)?.max(0) as u64))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Agents spawned, or finished, since `since`.
+    pub fn agent_events(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<AgentEventRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT COALESCE(a.description, a.agent_type, a.agent_id), a.first_ts, a.last_ts, a.finished,
+                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1),
+                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                    a.effort
+             FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))",
+        )?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok(AgentEventRow {
+                name: r.get(0)?,
+                first_ts: r.get(1)?,
+                last_ts: r.get(2)?,
+                finished: r.get::<_, i64>(3)? == 1,
+                model: r.get(4)?,
+                cost: r.get(5)?,
+                effort: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// API errors since `since`: (time, kind, text).
+    pub fn api_errors_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(i64, String, Option<String>)>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT ts, kind, text FROM api_errors WHERE ts >= ?1")?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The user's prompts since `since`: (time, characters, session title or empty).
+    pub fn prompts_since(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<(i64, i64, String)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT p.ts, p.chars, COALESCE(s.title, s.ai_title, '') FROM prompts p
+             LEFT JOIN sessions s ON s.seat = p.seat AND s.session_id = p.session_id WHERE p.ts >= ?1",
+        )?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The transcript file of an agent.
+    pub fn transcript_path(&self, a: AgentKey) -> anyhow::Result<Option<String>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT path FROM files WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+        )?;
+        Ok(st
+            .query_row(params![a.seat, a.session_id, a.agent_id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// The agent's latest `limit` requests, newest first.
+    pub fn agent_requests(&self, a: AgentKey, limit: usize) -> anyhow::Result<Vec<RequestPoint>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT ts, COALESCE(cost, 0), input + cw5 + cw1h + cread FROM requests
+             WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT ?4",
+        )?;
+        let rows = st.query_map(
+            params![a.seat, a.session_id, a.agent_id, limit as i64],
+            |r| {
+                Ok(RequestPoint {
+                    ts: r.get(0)?,
+                    cost: r.get(1)?,
+                    context: r.get(2)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The agent's latest `limit` tool calls, newest first.
+    pub fn agent_tool_calls(&self, a: AgentKey, limit: usize) -> anyhow::Result<Vec<ToolCallRow>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT ts, name, summary, done_ts, is_error FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT ?4",
+        )?;
+        let rows = st.query_map(
+            params![a.seat, a.session_id, a.agent_id, limit as i64],
+            |r| {
+                Ok(ToolCallRow {
+                    ts: r.get(0)?,
+                    name: r.get(1)?,
+                    summary: r.get(2)?,
+                    done_ts: r.get(3)?,
+                    is_error: r.get::<_, i64>(4)? != 0,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+}

@@ -1,5 +1,7 @@
 # Counts in production code (tests excluded) that may only go down (tests/architecture.rs).
-fallbacks_index_vault_cli = 57
+fallbacks_index_vault_app_cli_limits = 57
 unwraps = 18
-wildcard_arms = 58
-files_over_900_lines = 5
+wildcard_arms = 55
+files_over_900_lines = 0
+limit_threshold_copies = 0
+tui_duration_literals_outside_jobs = 1

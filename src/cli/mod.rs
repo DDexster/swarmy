@@ -1,7 +1,6 @@
 //! Command-line interface.
 
 pub mod accounts;
-pub mod context;
 pub mod doctor;
 pub mod limits;
 pub mod models;
@@ -187,7 +186,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) => {
             let dirs = crate::config::Dirs::resolve()?;
             let demo = crate::demo::start(&dirs.data.join("demo"))?;
-            let mut ctx = context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
+            let mut ctx = crate::app::context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
             // Saved logins, so the VAULT screen has something to show.
             {
                 let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
@@ -231,7 +230,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             }
         }
         command => {
-            let ctx = context::Ctx::load(painter, cli.mask)?;
+            let ctx = crate::app::context::Ctx::load(painter, cli.mask)?;
             match command {
                 Some(Command::Report(a)) => report::run(&ctx, &a),
                 Some(Command::Models(a)) => models::run(&ctx, &a),

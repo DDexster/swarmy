@@ -1,0 +1,19 @@
+//! swarmy: mission control for Claude Code agents.
+//!
+//! The library holds everything; the `swarmy` binary only parses the command line and calls
+//! [`cli::run`].
+
+pub mod app;
+pub mod claude;
+pub mod cli;
+pub mod config;
+pub mod core;
+pub mod demo;
+pub mod fleet;
+pub mod index;
+pub mod limits;
+pub mod live;
+pub mod power;
+pub mod tui;
+pub mod ui;
+pub mod vault;

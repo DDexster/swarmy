@@ -17,7 +17,7 @@ use anyhow::Context as _;
 use clap::Args;
 use serde_json::{Map, Value, json};
 
-use super::context::Ctx;
+use crate::app::context::Ctx;
 use crate::claude::seats::Seat;
 use crate::ui::style::Tone;
 

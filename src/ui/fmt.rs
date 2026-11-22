@@ -123,6 +123,20 @@ pub fn gauge(frac: f64, width: usize) -> String {
     format!("▕{b}{}▏", " ".repeat(width.saturating_sub(used)))
 }
 
+/// Bytes in binary units: `512 B`, `3 KB`, `1.5 MB`, `2.0 GB`.
+pub fn human_bytes(b: u64) -> String {
+    let f = b as f64;
+    if b >= 1 << 30 {
+        format!("{:.1} GB", f / (1u64 << 30) as f64)
+    } else if b >= 1 << 20 {
+        format!("{:.1} MB", f / (1u64 << 20) as f64)
+    } else if b >= 1 << 10 {
+        format!("{:.0} KB", f / 1024.0)
+    } else {
+        format!("{b} B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

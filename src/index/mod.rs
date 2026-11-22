@@ -6,6 +6,7 @@
 //! start. The first run reads everything in parallel.
 
 pub mod insights;
+pub mod live;
 mod prices;
 pub mod query;
 #[cfg(test)]
@@ -35,7 +36,7 @@ const SEAT_ACCOUNT_AT: &str = "COALESCE((SELECT sa.account_uuid FROM seat_accoun
 const PROJECTS_REV: &str = "4";
 
 pub struct Index {
-    pub conn: Connection,
+    conn: Connection,
     /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
     /// again only when a file was added to it.
     session_dirs: HashMap<(String, String), ListedDirs>,
@@ -119,6 +120,9 @@ impl Index {
 
     fn init(conn: Connection) -> anyhow::Result<Index> {
         conn.busy_timeout(Duration::from_secs(10))?;
+        // The live view runs a couple of dozen distinct statements every second (`live.rs`);
+        // keep them all prepared instead of the default 16.
+        conn.set_prepared_statement_cache_capacity(64);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // Facts migrate, the cache is rebuilt when its version changed; requests read again

@@ -10,12 +10,13 @@ use crate::claude::credentials;
 use crate::claude::registry;
 use crate::claude::seats::Seat;
 use crate::core::limits::WindowKind;
+use crate::limits::{AccountReport, all_reports};
 use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 use crate::vault::{self, Vault};
 
-use super::context::Ctx;
+use crate::app::context::Ctx;
 
 #[derive(Args, Debug, Clone)]
 pub struct AccountsArgs {
@@ -100,23 +101,21 @@ fn live_in(ctx: &Ctx, s: &Seat) -> usize {
     registered.max(by_env)
 }
 
-/// Last known weekly utilization of an account, accounting for resets since the reading.
-fn weekly(ctx: &Ctx, account: Option<&str>) -> Option<(f64, chrono::DateTime<chrono::Utc>, bool)> {
+/// The weekly window of an account as the limit analysis sees it (the same estimate as
+/// `swarmy limits`, the dashboard and the status line): (used ≈ now, resets at, the window rolled
+/// over since the last reading).
+fn weekly(
+    reports: &[AccountReport],
+    account: Option<&str>,
+) -> Option<(f64, chrono::DateTime<chrono::Utc>, bool)> {
     let account = account?;
-    let (_, rs) = ctx
-        .latest_readings()
-        .into_iter()
-        .find(|(a, _)| a == account)?;
-    let r = rs.into_iter().find(|r| r.kind == WindowKind::SevenDay)?;
-    if r.is_reset(ctx.now) {
-        let mut end = r.resets_at;
-        while end <= ctx.now {
-            end += chrono::Duration::days(7);
-        }
-        Some((0.0, end, true))
-    } else {
-        Some((r.utilization, r.resets_at, false))
-    }
+    let w = reports
+        .iter()
+        .find(|r| r.account_uuid == account)?
+        .windows
+        .iter()
+        .find(|w| w.reading.kind == WindowKind::SevenDay)?;
+    Some((w.estimate_now, w.window.end, w.reset_passed))
 }
 
 pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
@@ -276,6 +275,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
 
 fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     let states = v.edit(|tx| tx.seat_states(&ctx.seats))?;
+    let (idx, _) = ctx.index()?;
+    let reports = all_reports(ctx, &idx)?;
     let p = &ctx.painter;
     println!(
         "{} {}",
@@ -296,7 +297,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
         let st = states.get(&s.label).cloned().unwrap_or_default();
         let acct = si.account.as_ref().map(|a| a.account_uuid.clone());
-        let w = weekly(ctx, acct.as_deref());
+        let w = weekly(&reports, acct.as_deref());
         let (week, tone, resets) = match w {
             Some((u, end, reset)) => (
                 format!(
@@ -367,7 +368,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     ]);
     let mut best: Option<(f64, &str)> = None;
     for l in v.logins() {
-        let w = weekly(ctx, l.account_uuid.as_deref());
+        let w = weekly(&reports, l.account_uuid.as_deref());
         let week = match w {
             Some((u, _, reset)) => {
                 if l.mounted.is_none() && best.is_none_or(|(b, _)| u < b) {

@@ -1,33 +1,53 @@
 # Allowed `crate::<module>::` references between top-level modules (production code).
 # New lines need a reason; lines only ever get removed.
+# The composition root (Ctx) reads seats, config, prices, the index and the vault's labels.
+app -> claude
+app -> config
+app -> core
+app -> index
+# Ctx::index draws the first-run progress bar with ui::fmt.
+app -> ui
+app -> vault
 claude -> config
 claude -> core
 claude -> fleet
+# Commands start from the composition root.
+cli -> app
 cli -> claude
 cli -> config
 cli -> core
 cli -> demo
 cli -> fleet
 cli -> index
+# `swarmy limits` and `swarmy accounts` print the limit analysis.
+cli -> limits
 cli -> tui
 cli -> ui
 cli -> vault
 config -> claude
 config -> core
 demo -> claude
-demo -> tui
+# The demo world's pseudo-randomness (ui::hash, shared with the boot animation).
+demo -> ui
 index -> claude
 index -> core
+# The analysis reads its inputs (now, names, tiers, seat readings) from the context.
+limits -> app
+# Pure estimation rules.
+limits -> core
+# The queries feeding the estimation.
+limits -> index
 live -> claude
 live -> core
 live -> index
-live -> ui
 tui -> claude
-# The dashboard depends on the CLI (Ctx, limits): a cycle with cli -> tui (review H4).
-tui -> cli
+# The dashboard's worker starts from the composition root.
+tui -> app
 tui -> core
 tui -> fleet
 tui -> index
+# The dashboard shows the same limit analysis as `swarmy limits`.
+tui -> limits
 tui -> live
 tui -> power
 tui -> ui

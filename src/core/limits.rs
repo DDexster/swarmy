@@ -86,6 +86,58 @@ impl Reading {
     }
 }
 
+/// How full a limit window is: one set of thresholds for every front end (dashboard colours,
+/// CLI tones, status-line ANSI codes, alerts). Each front end maps a level to its own colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub enum Level {
+    /// Under 60%.
+    Ok,
+    /// From 60% to under 85%.
+    Warn,
+    /// From 85% to under 100%.
+    Bad,
+    /// 100% or more: "limit reached".
+    Reached,
+}
+
+impl Level {
+    pub const WARN_AT: f64 = 60.0;
+    pub const BAD_AT: f64 = 85.0;
+    pub const REACHED_AT: f64 = 100.0;
+
+    pub fn of(pct: f64) -> Level {
+        if pct >= Self::REACHED_AT {
+            Level::Reached
+        } else if pct >= Self::BAD_AT {
+            Level::Bad
+        } else if pct >= Self::WARN_AT {
+            Level::Warn
+        } else {
+            Level::Ok
+        }
+    }
+}
+
+/// The window `r` belongs to, rolled forward to the one that contains `now` when the reading is
+/// from an earlier window (the window keeps its length and cadence).
+pub fn current_window(r: &Reading, now: DateTime<Utc>) -> Span {
+    let mut w = r.window();
+    while w.end <= now {
+        w = Span {
+            start: w.end,
+            end: w.end + r.kind.length(),
+        };
+    }
+    w
+}
+
+/// A reset happened between two analyses of the same kind of window: its (effective) start moved
+/// forward, either because the window rolled over or because the limit was reset by hand (see
+/// [`effective_start`]).
+pub fn was_reset(before: Span, after: Span) -> bool {
+    after.start > before.start
+}
+
 /// The effective start of `cur`'s window, and the moment of a reset done by hand.
 ///
 /// Claude Code can reset a 5-hour (and, sometimes, the weekly) limit early. Utilization then falls
@@ -182,11 +234,239 @@ pub fn estimate_now(reading: f64, spent_since: f64, usd_per_point: Option<f64>) 
 
 /// Time until the limit reaches 100% at the given burn rate (points per hour).
 pub fn eta(current: f64, points_per_hour: f64) -> Option<Duration> {
-    if current >= 100.0 {
+    if Level::of(current) == Level::Reached {
         return Some(Duration::zero());
     }
-    (points_per_hour > 1e-9)
-        .then(|| Duration::seconds(((100.0 - current) / points_per_hour * 3600.0) as i64))
+    (points_per_hour > 1e-9).then(|| {
+        Duration::seconds(((Level::REACHED_AT - current) / points_per_hour * 3600.0) as i64)
+    })
+}
+
+/// When the window runs out at the current pace: the [`eta`], kept only when it comes before the
+/// window resets (after the reset the pace no longer matters).
+pub fn runs_out(
+    current: f64,
+    points_per_hour: Option<f64>,
+    now: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Option<Duration> {
+    points_per_hour
+        .and_then(|pph| eta(current, pph))
+        .filter(|d| now + *d < window_end)
+}
+
+/// Where the window ends up at the current pace: utilization at its reset, uncapped (over 100
+/// means it runs out first). `None` without a positive pace.
+pub fn projection_at_reset(
+    current: f64,
+    points_per_hour: Option<f64>,
+    now: DateTime<Utc>,
+    window_end: DateTime<Utc>,
+) -> Option<f64> {
+    points_per_hour.filter(|p| *p > 0.0).map(|pph| {
+        let left = (window_end - now).num_seconds().max(0) as f64 / 3600.0;
+        current + pph * left
+    })
+}
+
+// ───────────────────────── estimating one window ─────────────────────────
+//
+// The rules below are pure: `crate::limits` queries the index for their inputs
+// (`WindowInputs`) and turns the result into a report.
+
+/// Burn rate is measured over the last this many minutes.
+pub const BURN_MINUTES: i64 = 60;
+
+/// Another account of the same plan tier serves as the reference ratio only when its USD per
+/// point beats this account's own by more than this factor (20%): within that, the two differ by
+/// noise, not by hidden usage.
+pub const REFERENCE_MARGIN: f64 = 1.2;
+
+/// At most this many recent readings (with distinct values) calibrate an account's ratio.
+const CALIBRATION_READINGS: usize = 12;
+
+/// Readings closer than this (points) count as one value when calibrating.
+const CALIBRATION_STEP: f64 = 0.5;
+
+/// Where a reading's window stands now.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowPlace {
+    /// The window that contains now; its start is moved to a reset by hand.
+    pub window: Span,
+    /// When the limit was reset by hand inside this window.
+    pub manual_reset: Option<DateTime<Utc>>,
+    /// The window has rolled over since the reading (a new window without a reading yet).
+    pub reset_passed: bool,
+}
+
+/// The window of `r` now: rolled forward when it reset since the reading, else its nominal window
+/// with the start moved to a reset by hand found in `history` (readings of the same kind).
+pub fn window_of(r: &Reading, history: &[Reading], now: DateTime<Utc>) -> WindowPlace {
+    let reset_passed = r.is_reset(now);
+    let mut window = current_window(r, now);
+    let mut manual_reset = None;
+    if !reset_passed {
+        let (start, reset) = effective_start(history, r);
+        window.start = start;
+        manual_reset = reset;
+    }
+    WindowPlace {
+        window,
+        manual_reset,
+        reset_passed,
+    }
+}
+
+/// What the estimate counts from: the reading and its time, or zero from the window start when the
+/// window rolled over since the reading.
+pub fn counting_from(r: &Reading, place: &WindowPlace) -> (f64, DateTime<Utc>) {
+    if place.reset_passed {
+        (0.0, place.window.start)
+    } else {
+        (r.utilization, r.fetched_at)
+    }
+}
+
+/// The readings that calibrate an account's USD per point, each with the span whose spend it
+/// reflects (from its effective window start to the reading): the most recent readings with
+/// distinct values, newest first. `history` holds the stored readings of `r`'s kind, oldest first;
+/// `r` is added when not stored yet.
+pub fn calibration_points(history: &[Reading], r: &Reading) -> Vec<(Span, f64)> {
+    let mut history = history.to_vec();
+    if !history.iter().any(|h| h.fetched_at == r.fetched_at) {
+        history.push(*r);
+    }
+    let mut recent: Vec<Reading> = Vec::new();
+    for h in history.iter().rev() {
+        if recent
+            .last()
+            .is_none_or(|l: &Reading| (l.utilization - h.utilization).abs() >= CALIBRATION_STEP)
+        {
+            recent.push(*h);
+        }
+        if recent.len() >= CALIBRATION_READINGS {
+            break;
+        }
+    }
+    recent
+        .into_iter()
+        .map(|h| {
+            let (start, _) = effective_start(&history, &h);
+            (
+                Span {
+                    start,
+                    end: h.fetched_at,
+                },
+                h.utilization,
+            )
+        })
+        .collect()
+}
+
+/// The account's own USD per point: the median over `(utilization, spend until it)` pairs.
+pub fn own_ratio(points: &[(f64, f64)]) -> Option<f64> {
+    let samples: Vec<f64> = points
+        .iter()
+        .filter_map(|(u, c)| usd_per_point(*u, *c))
+        .collect();
+    calibrate(&samples)
+}
+
+/// Whether a tier reference ratio replaces the account's own (see [`REFERENCE_MARGIN`]).
+pub fn reference_wins(own: Option<f64>, reference: f64) -> bool {
+    own.is_none_or(|o| reference > o * REFERENCE_MARGIN)
+}
+
+/// The step of a window's curve: about 170 points whatever its length, at least a minute.
+pub fn curve_step(window: Span) -> Duration {
+    Duration::minutes(((window.end - window.start).num_minutes() / 168).max(1))
+}
+
+/// Everything the estimate of one window needs, as queried from the index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowInputs {
+    pub reading: Reading,
+    pub place: WindowPlace,
+    /// USD per point measured on this account alone ([`own_ratio`]).
+    pub own_usd_per_point: Option<f64>,
+    /// Spend since the point [`counting_from`] names.
+    pub spent_since: f64,
+    /// Spend from the window start until now.
+    pub cost_in_window: f64,
+    /// Spend over the last [`BURN_MINUTES`].
+    pub cost_burn: f64,
+    /// Spend in the window per project.
+    pub by_project: Vec<(String, f64)>,
+    /// Spend per [`curve_step`] from the window start (empty when the window rolled over).
+    pub series: Vec<f64>,
+    pub series_step: Duration,
+}
+
+/// The estimate of one window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowEstimate {
+    /// USD per point used: the reference's when given, else the account's own.
+    pub usd_per_point: Option<f64>,
+    pub estimate_now: f64,
+    /// ≈ points explained by spend visible on this machine.
+    pub visible_points: Option<f64>,
+    /// ≈ points from claude.ai, the desktop app, other computers…
+    pub outside_points: Option<f64>,
+    pub burn_usd_per_hour: f64,
+    pub points_per_hour: Option<f64>,
+    /// When it runs out at this pace, if before the reset ([`runs_out`]).
+    pub eta: Option<Duration>,
+    pub shares: Vec<Share>,
+    /// ≈ API-equivalent dollars of a full window.
+    pub window_usd: Option<f64>,
+    /// Cumulative spend through the window, scaled to end at `estimate_now`.
+    pub curve: Vec<f64>,
+}
+
+/// Estimates one window. `reference` is the tier reference ratio already chosen with
+/// [`reference_wins`].
+pub fn window_estimate(
+    i: &WindowInputs,
+    reference: Option<f64>,
+    now: DateTime<Utc>,
+) -> WindowEstimate {
+    let usd_per_point = reference.or(i.own_usd_per_point);
+    let (base, _) = counting_from(&i.reading, &i.place);
+    let estimate_now = estimate_now(base, i.spent_since, usd_per_point);
+    // What the spend seen here explains can not exceed the estimate; the rest is elsewhere.
+    let visible_points = usd_per_point.map(|u| (i.cost_in_window / u).min(estimate_now));
+    let outside_points = visible_points.map(|v| (estimate_now - v).max(0.0));
+    let burn_usd_per_hour = i.cost_burn * 60.0 / BURN_MINUTES as f64;
+    let points_per_hour = usd_per_point.map(|u| burn_usd_per_hour / u);
+    let eta = runs_out(estimate_now, points_per_hour, now, i.place.window.end);
+    let shares = attribute(visible_points.unwrap_or(estimate_now), &i.by_project);
+    let total: f64 = i.series.iter().sum();
+    let scale = if total > 0.0 {
+        estimate_now / total
+    } else {
+        0.0
+    };
+    let mut acc = 0.0;
+    let curve = i
+        .series
+        .iter()
+        .map(|c| {
+            acc += c;
+            acc * scale
+        })
+        .collect();
+    WindowEstimate {
+        usd_per_point,
+        estimate_now,
+        visible_points,
+        outside_points,
+        burn_usd_per_hour,
+        points_per_hour,
+        eta,
+        shares,
+        window_usd: usd_per_point.map(|u| u * 100.0),
+        curve,
+    }
 }
 
 #[cfg(test)]
@@ -273,5 +553,297 @@ mod tests {
         assert_eq!(eta(70.0, 3.0), Some(Duration::hours(10)));
         assert_eq!(eta(100.0, 0.0), Some(Duration::zero()));
         assert_eq!(eta(50.0, 0.0), None);
+    }
+
+    #[test]
+    fn levels_at_their_boundaries() {
+        assert_eq!(Level::of(0.0), Level::Ok);
+        assert_eq!(Level::of(59.99), Level::Ok);
+        assert_eq!(Level::of(60.0), Level::Warn);
+        assert_eq!(Level::of(84.99), Level::Warn);
+        assert_eq!(Level::of(85.0), Level::Bad);
+        assert_eq!(Level::of(99.99), Level::Bad);
+        assert_eq!(Level::of(100.0), Level::Reached);
+        assert_eq!(
+            Level::of(130.0),
+            Level::Reached,
+            "extra usage goes past 100"
+        );
+        assert!(Level::Reached > Level::Bad && Level::Bad > Level::Warn && Level::Warn > Level::Ok);
+    }
+
+    fn ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn current_window_rolls_forward() {
+        // A weekly reading that resets on Mon 11-23 00:00: its window is 11-16 → 11-23.
+        let r = Reading {
+            kind: WindowKind::SevenDay,
+            utilization: 40.0,
+            resets_at: ts("2026-11-23T00:00:00Z"),
+            fetched_at: ts("2026-11-20T00:00:00Z"),
+        };
+        let w = current_window(&r, ts("2026-11-22T12:00:00Z"));
+        assert_eq!(
+            (w.start, w.end),
+            (ts("2026-11-16T00:00:00Z"), ts("2026-11-23T00:00:00Z"))
+        );
+        // At the reset itself the next window starts (end is exclusive).
+        let w = current_window(&r, ts("2026-11-23T00:00:00Z"));
+        assert_eq!(
+            (w.start, w.end),
+            (ts("2026-11-23T00:00:00Z"), ts("2026-11-30T00:00:00Z"))
+        );
+        // Two windows later: 11-30 → 12-07.
+        let w = current_window(&r, ts("2026-12-01T09:00:00Z"));
+        assert_eq!(
+            (w.start, w.end),
+            (ts("2026-11-30T00:00:00Z"), ts("2026-12-07T00:00:00Z"))
+        );
+        // A 5-hour window rolls by 5 hours: reset 10:00, now 16:30 → 15:00 → 20:00.
+        let five = Reading {
+            kind: WindowKind::FiveHour,
+            resets_at: ts("2026-11-20T10:00:00Z"),
+            ..r
+        };
+        let w = current_window(&five, ts("2026-11-20T16:30:00Z"));
+        assert_eq!(
+            (w.start, w.end),
+            (ts("2026-11-20T15:00:00Z"), ts("2026-11-20T20:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn reset_is_a_start_moving_forward() {
+        let span = |a: &str, b: &str| Span {
+            start: ts(a),
+            end: ts(b),
+        };
+        let week = span("2026-11-16T00:00:00Z", "2026-11-23T00:00:00Z");
+        assert!(!was_reset(week, week));
+        // Rolled over.
+        assert!(was_reset(
+            week,
+            span("2026-11-23T00:00:00Z", "2026-11-30T00:00:00Z")
+        ));
+        // Reset by hand on 11-19 06:00: same end, later start.
+        assert!(was_reset(
+            week,
+            span("2026-11-19T06:00:00Z", "2026-11-23T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn runs_out_and_projection_by_hand() {
+        let now = ts("2026-11-20T12:00:00Z");
+        let end = ts("2026-11-21T00:00:00Z"); // 12 h left
+        // 70% at 2 points/h: runs out in 15 h, after the reset → no runs-out; at the reset
+        // 70 + 2 × 12 = 94%.
+        assert_eq!(runs_out(70.0, Some(2.0), now, end), None);
+        assert_eq!(projection_at_reset(70.0, Some(2.0), now, end), Some(94.0));
+        // 70% at 5 points/h: (100 − 70) / 5 = 6 h → before the reset; projection 70 + 60 = 130.
+        assert_eq!(
+            runs_out(70.0, Some(5.0), now, end),
+            Some(Duration::hours(6))
+        );
+        assert_eq!(projection_at_reset(70.0, Some(5.0), now, end), Some(130.0));
+        // No pace: no projection, and runs out only when already reached.
+        assert_eq!(projection_at_reset(70.0, Some(0.0), now, end), None);
+        assert_eq!(projection_at_reset(70.0, None, now, end), None);
+        assert_eq!(runs_out(70.0, None, now, end), None);
+        assert_eq!(runs_out(100.0, Some(0.0), now, end), Some(Duration::zero()));
+    }
+
+    // ── estimating one window ──
+
+    fn hour(h: i64) -> DateTime<Utc> {
+        ts("2026-11-20T00:00:00Z") + Duration::hours(h)
+    }
+
+    /// A weekly reading that resets at hour 100.
+    fn wk(h: i64, used: f64) -> Reading {
+        Reading {
+            kind: WindowKind::SevenDay,
+            utilization: used,
+            resets_at: hour(100),
+            fetched_at: hour(h),
+        }
+    }
+
+    #[test]
+    fn reference_wins_only_beyond_twenty_percent() {
+        // No own ratio: any reference is better than nothing.
+        assert!(reference_wins(None, 0.3));
+        // Own $1.00 per point: a reference has to exceed $1.20.
+        assert!(reference_wins(Some(1.0), 1.3));
+        assert!(!reference_wins(Some(1.0), 1.2), "exactly 20% more is noise");
+        assert!(!reference_wins(Some(1.0), 1.1));
+        assert!(!reference_wins(Some(1.0), 0.5));
+    }
+
+    #[test]
+    fn window_of_a_reading() {
+        let hist = [wk(10, 40.0), wk(20, 70.0), wk(22, 3.0)];
+        // Inside the window, after a reset by hand between hours 20 and 22: counts from 20.
+        let p = window_of(&hist[2], &hist, hour(50));
+        assert_eq!(p.window.start, hour(20));
+        assert_eq!(p.window.end, hour(100));
+        assert_eq!(p.manual_reset, Some(hour(20)));
+        assert!(!p.reset_passed);
+        assert_eq!(counting_from(&hist[2], &p), (3.0, hour(22)));
+        // After the reset at hour 100: the next window, counting from zero at its start.
+        let p = window_of(&hist[2], &hist, hour(120));
+        assert!(p.reset_passed);
+        assert_eq!(p.manual_reset, None);
+        assert_eq!((p.window.start, p.window.end), (hour(100), hour(268)));
+        assert_eq!(counting_from(&hist[2], &p), (0.0, hour(100)));
+    }
+
+    #[test]
+    fn calibration_points_and_own_ratio_by_hand() {
+        // Stored 10.0, 10.3, 11.0; the current 12.0 is not stored yet. Newest first: 12.0, 11.0,
+        // 10.3; 10.0 is within half a point of 10.3 and is skipped. Each span runs from the
+        // window start (hour 100 − 168 = hour −68) to its reading.
+        let hist = [wk(1, 10.0), wk(2, 10.3), wk(3, 11.0)];
+        let pts = calibration_points(&hist, &wk(4, 12.0));
+        let start = hour(-68);
+        let want: Vec<(Span, f64)> = [(4, 12.0), (3, 11.0), (2, 10.3)]
+            .iter()
+            .map(|&(h, u)| {
+                (
+                    Span {
+                        start,
+                        end: hour(h),
+                    },
+                    u,
+                )
+            })
+            .collect();
+        assert_eq!(pts, want);
+        // At most 12 readings: 20 readings one point apart give the 12 newest.
+        let many: Vec<Reading> = (1..=20).map(|h| wk(h, h as f64)).collect();
+        let pts = calibration_points(&many, &many[19]);
+        assert_eq!(pts.len(), 12);
+        assert_eq!(pts[11].1, 9.0);
+        // 10% after $4 → $0.40/pt; 30% after $14 → $14/30; 0.5% is too little to trust.
+        // Median of the two: (12/30 + 14/30) / 2 = 13/30.
+        let r = own_ratio(&[(10.0, 4.0), (30.0, 14.0), (0.5, 10.0)]).unwrap();
+        assert!((r - 13.0 / 30.0).abs() < 1e-12);
+        assert_eq!(own_ratio(&[]), None);
+    }
+
+    #[test]
+    fn curve_step_keeps_about_170_points() {
+        let span = |h: i64| Span {
+            start: hour(0),
+            end: hour(h),
+        };
+        // A week: 10 080 min / 168 = 60 min. Five hours: 300 / 168 = 1 min.
+        assert_eq!(curve_step(span(168)), Duration::minutes(60));
+        assert_eq!(curve_step(span(5)), Duration::minutes(1));
+    }
+
+    /// 30% read at hour 10; the window ends at hour 100 and now is hour 76 (24 h left).
+    fn inputs() -> WindowInputs {
+        let r = wk(10, 30.0);
+        WindowInputs {
+            reading: r,
+            place: window_of(&r, &[r], hour(76)),
+            own_usd_per_point: Some(0.5),
+            spent_since: 5.0,
+            cost_in_window: 15.0,
+            cost_burn: 2.0,
+            by_project: vec![("b".into(), 5.0), ("a".into(), 10.0)],
+            series: vec![5.0, 0.0, 10.0],
+            series_step: Duration::hours(1),
+        }
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn window_estimate_with_its_own_ratio() {
+        let e = window_estimate(&inputs(), None, hour(76));
+        // $0.50 per point: 30 + $5 / 0.5 = 40%.
+        assert_eq!(e.usd_per_point, Some(0.5));
+        assert!(near(e.estimate_now, 40.0));
+        // $15 in the window explain 30 points; the other 10 come from elsewhere.
+        assert!(near(e.visible_points.unwrap(), 30.0));
+        assert!(near(e.outside_points.unwrap(), 10.0));
+        // $2 in the last hour = 4 points/h: (100 − 40) / 4 = 15 h, before the reset in 24 h.
+        assert!(near(e.burn_usd_per_hour, 2.0));
+        assert!(near(e.points_per_hour.unwrap(), 4.0));
+        assert_eq!(e.eta, Some(Duration::hours(15)));
+        // The visible 30 points split $10 : $5 → a 20, b 10 (largest first).
+        assert_eq!(e.shares[0].key, "a");
+        assert!(near(e.shares[0].limit_points, 20.0));
+        assert!(near(e.shares[1].limit_points, 10.0));
+        // A full window ≈ 100 × $0.50 = $50.
+        assert!(near(e.window_usd.unwrap(), 50.0));
+        // Cumulative 5, 5, 15 scaled by 40/15: 13.33, 13.33, 40.
+        assert!(near(e.curve[0], 40.0 / 3.0));
+        assert!(near(e.curve[1], 40.0 / 3.0));
+        assert!(near(e.curve[2], 40.0));
+    }
+
+    #[test]
+    fn window_estimate_with_a_tier_reference() {
+        // The reference $1.00 per point replaces the own $0.50: 30 + 5 / 1 = 35%; the $15 seen
+        // here explain 15 points, 20 come from elsewhere; 2 points/h → (100 − 35) / 2 = 32.5 h,
+        // after the reset in 24 h, so no runs-out time.
+        let e = window_estimate(&inputs(), Some(1.0), hour(76));
+        assert_eq!(e.usd_per_point, Some(1.0));
+        assert!(near(e.estimate_now, 35.0));
+        assert!(near(e.visible_points.unwrap(), 15.0));
+        assert!(near(e.outside_points.unwrap(), 20.0));
+        assert!(near(e.points_per_hour.unwrap(), 2.0));
+        assert_eq!(e.eta, None);
+        assert!(near(e.window_usd.unwrap(), 100.0));
+    }
+
+    #[test]
+    fn window_estimate_after_the_reset() {
+        // Rolled over at hour 100; now hour 120. Counting from 0 at hour 100: $6 at $2/pt = 3%.
+        let r = wk(10, 30.0);
+        let i = WindowInputs {
+            place: window_of(&r, &[r], hour(120)),
+            own_usd_per_point: Some(2.0),
+            spent_since: 6.0,
+            cost_in_window: 6.0,
+            series: Vec::new(),
+            ..inputs()
+        };
+        let e = window_estimate(&i, None, hour(120));
+        assert!(near(e.estimate_now, 3.0));
+        assert!(near(e.visible_points.unwrap(), 3.0));
+        assert!(near(e.outside_points.unwrap(), 0.0));
+        assert!(e.curve.is_empty());
+    }
+
+    #[test]
+    fn window_estimate_with_nothing_known() {
+        // No ratio and nothing spent: the reading itself, nothing derived.
+        let i = WindowInputs {
+            own_usd_per_point: None,
+            spent_since: 0.0,
+            cost_in_window: 0.0,
+            cost_burn: 0.0,
+            by_project: Vec::new(),
+            series: Vec::new(),
+            ..inputs()
+        };
+        let e = window_estimate(&i, None, hour(76));
+        assert!(near(e.estimate_now, 30.0));
+        assert_eq!(
+            (e.usd_per_point, e.visible_points, e.outside_points),
+            (None, None, None)
+        );
+        assert_eq!((e.points_per_hour, e.eta, e.window_usd), (None, None, None));
+        assert!(e.shares.is_empty() && e.curve.is_empty());
+        assert!(near(e.burn_usd_per_hour, 0.0));
     }
 }

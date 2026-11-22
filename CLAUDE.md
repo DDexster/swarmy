@@ -27,7 +27,9 @@ logins. Users run it in a spare terminal, mostly on laptops.
   ```
   Measure *your* process (`pgrep -x swarmy` may find the owner's own instance), per thread from
   `/proc/<pid>/task/*/stat`. `SWARMY_DEBUG=1 swarmy 2>log` prints per-tick and per-frame
-  timings. Per-second work may only touch running sessions (`Index::refresh_hot` with cached dir
+  timings (and the job table at start). Every cadence lives in the job table `src/tui/jobs.rs`
+  (period, battery period, what it reads; tests pin the measured values and keep heavy jobs at
+  ≥ 30 s); the worker holds no intervals of its own. Per-second work may only touch running sessions (`Index::refresh_hot` with cached dir
   listings, `ProcTable::for_pids`, per-agent totals reused when no new request arrived); period
   aggregates (2 min), limits (1 min), efficiency (5 min), the previous period (10 min), lanes and
   session totals (10 s), history charts (5 min), the full process table and disks
@@ -38,6 +40,10 @@ logins. Users run it in a spare terminal, mostly on laptops.
   of Claude Code's cached prices applies from the day the index first saw it; an override derives
   what it leaves out from the entry it overrides (`Rates::derive`). Money numbers in tests are
   computed by hand in comments.
+- Limit rules live once, in `src/core/limits.rs`: `Level` (60/85/100 thresholds; front ends only
+  map a level to their colour), `current_window`, `runs_out`, `projection_at_reset`, `was_reset`.
+  Every surface reads an account's limit from `Ctx::latest_readings` (index + seats, newest wins)
+  through `limits::all_reports`; the `limit_threshold_copies` ratchet keeps copies out.
 - The index schema (`src/index/schema.rs`) has cache tables (rebuilt from transcripts when
   `CACHE_VERSION` changes) and fact tables that nothing else records (`seat_accounts`, `accounts`,
   `readings`, `observed_prices`: migrated by `FACTS_VERSION` steps, never dropped). A new table
@@ -48,14 +54,17 @@ logins. Users run it in a spare terminal, mostly on laptops.
 
 | Path | What |
 |---|---|
+| `src/lib.rs`, `src/main.rs` | the library holds everything; the binary only parses arguments and calls `cli::run` |
 | `src/core/` | pure domain: usage, pricing, periods, limits math (no I/O) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
-| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats |
-| `src/live/` | live agent states for the dashboard |
+| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
+| `src/live/` | live agent states for the dashboard; `state.rs`: how an agent's state is decided (pure, table-tested) |
 | `src/vault/` | login vault and switching |
+| `src/app/` | composition root `Ctx` (dirs, config, seats, prices, index), used by commands and dashboard |
+| `src/limits/` | limit analysis per account (`all_reports`): queries feeding the pure rules of `core::limits` |
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices |
-| `src/tui/` | dashboard: worker thread + UI loop (`mod.rs`), state and keys (`app.rs`), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
-| `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer, dialogs (`mod.rs`); panels that fill any rect (`panels.rs`); primitives (`kit.rs`) |
+| `src/tui/` | dashboard: UI loop (`mod.rs`), worker thread (`worker.rs`) on the cadences of `jobs.rs`, analytics passes (`analytics.rs`), state (`app/mod.rs`) and keys (`app/keys.rs`), what needs attention and what gets logged (`alerts.rs`: pure, tested), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
+| `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer (`mod.rs`); dialogs and toast (`overlays.rs`); help and legend (`help.rs`); panels that fill any rect (`panels/`, one file per panel, shared helpers in `panels/mod.rs`); primitives (`kit.rs`) |
 | `src/demo.rs` | made-up world for `swarmy demo` and README media |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
@@ -114,7 +123,7 @@ terminal; every panel fills its rect; positions are stable (the selection is kep
 tree is in start order, panel sizes do not depend on the agent count); colour only where it means
 something; everything works from the keyboard.
 
-Words on screen (keep them, and the legend in `view/mod.rs::legend_lines`, in sync):
+Words on screen (keep them, and the legend in `view/help.rs::legend_lines`, in sync):
 - **seat** = a Claude Code config dir; **login** = an OAuth sign-in (saved ones live in the vault);
   **account** = the Anthropic account behind a login, named after its saved login.
 - Limits: "week used N%", "runs out in 7h (Mon 03:34)", "limit reached"; shares as "% of week",

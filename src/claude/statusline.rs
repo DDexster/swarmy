@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::claude::config_json::Utilization;
-use crate::core::limits::{Reading, WindowKind};
+use crate::core::limits::{Level, Reading, WindowKind};
 
 /// What `swarmy statusline` keeps of one call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -267,13 +267,16 @@ fn form(p: &Paint, parts: &[(&str, &str)]) -> (String, usize) {
     (text, width)
 }
 
+/// A context window this full turns amber, then red (not a limit: its own thresholds).
+const CONTEXT_WARN: f64 = 70.0;
+const CONTEXT_BAD: f64 = 85.0;
+
+/// The ANSI code of a limit's level (`core::limits::Level`), the same colours as the dashboard.
 fn level(pct: f64) -> &'static str {
-    if pct >= 85.0 {
-        "1;31"
-    } else if pct >= 60.0 {
-        "33"
-    } else {
-        "32"
+    match Level::of(pct) {
+        Level::Ok => "32",
+        Level::Warn => "33",
+        Level::Bad | Level::Reached => "1;31",
     }
 }
 
@@ -440,7 +443,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                         .format("%a %H:%M")
                         .to_string()
                 };
-                if pct >= 100.0 {
+                if Level::of(pct) == Level::Reached {
                     let r = resets
                         .map(|t| format!(" · resets {}", when(t)))
                         .unwrap_or_default();
@@ -509,9 +512,9 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 else {
                     continue;
                 };
-                let code = if c >= 85.0 {
+                let code = if c >= CONTEXT_BAD {
                     "1;31"
-                } else if c >= 70.0 {
+                } else if c >= CONTEXT_WARN {
                     "33"
                 } else {
                     ""
@@ -586,9 +589,9 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
         }
         if let Some(sg) = segs.iter_mut().find(|s| s.key == key && !s.dropped) {
             if drop {
-                // A 5-hour limit past 60% and a context past 70% stay.
-                let keep = (key == "five_hour" && pct_of(key) >= 60.0)
-                    || (key == "context" && pct_of(key) >= 70.0);
+                // A 5-hour limit from amber on and a context past 70% stay.
+                let keep = (key == "five_hour" && Level::of(pct_of(key)) >= Level::Warn)
+                    || (key == "context" && pct_of(key) >= CONTEXT_WARN);
                 if !keep {
                     sg.dropped = true;
                 }

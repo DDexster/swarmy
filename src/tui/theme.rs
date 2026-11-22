@@ -2,6 +2,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::core::limits::Level;
 use crate::core::models::Family;
 use crate::live::State;
 
@@ -183,13 +184,12 @@ impl Theme {
         self.family(Family::of(name))
     }
 
+    /// The colour of a limit's level (`core::limits::Level`).
     pub fn utilization(&self, pct: f64) -> Color {
-        if pct >= 85.0 {
-            self.bad
-        } else if pct >= 60.0 {
-            self.warn
-        } else {
-            self.good
+        match Level::of(pct) {
+            Level::Ok => self.good,
+            Level::Warn => self.warn,
+            Level::Bad | Level::Reached => self.bad,
         }
     }
 

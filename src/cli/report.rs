@@ -6,15 +6,15 @@ use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 
-use super::context::Ctx;
 use super::{Format, ReportArgs};
+use crate::app::context::Ctx;
 
 pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
     let filter = a.filter.to_filter();
     let span = a
         .period
-        .span(ctx.now, ctx.limit_week(filter.account.as_deref()));
+        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_deref())?);
     let mut rows = idx.spend_by(a.by, span, &filter)?;
     let total = idx.total(span, &filter)?;
     if a.by == Dim::Account {

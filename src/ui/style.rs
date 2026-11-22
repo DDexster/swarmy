@@ -6,6 +6,7 @@ use std::io::IsTerminal;
 
 use owo_colors::{AnsiColors, OwoColorize, Style};
 
+use crate::core::limits::Level;
 use crate::core::models::Family;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +37,12 @@ impl Tone {
         }
     }
 
-    /// Green under 60%, amber to 85%, red above.
+    /// The tone of a limit's level (`core::limits::Level`): green, amber, red.
     pub fn of_utilization(pct: f64) -> Tone {
-        if pct >= 85.0 {
-            Tone::Bad
-        } else if pct >= 60.0 {
-            Tone::Warn
-        } else {
-            Tone::Good
+        match Level::of(pct) {
+            Level::Ok => Tone::Good,
+            Level::Warn => Tone::Warn,
+            Level::Bad | Level::Reached => Tone::Bad,
         }
     }
 

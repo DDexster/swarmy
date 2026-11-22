@@ -98,9 +98,19 @@ fn counts() -> BTreeMap<&'static str, usize> {
         let prod = production(text);
         let n = |pat: &str| prod.matches(pat).count();
         // Silent fallbacks where errors decide who pays and what is saved.
-        if matches!(m.as_str(), "index" | "vault" | "cli") {
-            *c.entry("fallbacks_index_vault_cli").or_default() +=
+        if matches!(m.as_str(), "index" | "vault" | "app" | "cli" | "limits") {
+            *c.entry("fallbacks_index_vault_app_cli_limits").or_default() +=
                 n("unwrap_or_default()") + n(".ok()") + n("let _ =") + n("unwrap_or(0");
+        }
+        // Limit thresholds written again outside `core::limits::Level` (review M1).
+        if m != "core" {
+            *c.entry("limit_threshold_copies").or_default() +=
+                n(">= 85.0") + n(">= 60.0") + n("estimate_now >= 100.0") + n("pct >= 100.0");
+        }
+        // Intervals belong in the dashboard's job table (`tui/jobs.rs`, review M10).
+        if m == "tui" && !p.ends_with("tui/jobs.rs") {
+            *c.entry("tui_duration_literals_outside_jobs").or_default() +=
+                n("Duration::from_secs(") + n("Duration::from_millis(") + n(".as_secs() <");
         }
         *c.entry("unwraps").or_default() += n(".unwrap()") + n(".expect(");
         *c.entry("wildcard_arms").or_default() += n("_ =>");
@@ -133,4 +143,40 @@ fn ratchets_only_go_down() {
         }
     }
     assert!(errors.is_empty(), "{}", errors.join("\n"));
+}
+
+/// `core` is the pure domain: no clock, no files, no database (review M2). Time comes in as an
+/// argument, so every rule there is testable with fixed numbers.
+#[test]
+fn core_is_pure() {
+    let (root, files) = files();
+    let mut found = Vec::new();
+    for (p, text) in &files {
+        if module_of(&root, p) != "core" {
+            continue;
+        }
+        for pat in ["Utc::now", "Local::now", "std::fs", "rusqlite", "std::env"] {
+            if production(text).contains(pat) {
+                found.push(format!(
+                    "{}: {pat}",
+                    p.strip_prefix(&root).unwrap().display()
+                ));
+            }
+        }
+    }
+    assert!(found.is_empty(), "core must stay pure: {found:?}");
+}
+
+/// The index owns its schema: no SQL and no `rusqlite` outside `src/index/` (review M4). Other
+/// modules read through typed methods (`index::live`, `index::query`, …).
+#[test]
+fn sql_stays_in_the_index() {
+    let (root, files) = files();
+    let found: Vec<String> = files
+        .iter()
+        .filter(|(p, _)| module_of(&root, p) != "index")
+        .filter(|(_, t)| t.contains("SELECT ") || t.contains("rusqlite"))
+        .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
+    assert!(found.is_empty(), "SQL outside src/index/: {found:?}");
 }

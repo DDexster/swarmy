@@ -273,8 +273,9 @@ impl Ctx {
             .and_then(|a| a.email.clone())
     }
 
-    /// The freshest utilization reading of every account Claude Code has cached.
-    pub fn latest_readings(&self) -> Vec<(String, Vec<Reading>)> {
+    /// The freshest utilization reading of every account Claude Code has cached in a seat now
+    /// (the status line's when newer).
+    fn seat_readings(&self) -> Vec<(String, Vec<Reading>)> {
         let mut best: std::collections::BTreeMap<String, &config_json::Utilization> =
             std::collections::BTreeMap::new();
         for si in &self.seat_info {
@@ -290,28 +291,45 @@ impl Ctx {
             .collect()
     }
 
-    /// The current weekly window of the most recently active account, for `--period week`.
-    pub fn limit_week(&self, account: Option<&str>) -> Option<Span> {
-        let readings = self.latest_readings();
+    /// The latest reading of every account and window kind: the newest stored in the index, or
+    /// the one a seat holds now when newer. Every account ever read is there, not only those in a
+    /// seat now: a login parked in the vault keeps its last known limit and reset time. Every
+    /// surface (`swarmy limits`, `swarmy accounts`, `doctor`, the dashboard, the status line
+    /// through `fleet`) starts from these readings, so they agree on an account.
+    pub fn latest_readings(&self, idx: &Index) -> anyhow::Result<Vec<(String, Vec<Reading>)>> {
+        let mut merged: std::collections::BTreeMap<String, Vec<Reading>> =
+            idx.latest_readings()?.into_iter().collect();
+        for (acct, rs) in self.seat_readings() {
+            let e = merged.entry(acct).or_default();
+            for r in rs {
+                match e.iter_mut().find(|x| x.kind == r.kind) {
+                    Some(x) if x.fetched_at < r.fetched_at => *x = r,
+                    Some(_) => {}
+                    None => e.push(r),
+                }
+            }
+        }
+        Ok(merged.into_iter().collect())
+    }
+
+    /// The current weekly window of the given account, else of the most recently read one, for
+    /// `--period week`.
+    pub fn limit_week(&self, idx: &Index, account: Option<&str>) -> anyhow::Result<Option<Span>> {
+        let readings = self.latest_readings(idx)?;
         let pick = match account {
             Some(a) => readings.iter().find(|(u, _)| u == a),
             None => readings
                 .iter()
                 .max_by_key(|(_, r)| r.iter().map(|x| x.fetched_at).max()),
-        }?;
-        let r = pick.1.iter().find(|r| r.kind == WindowKind::SevenDay)?;
-        let mut w = r.window();
-        while w.end <= self.now {
-            // The cached reading is from a previous window: roll forward.
-            w = Span {
-                start: w.end,
-                end: w.end + chrono::Duration::days(7),
-            };
-        }
-        Some(Span {
+        };
+        let Some(r) = pick.and_then(|p| p.1.iter().find(|r| r.kind == WindowKind::SevenDay)) else {
+            return Ok(None);
+        };
+        let w = crate::core::limits::current_window(r, self.now);
+        Ok(Some(Span {
             start: w.start,
             end: w.end.min(self.now + chrono::Duration::seconds(1)),
-        })
+        }))
     }
 
     /// `/home/user/x` → `~/x`, and just the last component when masking.

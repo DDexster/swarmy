@@ -10,7 +10,7 @@ use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 
-use super::context::Ctx;
+use crate::app::context::Ctx;
 
 pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let p = &ctx.painter;
@@ -183,7 +183,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         ok(&format!(
             "{} ({})",
             ctx.show_path(&ctx.dirs.index_file().to_string_lossy()),
-            human_bytes(
+            fmt::human_bytes(
                 std::fs::metadata(ctx.dirs.index_file())
                     .map(|m| m.len())
                     .unwrap_or(0)
@@ -273,7 +273,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
     println!();
     println!("{}", p.paint("LIMIT READINGS", Tone::Header));
-    let readings = ctx.latest_readings();
+    let readings = ctx.latest_readings(&idx)?;
     if readings.is_empty() {
         println!(
             "{}",
@@ -312,17 +312,4 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         }
     );
     Ok(())
-}
-
-pub fn human_bytes(b: u64) -> String {
-    let f = b as f64;
-    if b >= 1 << 30 {
-        format!("{:.1} GB", f / (1u64 << 30) as f64)
-    } else if b >= 1 << 20 {
-        format!("{:.1} MB", f / (1u64 << 20) as f64)
-    } else if b >= 1 << 10 {
-        format!("{:.0} KB", f / 1024.0)
-    } else {
-        format!("{b} B")
-    }
 }

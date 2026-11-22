@@ -17,7 +17,7 @@ use crate::claude::procs::proc_start_ticks;
 use crate::claude::seats::Seat;
 
 fn rnd(a: u64, b: u64) -> u64 {
-    crate::tui::hash(a, b, 0x5eed)
+    crate::ui::hash(a, b, 0x5eed)
 }
 
 fn frac(a: u64, b: u64) -> f64 {

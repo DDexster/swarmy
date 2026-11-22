@@ -8,7 +8,7 @@ use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 
 use super::Format;
-use super::context::Ctx;
+use crate::app::context::Ctx;
 
 pub fn run(ctx: &Ctx, format: Format) -> anyhow::Result<()> {
     let today = ctx.now.with_timezone(&chrono::Local).date_naive();

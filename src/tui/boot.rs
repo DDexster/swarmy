@@ -9,7 +9,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use super::app::App;
-use crate::ui::fmt;
+use crate::ui::{fmt, hash};
 
 const FONT: &[(char, [&str; 5])] = &[
     ('A', [" ███ ", "█   █", "█████", "█   █", "█   █"]),
@@ -49,17 +49,6 @@ pub fn logo_rows() -> Vec<String> {
         }
     }
     rows
-}
-
-/// A cheap deterministic hash for per-cell randomness.
-pub fn hash(a: u64, b: u64, c: u64) -> u64 {
-    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
-        ^ c.wrapping_mul(0x1656_67B1_9E37_79F9);
-    x ^= x >> 33;
-    x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
-    x ^= x >> 33;
-    x
 }
 
 fn lerp(a: Color, b: Color, k: f32) -> Color {

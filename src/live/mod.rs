@@ -2,45 +2,18 @@
 //! waiting for its children, stalled or done. Built from the index (freshly refreshed), the
 //! session registry and the process table.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::params;
 use serde::Serialize;
 
-use crate::claude::registry::{LiveSession, SessionStatus};
+use crate::claude::registry::LiveSession;
 use crate::core::models::Family;
+use crate::index::live::{AgentKey, AgentRow, DoneAgent};
 use crate::index::{Index, from_ms, ms};
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub enum State {
-    /// Blocked on the human (permission, question, dialog).
-    NeedsYou(String),
-    /// Running a tool.
-    Tool {
-        name: String,
-        summary: String,
-    },
-    /// Waiting for the model.
-    Thinking,
-    /// Idle main thread with background agents still running.
-    WaitingAgents(usize),
-    Idle,
-    /// Unfinished, no transcript activity for a while.
-    Stalled,
-    Done,
-    /// The Claude Code process is gone.
-    Gone,
-}
-
-impl State {
-    pub fn is_active(&self) -> bool {
-        matches!(
-            self,
-            State::Tool { .. } | State::Thinking | State::WaitingAgents(_)
-        )
-    }
-}
+mod state;
+pub use state::{Options, State, StateInputs, agent_state};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
@@ -141,39 +114,6 @@ impl Snapshot {
     }
 }
 
-pub struct Options {
-    pub stall_minutes: i64,
-    /// Finished agents stay on screen this long.
-    pub linger_minutes: i64,
-}
-
-impl Default for Options {
-    fn default() -> Self {
-        Options {
-            stall_minutes: 20,
-            linger_minutes: 3,
-        }
-    }
-}
-
-struct Row {
-    seat: String,
-    session_id: String,
-    agent_id: String,
-    kind: String,
-    agent_type: Option<String>,
-    description: Option<String>,
-    parent_agent_id: Option<String>,
-    depth: Option<i64>,
-    requested_model: Option<String>,
-    effort: Option<String>,
-    finished: bool,
-    last_ts: Option<i64>,
-    first_ts: Option<i64>,
-    title: Option<String>,
-    cwd: Option<String>,
-}
-
 pub fn build(
     idx: &Index,
     live: &[LiveSession],
@@ -186,51 +126,21 @@ pub fn build(
     // The previous snapshot, always: per-agent totals are reused when nothing new arrived.
     prev_all: Option<&Snapshot>,
 ) -> anyhow::Result<Snapshot> {
-    let conn = &idx.conn;
-    let recent = ms(now - Duration::minutes(opts.stall_minutes.max(30)));
-    let unfinished_horizon = ms(now - Duration::hours(24));
+    let recent = now - Duration::minutes(opts.stall_minutes.max(30));
     let live_keys: HashSet<(String, String)> = live
         .iter()
         .map(|l| (l.seat.clone(), l.session_id.clone()))
         .collect();
 
-    let mut rows: Vec<Row> = Vec::new();
-    {
-        let mut st = conn.prepare(
-            "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
-                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts
-             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
-             WHERE a.last_ts >= ?1 OR (a.finished = 0 AND a.last_ts >= ?2) OR a.agent_id = ''",
-        )?;
-        let it = st.query_map(params![recent, unfinished_horizon], |r| {
-            Ok(Row {
-                seat: r.get(0)?,
-                session_id: r.get(1)?,
-                agent_id: r.get(2)?,
-                kind: r.get(3)?,
-                agent_type: r.get(4)?,
-                description: r.get(5)?,
-                parent_agent_id: r.get(6)?,
-                depth: r.get(7)?,
-                requested_model: r.get(8)?,
-                effort: r.get(9)?,
-                finished: r.get::<_, i64>(10)? != 0,
-                last_ts: r.get(11)?,
-                title: r.get(12)?,
-                cwd: r.get(13)?,
-                first_ts: r.get(14)?,
-            })
-        })?;
-        for row in it {
-            let row = row?;
-            let is_live_main = row.agent_id.is_empty()
-                && live_keys.contains(&(row.seat.clone(), row.session_id.clone()));
-            let recent_enough = row.last_ts.is_some_and(|t| t >= recent);
-            if row.agent_id.is_empty() && !is_live_main && !recent_enough {
-                continue;
-            }
-            rows.push(row);
+    let mut rows: Vec<AgentRow> = Vec::new();
+    for row in idx.live_agent_rows(recent, now - Duration::hours(24))? {
+        let is_live_main = row.agent_id.is_empty()
+            && live_keys.contains(&(row.seat.clone(), row.session_id.clone()));
+        let recent_enough = row.last_ts.is_some_and(|t| t >= ms(recent));
+        if row.agent_id.is_empty() && !is_live_main && !recent_enough {
+            continue;
         }
+        rows.push(row);
     }
     // Live sessions that have no transcript yet still show up.
     for l in live {
@@ -238,7 +148,7 @@ pub fn build(
             .iter()
             .any(|r| r.agent_id.is_empty() && r.seat == l.seat && r.session_id == l.session_id)
         {
-            rows.push(Row {
+            rows.push(AgentRow {
                 seat: l.seat.clone(),
                 session_id: l.session_id.clone(),
                 agent_id: String::new(),
@@ -257,42 +167,18 @@ pub fn build(
             });
         }
     }
-    let projects: HashMap<String, String> = {
-        let mut st = conn.prepare("SELECT cwd, name FROM projects")?;
-        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<Result<_, _>>()?
-    };
-
-    let mut last_req = conn.prepare(
-        "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid FROM requests
-         WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 1",
-    )?;
-    let mut totals = conn.prepare("SELECT COUNT(*), TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3")?;
-    let mut open_tool = conn.prepare(
-        "SELECT name, summary, ts FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND done_ts IS NULL AND ts >= ?4
-         ORDER BY ts DESC LIMIT 1",
-    )?;
-    let mut last_done = conn.prepare(
-        "SELECT MAX(done_ts) FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-    )?;
-    let mut spark = conn.prepare(
-        "SELECT (ts - ?4) / 60000, TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4 GROUP BY 1",
-    )?;
-    let spark_start = ms(now - Duration::minutes(15));
+    let projects = idx.project_names()?;
+    let spark_start = now - Duration::minutes(15);
 
     let mut agents = Vec::new();
     for r in &rows {
-        let (model, effort, req_ts, ctx_tokens, account) = last_req
-            .query_row(params![r.seat, r.session_id, r.agent_id], |x| {
-                Ok((
-                    x.get::<_, Option<String>>(0)?,
-                    x.get::<_, Option<String>>(1)?,
-                    x.get::<_, Option<i64>>(2)?,
-                    x.get::<_, Option<i64>>(3)?,
-                    x.get::<_, Option<String>>(4)?,
-                ))
-            })
-            .unwrap_or((None, None, None, None, None));
+        let key = AgentKey {
+            seat: &r.seat,
+            session_id: &r.session_id,
+            agent_id: &r.agent_id,
+        };
+        let last_req = idx.last_request(key)?.unwrap_or_default();
+        let req_ts = last_req.ts;
         // Nothing new since the previous snapshot: reuse its totals and sparkline.
         let unchanged = prev_all
             .and_then(|p| {
@@ -301,46 +187,30 @@ pub fn build(
                 })
             })
             .filter(|o| o.last_request_ts == req_ts);
-        let (requests, cost): (i64, Option<f64>) = match unchanged {
-            Some(o) => (o.requests as i64, Some(o.cost)),
-            None => totals.query_row(params![r.seat, r.session_id, r.agent_id], |x| {
-                Ok((x.get(0)?, x.get(1)?))
-            })?,
+        let (requests, cost) = match unchanged {
+            Some(o) => (o.requests, o.cost),
+            None => idx.agent_totals(key)?,
         };
         let tool = match req_ts {
-            Some(t) => open_tool
-                .query_row(params![r.seat, r.session_id, r.agent_id, t], |x| {
-                    Ok((
-                        x.get::<_, String>(0)?,
-                        x.get::<_, Option<String>>(1)?,
-                        x.get::<_, i64>(2)?,
-                    ))
-                })
-                .ok(),
+            Some(t) => idx.open_tool(key, t)?,
             None => None,
         };
-        let done_ts: Option<i64> = last_done
-            .query_row(params![r.seat, r.session_id, r.agent_id], |x| x.get(0))
-            .unwrap_or(None);
-        let mut sp = vec![0.0; 15];
+        let done_ts = idx.last_tool_done(key)?;
         let reuse_spark = unchanged
             .filter(|_| prev.is_some())
             .map(|o| o.spark.clone());
-        let it = spark.query_map(
-            params![r.seat, r.session_id, r.agent_id, spark_start],
-            |x| {
-                Ok((
-                    x.get::<_, i64>(0)?,
-                    x.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                ))
-            },
-        )?;
-        for row in it.take(if reuse_spark.is_some() { 0 } else { usize::MAX }) {
-            let (i, c) = row?;
-            if (0..15).contains(&i) {
-                sp[i as usize] = c;
+        let spark = match reuse_spark {
+            Some(sp) => sp,
+            None => {
+                let mut sp = vec![0.0; 15];
+                for (i, c) in idx.agent_spend_per_minute(key, spark_start)? {
+                    if (0..15).contains(&i) {
+                        sp[i as usize] = c;
+                    }
+                }
+                sp
             }
-        }
+        };
         let last = [r.last_ts, req_ts, done_ts]
             .into_iter()
             .flatten()
@@ -350,57 +220,19 @@ pub fn build(
         let live_session = live
             .iter()
             .find(|l| l.seat == r.seat && l.session_id == r.session_id);
-        let silent = now - last;
-
-        let (state, since) = if r.agent_id.is_empty() {
-            match live_session.map(|l| &l.status) {
-                None => (State::Gone, last),
-                Some(SessionStatus::Waiting(w)) => (
-                    State::NeedsYou(w.clone()),
-                    live_session.and_then(|l| l.status_since).unwrap_or(last),
-                ),
-                Some(SessionStatus::Busy) => match &tool {
-                    Some((n, s, t)) => (
-                        State::Tool {
-                            name: n.clone(),
-                            summary: s.clone().unwrap_or_default(),
-                        },
-                        from_ms(*t),
-                    ),
-                    None => (
-                        State::Thinking,
-                        live_session.and_then(|l| l.status_since).unwrap_or(last),
-                    ),
-                },
-                Some(_) => (
-                    State::Idle,
-                    live_session.and_then(|l| l.status_since).unwrap_or(last),
-                ),
-            }
-        } else if r.finished {
-            (State::Done, last)
-        } else if !live_keys.contains(&(r.seat.clone(), r.session_id.clone()))
-            || silent > Duration::minutes(opts.stall_minutes)
-        {
-            (State::Stalled, last)
-        } else {
-            match &tool {
-                Some((n, s, t)) => (
-                    State::Tool {
-                        name: n.clone(),
-                        summary: s.clone().unwrap_or_default(),
-                    },
-                    from_ms(*t),
-                ),
-                None => (State::Thinking, last),
-            }
+        let Some((state, since)) = agent_state(
+            &StateInputs {
+                is_main: r.agent_id.is_empty(),
+                finished: r.finished,
+                session: live_session,
+                tool: tool.as_ref(),
+                last,
+            },
+            opts,
+            now,
+        ) else {
+            continue;
         };
-        if state == State::Done && silent > Duration::minutes(opts.linger_minutes) {
-            continue;
-        }
-        if state == State::Stalled && silent > Duration::hours(24) {
-            continue;
-        }
         let name = if r.agent_id.is_empty() {
             live_session
                 .and_then(|l| l.name.clone())
@@ -438,19 +270,19 @@ pub fn build(
                 .clone()
                 .or_else(|| (r.kind == "workflow").then(|| "workflow".to_string())),
             project,
-            model: model.or_else(|| r.requested_model.clone()),
-            effort: effort.or_else(|| r.effort.clone()),
+            model: last_req.model.or_else(|| r.requested_model.clone()),
+            effort: last_req.effort.or_else(|| r.effort.clone()),
             state,
             since,
             last_activity: last,
-            cost: cost.unwrap_or(0.0),
-            requests: requests as u64,
-            context_tokens: ctx_tokens.unwrap_or(0) as u64,
-            spark: reuse_spark.unwrap_or(sp),
+            cost,
+            requests,
+            context_tokens: last_req.context_tokens.unwrap_or(0).max(0) as u64,
+            spark,
             lane: Vec::new(),
             tmux: live_session.and_then(|l| l.tmux.clone()),
             pid: live_session.map(|l| l.pid),
-            account,
+            account: last_req.account,
             first_seen: r.first_ts.map(from_ms).unwrap_or(last),
             session_cost: 0.0,
             session_burn: 0.0,
@@ -491,7 +323,7 @@ pub fn build(
         }
         None => {
             for a in agents.iter_mut() {
-                a.lane = lane(conn, a, now).unwrap_or_default();
+                a.lane = lane(idx, a, now).unwrap_or_default();
             }
         }
     }
@@ -512,17 +344,10 @@ pub fn build(
             }
         }
     } else {
-        let hour_ago = ms(now - Duration::hours(1));
-        let mut st = conn.prepare(
-            "SELECT TOTAL(cost), SUM(CASE WHEN ts >= ?3 THEN cost ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
-        )?;
+        let hour_ago = now - Duration::hours(1);
         for a in agents.iter_mut().filter(|a| a.is_main()) {
-            let (total, hour): (Option<f64>, Option<f64>) = st
-                .query_row(params![a.seat, a.session_id, hour_ago], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })?;
-            a.session_cost = total.unwrap_or(0.0);
-            a.session_burn = hour.unwrap_or(0.0);
+            (a.session_cost, a.session_burn) =
+                idx.session_spend(&a.seat, &a.session_id, hour_ago)?;
             if let Some(n) = a.pid.and_then(|p| procs.nodes.get(&p)) {
                 a.cpu = n.cpu;
                 a.memory = n.memory;
@@ -537,20 +362,9 @@ pub fn build(
     };
 
     // Burn per minute by family, last 60 minutes.
-    let start = ms(now - Duration::minutes(60));
-    let mut st = conn.prepare(
-        "SELECT (ts - ?1) / 60000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1, 2",
-    )?;
-    let it = st.query_map(params![start], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-        ))
-    })?;
+    let start = now - Duration::minutes(60);
     let mut total = 0.0;
-    for row in it {
-        let (i, model, c) = row?;
+    for (i, model, c) in idx.spend_per_minute_by_model(start)? {
         if (0..60).contains(&i) {
             let fam = Family::of(&model).name().to_string();
             snap.burn.entry(fam).or_insert_with(|| vec![0.0; 60])[i as usize] += c;
@@ -568,13 +382,7 @@ pub fn build(
         .earliest()
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or(now);
-    snap.today_cost = conn
-        .query_row(
-            "SELECT TOTAL(cost) FROM requests WHERE ts >= ?1",
-            params![ms(midnight)],
-            |r| r.get::<_, Option<f64>>(0),
-        )?
-        .unwrap_or(0.0);
+    snap.today_cost = idx.spend_since(midnight)?;
     // Recently finished agents (the history under the live tree).
     if let Some(p) = prev {
         snap.recent_done = p.recent_done.clone();
@@ -583,26 +391,15 @@ pub fn build(
         snap.conflicts = idx
             .edit_conflicts(now - Duration::minutes(30))
             .unwrap_or_default();
-        let mut st = conn.prepare(
-            "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
-                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
-                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1)
-             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
-             WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60",
-        )?;
-        let since = ms(now - Duration::hours(6));
-        let rows = st.query_map(params![since], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Option<String>>(1)?,
-                r.get::<_, Option<i64>>(2)?,
-                r.get::<_, Option<i64>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-            ))
-        })?;
-        for row in rows {
-            let (name, cwd, first, last, cost, model) = row?;
+        for d in idx.recently_done(now - Duration::hours(6))? {
+            let DoneAgent {
+                name,
+                cwd,
+                first_ts: first,
+                last_ts: last,
+                cost,
+                model,
+            } = d;
             let project = cwd
                 .as_ref()
                 .and_then(|c| projects.get(c).cloned())
@@ -622,29 +419,41 @@ pub fn build(
             });
         }
     }
-    let mut st = conn.prepare("SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 GROUP BY 1")?;
-    snap.errors_last_hour = st
-        .query_map(params![start], |r| {
-            Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
-        })?
-        .collect::<Result<_, _>>()?;
+    snap.errors_last_hour = idx.api_error_counts(start)?;
     Ok(snap)
 }
 
-/// What happened before the dashboard started, so the event log is not empty on launch.
-#[derive(Debug, Clone)]
+/// What happened before the dashboard started, so the event log is not empty on launch. The
+/// dashboard words it (`PastEvent::kind` carries the facts, not text).
+#[derive(Debug, Clone, PartialEq)]
 pub struct PastEvent {
     pub at: DateTime<Utc>,
     pub kind: PastKind,
-    pub text: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PastKind {
-    Spawned,
-    Done,
-    ApiError,
-    Prompt,
+    Spawned {
+        name: String,
+        /// Short model name, empty when unknown.
+        model: String,
+        effort: Option<String>,
+    },
+    Done {
+        name: String,
+        took: Option<Duration>,
+        cost: f64,
+    },
+    ApiError {
+        kind: String,
+        /// First line of the error text.
+        text: Option<String>,
+    },
+    Prompt {
+        /// Session title, empty when it has none.
+        title: String,
+        chars: i64,
+    },
 }
 
 /// Agents spawned and finished, API errors and the user's prompts since `since`, newest first.
@@ -653,94 +462,48 @@ pub fn past_events(
     since: DateTime<Utc>,
     limit: usize,
 ) -> anyhow::Result<Vec<PastEvent>> {
-    let conn = &idx.conn;
     let since_ms = ms(since);
     let mut out = Vec::new();
-    let mut st = conn.prepare(
-        "SELECT COALESCE(a.description, a.agent_type, a.agent_id), a.first_ts, a.last_ts, a.finished,
-                (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1),
-                (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
-                a.effort
-         FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))",
-    )?;
-    let rows = st.query_map(params![since_ms], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<i64>>(1)?,
-            r.get::<_, Option<i64>>(2)?,
-            r.get::<_, i64>(3)? == 1,
-            r.get::<_, Option<String>>(4)?,
-            r.get::<_, Option<f64>>(5)?,
-            r.get::<_, Option<String>>(6)?,
-        ))
-    })?;
-    for row in rows {
-        let (name, first, last, finished, model, cost, effort) = row?;
-        let model = model
+    for e in idx.agent_events(since)? {
+        let model = e
+            .model
             .as_deref()
             .map(crate::core::models::short_name)
             .unwrap_or_default();
-        if let Some(f) = first.filter(|f| *f >= since_ms) {
-            let effort = effort.map(|e| format!("/{e}")).unwrap_or_default();
+        if let Some(f) = e.first_ts.filter(|f| *f >= since_ms) {
             out.push(PastEvent {
                 at: from_ms(f),
-                kind: PastKind::Spawned,
-                text: format!("{name} spawned · {model}{effort}"),
+                kind: PastKind::Spawned {
+                    name: e.name.clone(),
+                    model,
+                    effort: e.effort.clone(),
+                },
             });
         }
-        if let (true, Some(l)) = (finished, last.filter(|l| *l >= since_ms)) {
-            let took = first
-                .map(|f| crate::ui::fmt::duration(from_ms(l) - from_ms(f)))
-                .unwrap_or_default();
+        if let (true, Some(l)) = (e.finished, e.last_ts.filter(|l| *l >= since_ms)) {
             out.push(PastEvent {
                 at: from_ms(l),
-                kind: PastKind::Done,
-                text: format!(
-                    "{name} done · {took} · {}",
-                    crate::ui::fmt::money(cost.unwrap_or(0.0))
-                ),
+                kind: PastKind::Done {
+                    name: e.name,
+                    took: e.first_ts.map(|f| from_ms(l) - from_ms(f)),
+                    cost: e.cost.unwrap_or(0.0),
+                },
             });
         }
     }
-    let mut st = conn.prepare("SELECT ts, kind, text FROM api_errors WHERE ts >= ?1")?;
-    for row in st.query_map(params![since_ms], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, Option<String>>(2)?,
-        ))
-    })? {
-        let (ts, kind, text) = row?;
-        let text = text
-            .map(|t| format!(" · {}", t.lines().next().unwrap_or("")))
-            .unwrap_or_default();
+    for (ts, kind, text) in idx.api_errors_since(since)? {
         out.push(PastEvent {
             at: from_ms(ts),
-            kind: PastKind::ApiError,
-            text: format!("API error: {kind}{text}"),
+            kind: PastKind::ApiError {
+                kind,
+                text: text.map(|t| t.lines().next().unwrap_or("").to_string()),
+            },
         });
     }
-    let mut st = conn.prepare(
-        "SELECT p.ts, p.chars, COALESCE(s.title, s.ai_title, '') FROM prompts p
-         LEFT JOIN sessions s ON s.seat = p.seat AND s.session_id = p.session_id WHERE p.ts >= ?1",
-    )?;
-    for row in st.query_map(params![since_ms], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, i64>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })? {
-        let (ts, chars, title) = row?;
-        let to = if title.is_empty() {
-            String::new()
-        } else {
-            format!(" → {title}")
-        };
+    for (ts, chars, title) in idx.prompts_since(since)? {
         out.push(PastEvent {
             at: from_ms(ts),
-            kind: PastKind::Prompt,
-            text: format!("you{to} · {chars} chars"),
+            kind: PastKind::Prompt { title, chars },
         });
     }
     out.sort_by_key(|e| std::cmp::Reverse(e.at));
@@ -802,14 +565,7 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
 /// The last text the agent wrote (read from the tail of its transcript).
 pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let path: String = idx
-        .conn
-        .query_row(
-            "SELECT path FROM files WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-            params![a.seat, a.session_id, a.agent_id],
-            |r| r.get(0),
-        )
-        .ok()?;
+    let path = idx.transcript_path(key_of(a)).ok().flatten()?;
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(256 * 1024);
@@ -844,35 +600,15 @@ pub enum Lane {
 
 pub const LANE_MINUTES: i64 = 30;
 
-fn lane(conn: &rusqlite::Connection, a: &Agent, now: DateTime<Utc>) -> anyhow::Result<Vec<Lane>> {
+fn lane(idx: &Index, a: &Agent, now: DateTime<Utc>) -> anyhow::Result<Vec<Lane>> {
     let start = now - Duration::minutes(LANE_MINUTES);
     let mut out = vec![Lane::Quiet; LANE_MINUTES as usize];
     let slot = |t: i64| ((t - ms(start)) / 60_000).clamp(0, LANE_MINUTES - 1) as usize;
-    let mut st = conn.prepare_cached(
-        "SELECT ts FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4",
-    )?;
-    for t in st.query_map(params![a.seat, a.session_id, a.agent_id, ms(start)], |r| {
-        r.get::<_, i64>(0)
-    })? {
-        let i = slot(t?);
+    for t in idx.agent_request_times(key_of(a), start)? {
+        let i = slot(t);
         out[i] = out[i].max(Lane::Thinking);
     }
-    let mut st = conn.prepare_cached(
-        "SELECT ts, COALESCE(done_ts, ?5), name FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3
-         AND COALESCE(done_ts, ?5) >= ?4",
-    )?;
-    let rows = st.query_map(
-        params![a.seat, a.session_id, a.agent_id, ms(start), ms(now)],
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        },
-    )?;
-    for row in rows {
-        let (t0, t1, name) = row?;
+    for (t0, t1, name) in idx.agent_tool_spans(key_of(a), start, now)? {
         let kind = match name.as_str() {
             "AskUserQuestion" | "ExitPlanMode" => Lane::You,
             "Agent" | "Task" => Lane::Agents,
@@ -898,40 +634,39 @@ pub struct LifePoint {
 
 /// The agent's requests, oldest first (the last 2000).
 pub fn life(idx: &Index, a: &Agent) -> anyhow::Result<Vec<LifePoint>> {
-    let mut st = idx.conn.prepare_cached(
-        "SELECT ts, COALESCE(cost, 0), input + cw5 + cw1h + cread FROM requests
-         WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 2000",
-    )?;
-    let mut v: Vec<LifePoint> = st
-        .query_map(params![a.seat, a.session_id, a.agent_id], |r| {
-            Ok(LifePoint {
-                ts: from_ms(r.get(0)?),
-                cost: r.get(1)?,
-                context: r.get::<_, i64>(2)?.max(0) as u64,
-            })
-        })?
-        .collect::<Result<_, _>>()?;
+    let mut v: Vec<LifePoint> = idx
+        .agent_requests(key_of(a), 2000)?
+        .into_iter()
+        .map(|r| LifePoint {
+            ts: from_ms(r.ts),
+            cost: r.cost,
+            context: r.context.max(0) as u64,
+        })
+        .collect();
     v.reverse();
     Ok(v)
 }
 
 pub fn tool_timeline(idx: &Index, a: &Agent, limit: usize) -> anyhow::Result<Vec<ToolLine>> {
-    let mut st = idx.conn.prepare(
-        "SELECT ts, name, summary, done_ts, is_error FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT ?4",
-    )?;
-    let it = st.query_map(
-        params![a.seat, a.session_id, a.agent_id, limit as i64],
-        |r| {
-            Ok(ToolLine {
-                ts: from_ms(r.get(0)?),
-                name: r.get(1)?,
-                summary: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                done: r.get::<_, Option<i64>>(3)?.map(from_ms),
-                is_error: r.get::<_, i64>(4)? != 0,
-            })
-        },
-    )?;
-    Ok(it.collect::<Result<_, _>>()?)
+    Ok(idx
+        .agent_tool_calls(key_of(a), limit)?
+        .into_iter()
+        .map(|t| ToolLine {
+            ts: from_ms(t.ts),
+            name: t.name,
+            summary: t.summary.unwrap_or_default(),
+            done: t.done_ts.map(from_ms),
+            is_error: t.is_error,
+        })
+        .collect())
+}
+
+fn key_of(a: &Agent) -> AgentKey<'_> {
+    AgentKey {
+        seat: &a.seat,
+        session_id: &a.session_id,
+        agent_id: &a.agent_id,
+    }
 }
 
 #[cfg(test)]
