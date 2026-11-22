@@ -15,6 +15,9 @@ python3 tools/render_frames.py "$TMP/wall.jsonl" docs/img --gif demo.gif --every
 # The boot swarm (frames recorded while the boot screen runs).
 SWARMY_RECORD_BOOT=1 "$BIN" demo --record "$TMP/boot.jsonl" --frames 90 --size 200x50
 python3 tools/render_frames.py "$TMP/boot.jsonl" docs/img --gif boot.gif --every 1 --scale 0.5 --size 14
+# A smaller wall: the bottom panels in two rows.
+"$BIN" demo --record "$TMP/wall-small.jsonl" --frames 40 --size 200x60 --keys "20:j"
+python3 tools/render_frames.py "$TMP/wall-small.jsonl" docs/img --png 35:wall-small.png --size 14
 # The column (half a 4K screen) and tabs (a laptop terminal).
 "$BIN" demo --record "$TMP/column.jsonl" --frames 40 --size 160x81 --keys "20:j"
 python3 tools/render_frames.py "$TMP/column.jsonl" docs/img --png 35:column.png --size 14

@@ -62,6 +62,37 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     }
     println!("{}", t.render(p));
 
+    // The optional status line: exact limits after every response.
+    let with: Vec<&str> = ctx
+        .seats
+        .iter()
+        .filter(|s| {
+            matches!(
+                super::setup::seat_status_line(s),
+                super::setup::StatusLine::Swarmy { .. }
+            )
+        })
+        .map(|s| s.label.as_str())
+        .collect();
+    println!();
+    if with.is_empty() {
+        println!(
+            "{}",
+            p.paint(
+                "limits come from Claude Code's cached readings (≈ between them); optional: `swarmy setup` adds a status line for exact ones",
+                Tone::Dim
+            )
+        );
+    } else {
+        println!(
+            "{}",
+            ok(&format!(
+                "swarmy status line in: {} (exact limits after every response)",
+                with.join(", ")
+            ))
+        );
+    }
+
     // Accounts shared by several seats share one limit.
     let mut by_acct: std::collections::BTreeMap<String, Vec<&str>> = Default::default();
     for si in &ctx.seat_info {

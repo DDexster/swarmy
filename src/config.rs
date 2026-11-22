@@ -70,6 +70,8 @@ pub struct Config {
     pub price: Vec<PriceConf>,
     /// Display names for accounts: `[accounts] "<account uuid>" = "work"`.
     pub accounts: std::collections::BTreeMap<String, String>,
+    /// The Claude Code status line (`swarmy statusline`).
+    pub statusline: StatuslineConf,
     /// Monthly subscription price per account label or uuid, for the payback figure.
     pub subscription: std::collections::BTreeMap<String, f64>,
     /// Minutes without transcript activity after which an unfinished agent counts as stalled.
@@ -226,4 +228,46 @@ fn migrate_dir(from: &std::path::Path, to: &std::path::Path) {
     }
     // Remove the old dir only when everything moved.
     let _ = std::fs::remove_dir(from);
+}
+
+/// `[statusline]` in config.toml.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StatuslineConf {
+    /// Segments in display order: attention, agents, week, five_hour, context, cost, burn.
+    pub segments: Vec<String>,
+    /// 1, or 2 for a second line with the model, effort, branch and session name.
+    pub lines: u8,
+    /// Seconds between refreshes of an idle session's line (`swarmy setup` writes it into
+    /// Claude Code's `refreshInterval`); 0 = only on Claude Code's own events.
+    pub refresh_seconds: u32,
+    /// The dashboard's summary counts while it is younger than this.
+    pub fresh_seconds: u32,
+    /// Columns left free on the right for Claude Code's own notifications.
+    pub reserve: u16,
+    /// Hide session and project names (also `SWARMY_MASK=1`).
+    pub mask: bool,
+}
+
+impl Default for StatuslineConf {
+    fn default() -> Self {
+        StatuslineConf {
+            segments: [
+                "attention",
+                "agents",
+                "week",
+                "five_hour",
+                "context",
+                "cost",
+                "burn",
+            ]
+            .map(String::from)
+            .to_vec(),
+            lines: 1,
+            refresh_seconds: 10,
+            fresh_seconds: 15,
+            reserve: 0,
+            mask: false,
+        }
+    }
 }

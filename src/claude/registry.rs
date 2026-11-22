@@ -125,6 +125,49 @@ pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -
     out
 }
 
+/// Sessions of one config dir that wait for the user, read straight from the registry with a
+/// cheap liveness check (for the status line when the dashboard is not running).
+pub fn waiting_sessions(
+    sessions_dir: &Path,
+) -> Vec<(String, Option<String>, String, Option<String>, String)> {
+    let Ok(rd) = std::fs::read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Some(r) = std::fs::read_to_string(&p)
+            .ok()
+            .and_then(|t| serde_json::from_str::<RawSession>(&t).ok())
+        else {
+            continue;
+        };
+        if r.status.as_deref() != Some("waiting") || r.pid == 0 || !pid_alive(r.pid) {
+            continue;
+        }
+        // (session id, name, what it waits for, tmux pane, cwd)
+        out.push((
+            r.session_id,
+            r.name,
+            r.waiting_for.unwrap_or_else(|| "input".into()),
+            r.tmux.filter(|t| !t.is_empty()),
+            r.cwd,
+        ));
+    }
+    out
+}
+
+fn pid_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        Path::new("/proc").join(pid.to_string()).exists()
+    } else {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

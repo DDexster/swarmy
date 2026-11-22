@@ -117,8 +117,10 @@ impl Shape {
             LayoutMode::Wall => Shape::Wall,
             LayoutMode::Column => Shape::Column,
             LayoutMode::Tabs => Shape::Tabs,
-            LayoutMode::Auto if area.width >= 250 && area.height >= 55 => Shape::Wall,
-            LayoutMode::Auto if area.width >= 150 && area.height >= 48 => Shape::Column,
+            // Everything on one screen as soon as panels can be readable; they shrink, scroll and
+            // zoom rather than hide.
+            LayoutMode::Auto if area.width >= 180 && area.height >= 45 => Shape::Wall,
+            LayoutMode::Auto if area.width >= 110 && area.height >= 40 => Shape::Column,
             LayoutMode::Auto => Shape::Tabs,
         }
     }
@@ -929,8 +931,11 @@ impl App {
                 Panel::Agent,
                 Panel::Mana,
                 Panel::Attention,
+                Panel::Burn,
                 Panel::Projects,
                 Panel::Efficiency,
+                Panel::History,
+                Panel::Models,
             ],
             Shape::Tabs => match self.tab {
                 Tab::Ops => vec![Panel::Swarm, Panel::Mana, Panel::Attention],
@@ -1314,33 +1319,14 @@ impl App {
             self.toast("this session is not running inside tmux", Tone::Warn);
             return;
         };
-        let (session, rest) = pane.split_once(':').unwrap_or(("", pane.as_str()));
-        let (window, pane_id) = rest.split_once('.').unwrap_or((rest, ""));
-        if std::env::var_os("TMUX").is_none() {
-            self.toast(format!("not inside tmux; attach with: tmux attach -t {session} \\; select-pane -t {pane_id}"), Tone::Warn);
-            return;
-        }
-        let ok = std::process::Command::new("tmux")
-            .args([
-                "select-window",
-                "-t",
-                window,
-                ";",
-                "select-pane",
-                "-t",
-                pane_id,
-                ";",
-                "switch-client",
-                "-t",
-                session,
-            ])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if ok {
-            self.toast(format!("jumped to {pane}"), Tone::Good);
-        } else {
-            self.toast(format!("tmux could not switch to {pane}"), Tone::Bad);
+        match crate::claude::tmux::switch_to(&pane) {
+            crate::claude::tmux::Jump::Done => self.toast(format!("jumped to {pane}"), Tone::Good),
+            crate::claude::tmux::Jump::NotInTmux { hint } => {
+                self.toast(format!("not inside tmux; attach with: {hint}"), Tone::Warn)
+            }
+            crate::claude::tmux::Jump::Failed => {
+                self.toast(format!("tmux could not switch to {pane}"), Tone::Bad)
+            }
         }
     }
 

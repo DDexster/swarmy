@@ -37,9 +37,13 @@ impl Ctx {
         let dirs = Dirs::resolve()?;
         let config = Config::load(&dirs)?;
         let procs = ProcTable::snapshot();
+        // `SWARMY_ISOLATED=1` (tests, demos): only dirs under $HOME and the config count, not the
+        // config dirs of running `claude` processes, which belong to the real user.
+        let isolated = std::env::var_os("SWARMY_ISOLATED").is_some();
         let mut env_dirs: Vec<PathBuf> = procs
             .claude
             .iter()
+            .filter(|_| !isolated)
             .filter_map(|p| p.config_dir.clone())
             .collect();
         if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -53,15 +57,11 @@ impl Ctx {
         let mut prices = PriceBook::builtin();
         let mut seat_info = Vec::new();
         for s in &seats {
-            let cj = config_json::read(&s.claude_json).unwrap_or_default();
-            if let Some(costs) = &cj.model_costs {
+            let (info, costs) = seat_info_of(s, &dirs.data);
+            if let Some(costs) = &costs {
                 prices.merge_claude_code_cache(&s.label, costs);
             }
-            seat_info.push(SeatInfo {
-                label: s.label.clone(),
-                account: cj.account,
-                utilization: cj.utilization,
-            });
+            seat_info.push(info);
         }
         config.apply_prices(&mut prices);
         let mut ctx = Ctx {
@@ -298,4 +298,22 @@ impl Ctx {
             None => p.to_string(),
         }
     }
+}
+
+/// What a seat says about itself: its account from `.claude.json`, and its limit readings — the
+/// status line's when newer than Claude Code's cached ones (see `claude::statusline`).
+pub fn seat_info_of(s: &Seat, data_dir: &std::path::Path) -> (SeatInfo, Option<serde_json::Value>) {
+    let cj = config_json::read(&s.claude_json).unwrap_or_default();
+    let live =
+        crate::claude::statusline::read(&crate::claude::statusline::file_for(data_dir, &s.dir));
+    let account = cj.account.as_ref().map(|a| a.account_uuid.clone());
+    let utilization = crate::claude::statusline::merge(cj.utilization, account.as_deref(), live);
+    (
+        SeatInfo {
+            label: s.label.clone(),
+            account: cj.account,
+            utilization,
+        },
+        cj.model_costs,
+    )
 }

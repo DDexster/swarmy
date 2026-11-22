@@ -55,7 +55,7 @@ impl Account {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Utilization {
     pub account_uuid: String,
     pub fetched_at: DateTime<Utc>,

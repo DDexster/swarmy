@@ -7,6 +7,7 @@ pub mod limits;
 pub mod models;
 pub mod prices;
 pub mod report;
+pub mod setup;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 
@@ -57,6 +58,20 @@ pub enum Command {
     Accounts(accounts::AccountsArgs),
     /// What was found on this machine and whether it is readable.
     Doctor,
+    /// Optional: add the swarmy status line to Claude Code (exact limits) and save logins.
+    Setup(setup::SetupArgs),
+    /// Switch tmux to the Claude Code that has waited for you the longest (bind it to a key).
+    Jump {
+        /// Only list who waits, do not switch.
+        #[arg(long)]
+        list: bool,
+    },
+    /// Used by Claude Code's status line: records the limits it passes and prints a short line.
+    Statusline {
+        /// A status-line command to run first (the one you had before), with the same input.
+        #[arg(long)]
+        then: Option<String>,
+    },
     /// The price in force for every model and its source.
     Prices {
         #[arg(long, value_enum, default_value_t = Format::Table)]
@@ -153,6 +168,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             clap_complete::generate(shell, &mut Cli::command(), "swarmy", &mut std::io::stdout());
             Ok(())
         }
+        Some(Command::Jump { list }) => jump(list),
+        Some(Command::Statusline { then }) => {
+            // Runs after every model response: no index, no scanning, just record and print.
+            let dirs = crate::config::Dirs::resolve()?;
+            let config = crate::config::Config::load(&dirs).unwrap_or_default();
+            crate::claude::statusline::run(&dirs, &config.statusline, then.as_deref())
+        }
         Some(Command::Man) => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
@@ -225,10 +247,89 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                         limits::run(&ctx, Format::Table, 8)
                     }
                 }
-                Some(Command::Completions { .. } | Command::Man | Command::Demo { .. }) => {
+                Some(Command::Setup(a)) => setup::run(&ctx, &a),
+                Some(
+                    Command::Completions { .. }
+                    | Command::Man
+                    | Command::Demo { .. }
+                    | Command::Statusline { .. }
+                    | Command::Jump { .. },
+                ) => {
                     unreachable!()
                 }
             }
         }
+    }
+}
+
+/// `swarmy jump`: the oldest session that waits for the user, from the dashboard's summary when
+/// it runs, else straight from the session registries.
+fn jump(list: bool) -> anyhow::Result<()> {
+    let dirs = crate::config::Dirs::resolve()?;
+    let config = crate::config::Config::load(&dirs).unwrap_or_default();
+    let now = chrono::Utc::now();
+    // (name, what, tmux)
+    let waiting: Vec<(String, String, Option<String>)> = match crate::fleet::read_fresh(
+        &crate::fleet::path(&dirs.data),
+        config.statusline.fresh_seconds,
+        now,
+    ) {
+        Some(f) => f
+            .needs_you
+            .into_iter()
+            .map(|n| (n.name, n.what, n.tmux))
+            .collect(),
+        None => {
+            let mut seat_dirs = vec![dirs.home.join(".claude")];
+            if let Ok(rd) = std::fs::read_dir(&dirs.home) {
+                for e in rd.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(".claude-") {
+                        seat_dirs.push(e.path());
+                    }
+                }
+            }
+            seat_dirs
+                .iter()
+                .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
+                .map(|(_, name, what, tmux, cwd)| {
+                    (
+                        name.unwrap_or_else(|| cwd.rsplit('/').next().unwrap_or("").to_string()),
+                        what,
+                        tmux,
+                    )
+                })
+                .collect()
+        }
+    };
+    if waiting.is_empty() {
+        println!("nothing waits for you");
+        return Ok(());
+    }
+    if list {
+        for (name, what, tmux) in &waiting {
+            println!(
+                "▲ {name}: {what}{}",
+                tmux.as_ref()
+                    .map(|t| format!("  (tmux {t})"))
+                    .unwrap_or_default()
+            );
+        }
+        return Ok(());
+    }
+    let Some((name, what, Some(pane))) = waiting.iter().find(|w| w.2.is_some()).cloned() else {
+        anyhow::bail!(
+            "{} session(s) wait for you, none inside tmux",
+            waiting.len()
+        );
+    };
+    match crate::claude::tmux::switch_to(&pane) {
+        crate::claude::tmux::Jump::Done => {
+            println!("→ {name}: {what}");
+            Ok(())
+        }
+        crate::claude::tmux::Jump::NotInTmux { hint } => {
+            anyhow::bail!("not inside tmux; attach with: {hint}")
+        }
+        crate::claude::tmux::Jump::Failed => anyhow::bail!("tmux could not switch to {pane}"),
     }
 }

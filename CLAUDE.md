@@ -60,6 +60,19 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - `.claude.json`: `cachedUsageUtilization` (limits, no network needed), `additionalModelCostsCache`
   (prices), `oauthAccount`. For `~/.claude` it lives at `~/.claude.json`, otherwise inside the dir.
 - Unknown record types are counted; `swarmy doctor` reports them (format drift).
+- Status line (optional, `swarmy setup`): Claude Code runs `statusLine.command` after each response
+  with a JSON on stdin; `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at (epoch s)}`
+  are exact. `swarmy statusline` must stay fast (no index, no scan): it writes
+  `<data>/statusline/<sha256(config dir)[..16]>.json` and prints one line. The dashboard merges
+  these readings when newer than `.claude.json`'s. `setup` writes only `settings.json` (backup
+  first, never over an older backup) and only after a yes. The status line reads the dashboard's
+  `statusline/fleet.json` (`src/fleet.rs`; fresh while < `fresh_seconds` and its writer pid runs)
+  and otherwise scans the session registries; segments shorten in a fixed order to `$COLUMNS`
+  (Claude Code sets it). Keep its vocabulary and glyphs the same as the dashboard's.
+- Testing `setup` or anything that discovers seats: seats are also found through running
+  `claude` processes' `CLAUDE_CONFIG_DIR`, so a fake `HOME` is NOT isolation — the real seats
+  still show up. Set `SWARMY_ISOLATED=1` together with the fake `HOME` (and unset
+  `CLAUDE_CONFIG_DIR`), and check the seat list before any `--yes`.
 - Projects: a cwd resolves to its git root; removed worktrees under `<repo>-wt/` fold into
   `<repo>`; a dir outside any repo (gone, or a scratch dir) takes the project of the session it ran
   in, or the session's own dir when it lies under it (never a home dir). Changing these rules means

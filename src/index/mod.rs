@@ -438,11 +438,15 @@ impl Index {
                         |r| r.get(0),
                     )
                     .ok();
+                // Only changes are kept: readings arrive after every response.
+                if before.as_deref() == Some(acc) {
+                    continue;
+                }
                 let added = tx.execute(
                     "INSERT OR IGNORE INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)",
                     params![si.label, ts, acc],
                 )?;
-                if added > 0 && before.as_deref() != Some(acc) {
+                if added > 0 {
                     reattribute.push((si.label.clone(), ts));
                 }
             }

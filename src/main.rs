@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod core;
 mod demo;
+mod fleet;
 mod index;
 mod live;
 mod power;

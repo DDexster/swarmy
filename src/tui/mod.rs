@@ -336,20 +336,121 @@ fn login_files_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
         .collect()
 }
 
+/// The fleet summary for the status line (`fleet.rs`); `written_at` is set by the caller.
+fn fleet_of(
+    ctx: &Ctx,
+    snap: &live::Snapshot,
+    limits: &[limits::AccountReport],
+) -> crate::fleet::Fleet {
+    use crate::fleet::{Fleet, NeedsYou, SeatLimit, SessionCounts};
+    let mut f = Fleet {
+        v: crate::fleet::VERSION,
+        writer_pid: std::process::id(),
+        ..Default::default()
+    };
+    for a in &snap.agents {
+        let main = snap
+            .agents
+            .iter()
+            .find(|m| m.is_main() && m.seat == a.seat && m.session_id == a.session_id);
+        if a.is_main() {
+            if a.state != live::State::Gone {
+                f.counts.sessions += 1;
+            }
+            f.sessions
+                .entry(a.session_id.clone())
+                .or_default()
+                .burn_usd_h = a.session_burn;
+        } else if a.state.is_active()
+            || matches!(
+                a.state,
+                live::State::NeedsYou(_) | live::State::Stalled | live::State::WaitingAgents(_)
+            )
+        {
+            f.counts.agents += 1;
+            f.sessions.entry(a.session_id.clone()).or_default().agents += 1;
+        }
+        let sc = f.sessions.entry(a.session_id.clone()).or_default();
+        let (w, t, wt, st) = match &a.state {
+            live::State::Tool { .. } => (1, 0, 0, 0),
+            live::State::Thinking => (0, 1, 0, 0),
+            live::State::WaitingAgents(_) => (0, 0, 1, 0),
+            live::State::Stalled => (0, 0, 0, 1),
+            _ => (0, 0, 0, 0),
+        };
+        if !a.is_main() {
+            sc.working += w;
+            sc.thinking += t;
+            sc.waiting += wt;
+            sc.stalled += st;
+        }
+        f.counts.working += w;
+        f.counts.thinking += t;
+        f.counts.waiting += wt;
+        f.counts.stalled += st;
+        if let live::State::NeedsYou(what) = &a.state {
+            let name = main
+                .map(|m| m.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| a.project.clone());
+            f.needs_you.push(NeedsYou {
+                session_id: a.session_id.clone(),
+                seat: a.seat.clone(),
+                name,
+                what: what.clone(),
+                since: Some(a.since),
+                tmux: main.and_then(|m| m.tmux.clone()).or_else(|| a.tmux.clone()),
+            });
+        }
+    }
+    f.needs_you.sort_by_key(|n| n.since);
+    for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
+        let key = crate::claude::statusline::file_for(&ctx.dirs.data, &s.dir)
+            .file_stem()
+            .map(|x| x.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let Some(acct) = si.account.as_ref().map(|a| a.account_uuid.clone()) else {
+            continue;
+        };
+        let week = limits
+            .iter()
+            .find(|r| r.account_uuid == acct)
+            .and_then(|r| {
+                r.windows.iter().find(|w| {
+                    w.reading.kind == crate::core::limits::WindowKind::SevenDay && !w.reset_passed
+                })
+            });
+        f.seats.insert(
+            key,
+            SeatLimit {
+                label: s.label.clone(),
+                account: ctx.account_name(&acct),
+                week_used: week.map(|w| w.estimate_now),
+                runs_out_at: week.and_then(|w| w.eta).map(|d| ctx.now + d),
+                resets_at: week.map(|w| w.reading.resets_at),
+            },
+        );
+    }
+    f
+}
+
 fn reload_seat_info(ctx: &mut Ctx) {
+    let data = ctx.dirs.data.clone();
     ctx.seat_info = ctx
         .seats
         .iter()
-        .map(|s| {
-            let cj = config_json::read(&s.claude_json).unwrap_or_default();
-            SeatInfo {
-                label: s.label.clone(),
-                account: cj.account,
-                utilization: cj.utilization,
-            }
-        })
+        .map(|s| crate::cli::context::seat_info_of(s, &data).0)
         .collect();
     ctx.drop_unconfirmed();
+}
+
+/// Modification times of the seats' status-line readings (one `stat` per seat).
+fn statusline_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
+    ctx.seats
+        .iter()
+        .map(|s| crate::claude::statusline::file_for(&ctx.dirs.data, &s.dir))
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect()
 }
 
 fn worker(
@@ -411,6 +512,8 @@ fn worker(
     let mut last_full = Instant::now();
     let mut login_stamp = login_files_stamp(&ctx);
     let mut seats_changed = false;
+    let mut sl_stamp = statusline_stamp(&ctx);
+    let mut last_sl = Instant::now();
     let mut last_power = Instant::now();
     let mut last_full_analytics: Option<Instant> = None;
     let mut last_heavy: Option<Instant> = None;
@@ -418,6 +521,8 @@ fn worker(
     let mut last_limits: Option<Instant> = None;
     let mut prev_snap: Option<live::Snapshot> = None;
     let mut prev_analytics: Option<Analytics> = None;
+    let mut last_fleet = Instant::now() - Duration::from_secs(10);
+    let mut fleet_last: Option<crate::fleet::Fleet> = None;
     let mut last_procs = Instant::now() - Duration::from_secs(60);
     #[allow(clippy::type_complexity)]
     let mut slow: Option<(
@@ -451,6 +556,15 @@ fn worker(
         }
         // A login file changed (a refresh, a /login, a copied backup): re-read at once.
         marks.push(("procs", Instant::now()));
+        // A fresh status-line reading: limits are exact again, show them (at most every 5 s).
+        let sl = statusline_stamp(&ctx);
+        if sl != sl_stamp && last_sl.elapsed() > Duration::from_secs(5) {
+            sl_stamp = sl;
+            last_sl = Instant::now();
+            reload_seat_info(&mut ctx);
+            last_info = Instant::now();
+            seats_changed = true;
+        }
         let stamp = login_files_stamp(&ctx);
         if stamp != login_stamp || last_info.elapsed() > Duration::from_secs(20) {
             if stamp != login_stamp {
@@ -518,6 +632,26 @@ fn worker(
         }
         match built {
             Ok(snap) => {
+                // The status line's summary: when something changed, at most every 2 s, and at
+                // least every 5 s so it stays fresh.
+                if last_fleet.elapsed() > Duration::from_secs(2) {
+                    let fl = fleet_of(
+                        &ctx,
+                        &snap,
+                        prev_analytics
+                            .as_ref()
+                            .map(|a| a.limits.as_slice())
+                            .unwrap_or(&[]),
+                    );
+                    let changed = Some(&fl) != fleet_last.as_ref();
+                    if changed || last_fleet.elapsed() > Duration::from_secs(5) {
+                        let mut f = fl.clone();
+                        f.written_at = Utc::now();
+                        let _ = crate::fleet::write(&crate::fleet::path(&ctx.dirs.data), &f);
+                        fleet_last = Some(fl);
+                        last_fleet = Instant::now();
+                    }
+                }
                 // Only the SYSTEM panel shows this; listing disks is not free.
                 let sysview = if want_system {
                     system_view(&ctx, &live_sessions, sys.as_ref())
@@ -562,9 +696,10 @@ fn worker(
         if dbg {
             eprintln!("timeline {:?}", tt.elapsed());
         }
+        let seats_now = std::mem::take(&mut seats_changed);
         let due = last_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(30))
             || w.refresh_analytics
-            || std::mem::take(&mut seats_changed);
+            || seats_now;
         if due {
             if last_disk.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
                 disk_cache = ctx
@@ -607,8 +742,9 @@ fn worker(
                 || last_full_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(120));
             let reuse = if full { None } else { prev_analytics.as_ref() };
             // Limits every minute (their inputs move slowly; the reading itself is cached by Claude Code).
-            let limits_due =
-                full || last_limits.is_none_or(|t| t.elapsed() > Duration::from_secs(55));
+            let limits_due = full
+                || seats_now
+                || last_limits.is_none_or(|t| t.elapsed() > Duration::from_secs(55));
             let res = analytics(
                 &ctx,
                 &idx,
