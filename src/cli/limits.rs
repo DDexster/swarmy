@@ -49,6 +49,15 @@ pub struct WindowReport {
     pub shares: Vec<Share>,
     /// ≈ API-equivalent dollars of a full window.
     pub window_usd: Option<f64>,
+    /// Estimated utilization through the window: cumulative spend, scaled to end at
+    /// `estimate_now`; one point per `curve_step` from `window.start`.
+    #[serde(skip)]
+    pub curve: Vec<f64>,
+    #[serde(skip)]
+    pub curve_step: Duration,
+    /// Utilization readings inside the window (what Claude Code really fetched).
+    #[serde(skip)]
+    pub marks: Vec<(chrono::DateTime<chrono::Utc>, f64)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,6 +247,41 @@ pub fn analyze(
             })
             .collect();
         let shares = limits::attribute(visible_points.unwrap_or(estimate_now), &costs);
+        // The curve of the window: about 170 steps whatever its length.
+        let (curve, curve_step, marks) = if reset_passed {
+            (Vec::new(), Duration::hours(1), Vec::new())
+        } else {
+            let step = Duration::minutes(((window.end - window.start).num_minutes() / 168).max(1));
+            let series = idx.spend_series(
+                Span {
+                    start: window.start,
+                    end: now_end,
+                },
+                step.num_minutes(),
+                &filter,
+            )?;
+            let total: f64 = series.iter().sum();
+            let scale = if total > 0.0 {
+                estimate_now / total
+            } else {
+                0.0
+            };
+            let mut acc = 0.0;
+            let curve = series
+                .iter()
+                .map(|c| {
+                    acc += c;
+                    acc * scale
+                })
+                .collect();
+            let marks = idx
+                .readings(account, r.kind)?
+                .into_iter()
+                .filter(|x| x.fetched_at >= window.start && x.fetched_at <= ctx.now)
+                .map(|x| (x.fetched_at, x.utilization))
+                .collect();
+            (curve, step, marks)
+        };
         windows.push(WindowReport {
             reading: *r,
             reset_passed,
@@ -256,6 +300,9 @@ pub fn analyze(
             eta_seconds: eta.map(|d| d.num_seconds()),
             shares,
             window_usd: usd_per_point.map(|u| u * 100.0),
+            curve,
+            curve_step,
+            marks,
         });
     }
     Ok(AccountReport {

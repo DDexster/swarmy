@@ -18,6 +18,10 @@ pub struct Project {
     pub name: String,
     /// Set when the cwd is inside a linked worktree.
     pub worktree: Option<String>,
+    /// No repository or alias was found: the dir is gone, or it is a scratch dir. Such a cwd takes
+    /// the project of the session it was used in (see `Index::post_pass`).
+    #[serde(skip)]
+    pub orphan: bool,
 }
 
 /// `[[project]]` entries of `config.toml`: every cwd starting with `match` belongs to `name`.
@@ -63,21 +67,33 @@ impl Resolver {
                 key: format!("alias:{}", a.name),
                 name: a.name.clone(),
                 worktree: None,
+                orphan: false,
             };
         }
-        if let Some((root, worktree)) = git_root(Path::new(cwd)) {
+        if let Some((root, worktree)) =
+            git_root(Path::new(cwd)).or_else(|| worktree_sibling(Path::new(cwd)))
+        {
             let name = dir_name(&root);
             return Project {
                 key: root.to_string_lossy().into_owned(),
                 name,
                 worktree,
+                orphan: false,
             };
         }
         let p = Path::new(cwd);
+        // The home dir is named "~", not after the user.
+        let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+        let name = if home.as_deref() == Some(p) {
+            "~".to_string()
+        } else {
+            dir_name(p)
+        };
         Project {
             key: cwd.to_string(),
-            name: dir_name(p),
+            name,
             worktree: None,
+            orphan: true,
         }
     }
 }
@@ -86,6 +102,30 @@ fn dir_name(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| p.to_string_lossy().into_owned())
+}
+
+/// Worktrees kept next to the repository, as `<repo>-wt/<name>` or `<repo>-worktrees/<name>`:
+/// once such a worktree is removed, its old path still names the repository.
+fn worktree_sibling(dir: &Path) -> Option<(PathBuf, Option<String>)> {
+    let mut cur = dir;
+    while let Some(parent) = cur.parent() {
+        let name = cur.file_name()?.to_string_lossy();
+        let base = name
+            .strip_suffix("-wt")
+            .or_else(|| name.strip_suffix("-worktrees"));
+        if let Some(base) = base.filter(|b| !b.is_empty()) {
+            let repo = parent.join(base);
+            if repo.join(".git").exists() {
+                let wt = dir
+                    .ancestors()
+                    .find(|a| a.parent() == Some(cur))
+                    .unwrap_or(dir);
+                return Some((repo, Some(wt.to_string_lossy().into_owned())));
+            }
+        }
+        cur = parent;
+    }
+    None
 }
 
 /// The main repository root of `dir` and, for a linked worktree, the worktree path.
@@ -166,6 +206,16 @@ mod tests {
         assert_eq!(
             (m.key.as_str(), m.name.as_str()),
             ("/nowhere/at/all/thing", "thing")
+        );
+        assert!(m.orphan);
+        assert!(!p.orphan);
+
+        // A removed worktree under `<repo>-wt/` still belongs to the repository.
+        let gone = r.resolve(&t.path().join("shop-wt/fix-1/backend").to_string_lossy());
+        assert_eq!((gone.name.as_str(), gone.orphan), ("shop", false));
+        assert_eq!(
+            gone.worktree.as_deref(),
+            Some(t.path().join("shop-wt/fix-1").to_string_lossy().as_ref())
         );
     }
 }

@@ -1,7 +1,7 @@
 //! The panels. Each one fills the rectangle it is given: columns, bar widths and row counts come
 //! from the size, so the same panel works in a 40-column strip and on a 4K wall.
 
-use chrono::{Local, Utc};
+use chrono::{Datelike, Local, Utc};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -33,6 +33,13 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         Some(fl) if !fl.is_empty() => format!("{n} agents · filter \"{fl}\""),
         _ => format!("{n} agents"),
     };
+    let suffix = if app.lanes && area.width >= 150 {
+        format!(
+            "{suffix} · last 30 min: ▃ thinking ▅ tool ▆ waiting for agents █ waiting for you · v switches"
+        )
+    } else {
+        suffix
+    };
     let inner = frame(f, app, Panel::Swarm, area, &suffix, false);
     let app: &App = app;
     let th = app.theme;
@@ -62,7 +69,11 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(16);
     let (model_w, t_w, cost_w) = (13usize, 8usize, 10usize);
     let ctx_w = if width >= 120 { 16 } else { 0 };
-    let spark_w = if width >= 150 { 16 } else { 0 };
+    let spark_w = if width >= 150 {
+        if app.lanes { 31 } else { 16 }
+    } else {
+        0
+    };
     let extra = width >= 210;
     let (reqs_w, age_w) = if extra { (7usize, 8usize) } else { (0, 0) };
     let fixed = 3
@@ -93,7 +104,17 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         header.push_str(&format!(" {}", fit("CONTEXT", ctx_w - 1)));
     }
     if spark_w > 0 {
-        header.push_str(&format!(" {}", fit("$ · 15 min", spark_w - 1)));
+        header.push_str(&format!(
+            " {}",
+            fit(
+                if app.lanes {
+                    "LAST 30 MIN          now"
+                } else {
+                    "$ · 15 min"
+                },
+                spark_w - 1
+            )
+        ));
     }
     if extra {
         header.push_str(&format!(
@@ -106,9 +127,31 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(header, faint(app)))];
     let rows_h = inner.height.saturating_sub(1) as usize;
     let sel = app.selected_index();
-    let offset = app.swarm_offset(rows_h);
+    // Sessions are separated by a rule; keep the selection visible with those extra lines.
+    let mut offset = app.swarm_offset(rows_h);
+    let lines_to = |from: usize, to: usize| {
+        (from..=to.min(agents.len().saturating_sub(1)))
+            .map(|k| 1 + usize::from(k > from && agents[k].is_main()))
+            .sum::<usize>()
+    };
+    while offset < sel && lines_to(offset, sel) > rows_h {
+        offset += 1;
+    }
     let now = Utc::now();
-    for (i, a) in agents.iter().enumerate().skip(offset).take(rows_h) {
+    let rule = "─".repeat(inner.width as usize);
+    for (i, a) in agents.iter().enumerate().skip(offset) {
+        if a.is_main() && i > offset {
+            if lines.len() > rows_h {
+                break;
+            }
+            lines.push(Line::from(Span::styled(
+                rule.clone(),
+                Style::new().fg(th.track),
+            )));
+        }
+        if lines.len() > rows_h {
+            break;
+        }
         let (g, gc) = glyph(app, &a.state);
         let last_in_branch = agents
             .get(i + 1)
@@ -139,7 +182,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         };
         let mut act = activity(&a.state);
         if a.is_main() && act_w >= 48 {
-            let mut extra_s = format!("{}/h", fmt::money(a.session_burn));
+            let mut extra_s = format!("{}/h", fmt::usd(a.session_burn));
             if a.cpu > 0.0 || a.memory > 0 {
                 extra_s.push_str(&format!(
                     " · cpu {:.0}% {}",
@@ -157,21 +200,33 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         let mut spans = vec![
             Span::styled(format!("{g}  "), Style::new().fg(gc)),
             Span::styled(tree.clone(), Style::new().fg(th.faint)),
-            Span::styled(
-                fit(&name, name_w.saturating_sub(w(&tree))),
-                if a.is_main() {
-                    th.bold(fg)
+        ];
+        // A session row: its name, then the project in the directory colour.
+        let nw = name_w.saturating_sub(w(&tree));
+        if a.is_main() {
+            let first = fit(&a.name, nw);
+            let first = first.trim_end().to_string();
+            let left = nw.saturating_sub(w(&first));
+            spans.push(Span::styled(first, th.bold(fg)));
+            spans.push(Span::styled(
+                fit(&format!(" · {}", a.project), left),
+                if quiet {
+                    Style::new().fg(th.fade(th.dir, 0.35))
                 } else {
-                    Style::new().fg(fg)
+                    th.bold(th.dir)
                 },
-            ),
+            ));
+        } else {
+            spans.push(Span::styled(fit(&name, nw), Style::new().fg(fg)));
+        }
+        spans.extend([
             Span::styled(
                 format!(" {}", fit(&model_chip(a), model_w)),
                 Style::new().fg(if quiet { th.dim } else { th.family(a.family()) }),
             ),
             Span::styled(format!(" {}", fit(&act, act_w)), act_style),
             Span::styled(format!(" {}", fit_right(&timer, t_w)), dim(app)),
-        ];
+        ]);
         if ctx_w > 0 {
             let win = a.model.as_deref().map(context_window).unwrap_or(1_000_000) as f64;
             let frac = a.context_tokens as f64 / win;
@@ -191,7 +246,25 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                 spans.push(Span::styled(fit("", ctx_w - 1), dim(app)));
             }
         }
-        if spark_w > 0 {
+        if spark_w > 0 && app.lanes {
+            use crate::live::Lane;
+            spans.push(Span::raw(" "));
+            let lane = &a.lane;
+            for k in 0..spark_w - 1 {
+                let v = lane
+                    .get(k + lane.len().saturating_sub(spark_w - 1))
+                    .copied()
+                    .unwrap_or_default();
+                let (ch, c) = match v {
+                    Lane::Quiet => ("·", th.track),
+                    Lane::Thinking => ("▃", th.thinking),
+                    Lane::Tool => ("▅", th.good),
+                    Lane::Agents => ("▆", th.accent),
+                    Lane::You => ("█", th.warn),
+                };
+                spans.push(Span::styled(ch, Style::new().fg(c)));
+            }
+        } else if spark_w > 0 {
             spans.push(Span::raw(" "));
             spans.push(spark(&a.spark, th.family(a.family())));
             spans.push(Span::raw(
@@ -209,9 +282,9 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
             ));
         }
         let cost = if a.is_main() {
-            format!("Σ{}", fmt::money(a.session_cost))
+            format!("Σ{}", fmt::usd(a.session_cost))
         } else {
-            fmt::money(a.cost)
+            fmt::usd(a.cost)
         };
         spans.push(Span::styled(
             format!(" {}", fit_right(&cost, cost_w)),
@@ -241,7 +314,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(
                     " · {} agents in the last 6 h · {}",
                     done.len(),
-                    fmt::money(total)
+                    fmt::usd(total)
                 ),
                 faint(app),
             ),
@@ -254,7 +327,10 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(vec![
                 Span::styled("✓  ", Style::new().fg(th.fade(th.good, 0.35))),
                 Span::styled(fit(&d.name, dname_w), Style::new().fg(th.dim)),
-                Span::styled(format!(" {}", fit(&d.project, proj_w)), faint(app)),
+                Span::styled(
+                    format!(" {}", fit(&d.project, proj_w)),
+                    Style::new().fg(th.fade(th.dir, 0.3)),
+                ),
                 Span::styled(
                     format!(" {}", fit(&model, 11)),
                     Style::new().fg(th.fade(th.family(fam), 0.3)),
@@ -268,7 +344,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                     faint(app),
                 ),
                 Span::styled(
-                    format!(" {}", fit_right(&fmt::money(d.cost), 10)),
+                    format!(" {}", fit_right(&fmt::usd(d.cost), 10)),
                     Style::new().fg(th.dim),
                 ),
             ]));
@@ -387,29 +463,27 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         }),
         th.fg,
     ));
-    lines.push(kv(
-        "where",
-        format!(
-            "{} · {} · {}",
-            a.project,
-            a.seat,
-            &a.session_id[..8.min(a.session_id.len())]
+    lines.push(Line::from(vec![
+        Span::styled(fit("where", kw), faint(app)),
+        Span::styled(a.project.clone(), th.bold(th.dir)),
+        Span::styled(
+            format!(
+                " · {} · {}",
+                a.seat,
+                &a.session_id[..8.min(a.session_id.len())]
+            ),
+            Style::new().fg(th.fg),
         ),
-        th.fg,
-    ));
+    ]));
     let cost = if a.is_main() {
         format!(
             "{} · session Σ{} · {}/h",
-            fmt::money(a.cost),
-            fmt::money(a.session_cost),
-            fmt::money(a.session_burn)
+            fmt::usd(a.cost),
+            fmt::usd(a.session_cost),
+            fmt::usd(a.session_burn)
         )
     } else {
-        format!(
-            "{} · {} requests",
-            fmt::money(a.cost),
-            fmt::count(a.requests)
-        )
+        format!("{} · {} requests", fmt::usd(a.cost), fmt::count(a.requests))
     };
     lines.push(kv("cost", cost, th.fg));
     let win = a.model.as_deref().map(context_window).unwrap_or(1_000_000);
@@ -434,7 +508,10 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
     {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(" LAST MESSAGE ", th.heading())));
-        let room = (card.height as usize).saturating_sub(lines.len()).max(1);
+        // Leave room for the life chart under it.
+        let room = (card.height as usize)
+            .saturating_sub(lines.len() + 10)
+            .clamp(2, 8);
         for l in wrap(
             if app.mask { "•••" } else { msg },
             card.width as usize,
@@ -443,7 +520,16 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
             lines.push(Line::from(Span::styled(l, Style::new().fg(th.fg))));
         }
     }
+    let used = lines.len() as u16;
     put(f, card, lines);
+    let life_area = Rect {
+        y: card.y + used + 1,
+        height: card.height.saturating_sub(used + 1),
+        ..card
+    };
+    if life_area.height >= 6 && app.life.0 == a.key() {
+        agent_life(f, app, &a, life_area);
+    }
 
     // Tool timeline, newest first, scrollable when the panel has focus.
     let mut lines = Vec::new();
@@ -698,7 +784,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                     .and_then(|w| w.eta)
                     .map(|d| format!("empty in {}", fmt::duration(d)));
                 let burn = weekly
-                    .map(|w| format!("{}/h", fmt::money(w.burn_usd_per_hour)))
+                    .map(|w| format!("{}/h", fmt::usd(w.burn_usd_per_hour)))
                     .unwrap_or_default();
                 let live_s = if live > 0 {
                     format!("●{live} live")
@@ -748,74 +834,298 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             faint(app),
         )));
     }
-    // Where each account's week went, when there is room.
-    if detail || inner.height as usize > lines.len() + 4 {
-        for rep in &app.analytics.limits {
-            let Some(win) = rep
-                .windows
-                .iter()
-                .find(|w| w.reading.kind == WindowKind::SevenDay)
-            else {
-                continue;
+    // Below the rows: the week as a curve (left) and where it went (right), when there is room.
+    let used = lines.len() as u16;
+    put(f, inner, lines);
+    let rest = Rect {
+        y: inner.y + used + 1,
+        height: inner.height.saturating_sub(used + 1),
+        ..inner
+    };
+    if rest.height >= 5 {
+        let (chart, side) = if rest.width >= 110 {
+            let c = hsplit(rest, &[58, 42]);
+            (c[0], Some(c[1]))
+        } else {
+            (rest, None)
+        };
+        mana_curve(f, app, chart);
+        if let Some(side) = side {
+            let side = Rect {
+                x: side.x + 2,
+                width: side.width.saturating_sub(2),
+                ..side
             };
-            if (lines.len() as u16) + 2 >= inner.height {
-                break;
-            }
-            lines.push(Line::from(""));
-            let mut head = vec![
-                Span::styled(mask_name(app, &rep.name), th.bold(th.fg)),
-                Span::styled(
-                    format!(
-                        " · week {} · ≈{}/pt",
-                        fmt::pct(win.estimate_now),
-                        win.usd_per_point
-                            .map(fmt::money)
-                            .unwrap_or_else(|| "?".into())
-                    ),
-                    dim(app),
-                ),
-            ];
-            if let Some(t) = win.manual_reset {
-                head.push(Span::styled(
-                    format!(
-                        " · reset by hand ≈{}",
-                        t.with_timezone(&Local).format("%a %H:%M")
-                    ),
-                    Style::new().fg(th.accent),
-                ));
-            }
-            if let Some(o) = win.outside_points.filter(|o| *o >= 2.0) {
-                head.push(Span::styled(
-                    format!(" · ≈{o:.0}pt used elsewhere (claude.ai, other devices)"),
-                    Style::new().fg(th.warn),
-                ));
-            }
-            lines.push(Line::from(head));
-            let max = win.shares.first().map(|s| s.share).unwrap_or(0.0).max(1e-9);
-            let bw = width.saturating_sub(48).clamp(10, 60);
-            for s in win.shares.iter() {
-                if (lines.len() as u16) >= inner.height {
-                    break;
-                }
-                let mut sp = vec![Span::styled(
-                    format!("  {} ", fit(&s.key, 18)),
-                    Style::new().fg(th.fg),
-                )];
-                sp.extend(gauge(s.share / max, bw, th.fade(th.accent, 0.3), &th));
-                sp.push(Span::styled(
-                    format!(
-                        " {:>10} {:>5} ≈{:.1}pt",
-                        fmt::money(s.cost),
-                        fmt::pct(s.share * 100.0),
-                        s.limit_points
-                    ),
-                    dim(app),
-                ));
-                lines.push(Line::from(sp));
-            }
+            put(
+                f,
+                side,
+                mana_shares(app, side.width as usize, side.height as usize, detail),
+            );
         }
     }
-    put(f, inner, lines);
+}
+
+/// Where each account's week went: projects with their share of the used limit.
+fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Line<'static>> {
+    let th = app.theme;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, rep) in app.analytics.limits.iter().enumerate() {
+        let Some(win) = rep
+            .windows
+            .iter()
+            .find(|w| w.reading.kind == WindowKind::SevenDay)
+        else {
+            continue;
+        };
+        if lines.len() + 2 > height {
+            break;
+        }
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        let mut head = vec![
+            Span::styled("■ ", Style::new().fg(account_color(&th, i))),
+            Span::styled(mask_name(app, &rep.name), th.bold(th.fg)),
+            Span::styled(
+                format!(
+                    " · week {} · ≈{}/pt",
+                    fmt::pct(win.estimate_now),
+                    win.usd_per_point
+                        .map(fmt::money)
+                        .unwrap_or_else(|| "?".into())
+                ),
+                dim(app),
+            ),
+        ];
+        if let Some(t) = win.manual_reset {
+            head.push(Span::styled(
+                format!(
+                    " · reset by hand ≈{}",
+                    t.with_timezone(&Local).format("%a %H:%M")
+                ),
+                Style::new().fg(th.accent),
+            ));
+        }
+        if let Some(o) = win.outside_points.filter(|o| *o >= 2.0) {
+            head.push(Span::styled(
+                format!(" · ≈{o:.0}pt elsewhere"),
+                Style::new().fg(th.warn),
+            ));
+        }
+        lines.push(Line::from(head));
+        let max = win.shares.first().map(|s| s.share).unwrap_or(0.0).max(1e-9);
+        let name_w = 16usize.min(width / 4);
+        let bw = width.saturating_sub(name_w + 30).clamp(6, 40);
+        for s in win.shares.iter() {
+            if lines.len() >= height {
+                break;
+            }
+            let mut sp = vec![Span::styled(
+                format!("  {} ", fit(&s.key, name_w)),
+                Style::new().fg(th.fg),
+            )];
+            sp.extend(gauge(
+                s.share / max,
+                bw,
+                th.fade(account_color(&th, i), 0.3),
+                &th,
+            ));
+            sp.push(Span::styled(
+                format!(
+                    " {:>8} {:>5} ≈{:.1}pt",
+                    fmt::usd(s.cost),
+                    fmt::pct(s.share * 100.0),
+                    s.limit_points
+                ),
+                dim(app),
+            ));
+            lines.push(Line::from(sp));
+        }
+    }
+    lines
+}
+
+/// Colours of accounts in the limit chart and its legend.
+pub fn account_color(th: &crate::tui::theme::Theme, i: usize) -> Color {
+    [th.accent, Color::Rgb(255, 121, 198), th.good, th.fable][i % 4]
+}
+
+/// The limit window as a curve per account: estimated utilization from the window start to now
+/// (solid), the readings Claude Code fetched (dots), the projection to the reset at the current
+/// pace (dotted), the 100% line and "now".
+fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
+    use chrono::Duration;
+    use ratatui::widgets::canvas::Points;
+    let th = app.theme;
+    let now = Utc::now();
+    let wins: Vec<(usize, &crate::cli::limits::WindowReport)> = app
+        .analytics
+        .limits
+        .iter()
+        .enumerate()
+        .filter_map(|(i, r)| {
+            r.windows
+                .iter()
+                .find(|w| w.reading.kind == WindowKind::SevenDay && !w.curve.is_empty())
+                .map(|w| (i, w))
+        })
+        .collect();
+    if wins.is_empty() || area.height < 4 || area.width < 30 {
+        return;
+    }
+    let [chart, legend] = [
+        Rect {
+            height: area.height - 1,
+            ..area
+        },
+        Rect {
+            y: area.y + area.height - 1,
+            height: 1,
+            ..area
+        },
+    ];
+    let x0 = wins
+        .iter()
+        .map(|(_, w)| w.window.start)
+        .min()
+        .unwrap_or(now);
+    let x1 = wins.iter().map(|(_, w)| w.window.end).max().unwrap_or(now);
+    let hours = |t: chrono::DateTime<Utc>| (t - x0).num_seconds() as f64 / 3600.0;
+    let span = hours(x1).max(1.0);
+    // Projections: the current pace until the reset.
+    let proj: Vec<Option<(f64, f64)>> = wins
+        .iter()
+        .map(|(_, w)| {
+            w.points_per_hour.filter(|p| *p > 0.0).map(|pph| {
+                let left = (w.window.end - now).num_seconds().max(0) as f64 / 3600.0;
+                (hours(w.window.end), w.estimate_now + pph * left)
+            })
+        })
+        .collect();
+    let peak = wins
+        .iter()
+        .map(|(_, w)| w.estimate_now)
+        .chain(proj.iter().flatten().map(|p| p.1))
+        .fold(100.0f64, f64::max)
+        .min(400.0);
+    let ymax = peak * 1.08;
+    let (bad, faint_c, track) = (th.bad, th.faint, th.track);
+    let series: Vec<(
+        Color,
+        Vec<(f64, f64)>,
+        Vec<(f64, f64)>,
+        Option<(f64, f64, f64, f64)>,
+    )> = wins
+        .iter()
+        .zip(&proj)
+        .map(|((i, w), p)| {
+            let step = w.curve_step.num_seconds() as f64 / 3600.0;
+            let start = hours(w.window.start);
+            let mut pts = vec![(start, 0.0)];
+            pts.extend(
+                w.curve
+                    .iter()
+                    .enumerate()
+                    .map(|(k, v)| ((start + (k as f64 + 1.0) * step).min(hours(now)), *v)),
+            );
+            let marks = w.marks.iter().map(|(t, u)| (hours(*t), *u)).collect();
+            let pr = p.map(|(xe, ye)| (hours(now), w.estimate_now, xe, ye));
+            (account_color(&th, *i), pts, marks, pr)
+        })
+        .collect();
+    let xn = hours(now);
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, span])
+        .y_bounds([0.0, ymax])
+        .paint(move |ctx| {
+            // Day boundaries, then 100% and now.
+            let mut d = (x0 + Duration::days(1)).with_timezone(&Local).date_naive();
+            while let Some(t) = d
+                .and_hms_opt(0, 0, 0)
+                .and_then(|t| t.and_local_timezone(Local).single())
+            {
+                let x = hours(t.with_timezone(&Utc));
+                if x >= span {
+                    break;
+                }
+                ctx.draw(&CLine::new(x, 0.0, x, ymax * 0.04, track));
+                d = d.succ_opt().unwrap_or(d);
+            }
+            let mut x = 0.0;
+            while x < span {
+                ctx.draw(&CLine::new(
+                    x,
+                    100.0,
+                    (x + span / 120.0).min(span),
+                    100.0,
+                    bad,
+                ));
+                x += span / 60.0;
+            }
+            ctx.draw(&CLine::new(xn, 0.0, xn, ymax, faint_c));
+            for (c, pts, marks, pr) in &series {
+                for w in pts.windows(2) {
+                    ctx.draw(&CLine::new(w[0].0, w[0].1, w[1].0, w[1].1, *c));
+                }
+                if let Some((xa, ya, xe, ye)) = pr {
+                    // Dotted: short dashes along the projection.
+                    let n = 40;
+                    for k in (0..n).step_by(2) {
+                        let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
+                        let y0 = ya + (ye - ya) * t0;
+                        let y1 = ya + (ye - ya) * t1;
+                        if y0 > ymax {
+                            break;
+                        }
+                        ctx.draw(&CLine::new(
+                            xa + (xe - xa) * t0,
+                            y0,
+                            xa + (xe - xa) * t1,
+                            y1.min(ymax),
+                            *c,
+                        ));
+                    }
+                }
+                ctx.draw(&Points {
+                    coords: marks,
+                    color: Color::White,
+                });
+            }
+        });
+    f.render_widget(canvas, chart);
+    // Legend: per account where it is and where it is heading.
+    let mut spans = vec![
+        Span::styled("100% ", Style::new().fg(th.bad)),
+        Span::styled("╌ ", Style::new().fg(th.bad)),
+    ];
+    for ((i, w), p) in wins.iter().zip(&proj) {
+        let name = mask_name(app, &app.analytics.limits[*i].name);
+        let ahead = match (w.eta, p) {
+            _ if w.estimate_now >= 100.0 => " · limit reached".to_string(),
+            (Some(d), _) => format!(
+                " → 100% {}",
+                (now + d).with_timezone(&Local).format("%a %H:%M")
+            ),
+            (None, Some((_, ye))) => format!(" → ≈{} at reset", fmt::pct(*ye)),
+            _ => String::new(),
+        };
+        spans.push(Span::styled("■ ", Style::new().fg(account_color(&th, *i))));
+        spans.push(Span::styled(
+            format!("{name} {}{ahead}   ", fmt::pct(w.estimate_now)),
+            dim(app),
+        ));
+    }
+    let range = format!(
+        "{} … {} · dots: readings",
+        x0.with_timezone(&Local).format("%a %d"),
+        x1.with_timezone(&Local).format("%a %d")
+    );
+    let used: usize = spans.iter().map(|s| w(&s.content)).sum();
+    if used + w(&range) <= legend.width as usize {
+        spans.push(Span::styled(range, faint(app)));
+    }
+    put(f, legend, vec![Line::from(spans)]);
 }
 
 // ───────────────────────────── BURN ─────────────────────────────
@@ -837,7 +1147,21 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         format!("{b:.2}")
     };
-    let big_w = bigdigits::width(&rate) as u16 + 2;
+    let period_label = app
+        .analytics
+        .period
+        .as_ref()
+        .map(|p| p.label())
+        .unwrap_or_default();
+    let today = fmt::usd(app.snapshot.today_cost);
+    let period_cost = app.analytics.total.as_ref().map(|t| fmt::usd(t.cost));
+    // The left column fits the big number and both captions, so the chart never covers them.
+    let labels_w = (6 + w(&today)).max(
+        period_cost
+            .as_ref()
+            .map_or(0, |c| w(&period_label) + 1 + w(c)),
+    );
+    let big_w = (bigdigits::width(&rate).max(labels_w).max(10) + 2) as u16;
     let chart_area = if inner.width >= big_w + 30 && inner.height >= 6 {
         let rows = bigdigits::render(&rate);
         let c = if app.snapshot.burn_per_hour > 0.0 {
@@ -853,22 +1177,12 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("today ", faint(app)),
-            Span::styled(fmt::money(app.snapshot.today_cost), th.bold(th.fg)),
+            Span::styled(today, th.bold(th.fg)),
         ]));
-        if let Some(t) = &app.analytics.total {
+        if let Some(c) = period_cost {
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!(
-                        "{} ",
-                        app.analytics
-                            .period
-                            .as_ref()
-                            .map(|p| p.label())
-                            .unwrap_or_default()
-                    ),
-                    faint(app),
-                ),
-                Span::styled(fmt::money(t.cost), th.bold(th.fg)),
+                Span::styled(format!("{period_label} "), faint(app)),
+                Span::styled(c, th.bold(th.fg)),
             ]));
         }
         put(
@@ -943,7 +1257,7 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     spans.push(Span::styled(
-        format!("peak {}/min · −60 min … now", fmt::money(max / 1.1)),
+        format!("peak {}/min · −60 min … now", fmt::usd(max / 1.1)),
         faint(app),
     ));
     put(f, legend, vec![Line::from(spans)]);
@@ -1011,10 +1325,23 @@ pub fn attention(f: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Panel::Attention;
     let now = Utc::now();
     let tw = (inner.width as usize).saturating_sub(10);
+    let height = inner.height as usize;
+    // Alerts first; the event log takes the rest (at least a few lines when there is room).
+    let room_for_items = if height >= 10 {
+        height - 2 - 4
+    } else {
+        height.saturating_sub(2)
+    };
+    let item_offset = if cur < items.len() && cur >= room_for_items {
+        cur + 1 - room_for_items
+    } else {
+        0
+    };
     for (i, a) in items
         .iter()
         .enumerate()
-        .take(inner.height.saturating_sub(2) as usize)
+        .skip(item_offset)
+        .take(room_for_items)
     {
         let c = app.tone_color(a.tone);
         let c = if a.severity == 0 {
@@ -1035,6 +1362,41 @@ pub fn attention(f: &mut Frame, app: &mut App, area: Rect) {
             line = line.style(Style::new().bg(th.sel));
         }
         lines.push(line);
+    }
+    if lines.len() + 3 <= height {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(" EVENTS ", th.heading()),
+            Span::styled(format!(" · {}", app.events.len()), faint(app)),
+        ]));
+        let start = cur.saturating_sub(items.len());
+        let room = height - lines.len();
+        for (k, e) in app.events.iter().enumerate().skip(start).take(room) {
+            let mut c = app.tone_color(e.tone);
+            let age = e.born.elapsed().as_secs_f32();
+            if age < 1.0 && app.animating() {
+                c = th.glow(c, (1.0 - age) * 0.6);
+            }
+            let mut line = Line::from(vec![
+                Span::styled(
+                    format!("{} ", e.at.with_timezone(&Local).format("%H:%M:%S")),
+                    faint(app),
+                ),
+                Span::styled(format!("{} ", e.glyph), th.bold(c)),
+                Span::styled(
+                    e.text.clone(),
+                    Style::new().fg(if e.tone == crate::tui::app::Tone::Info {
+                        th.dim
+                    } else {
+                        th.fg
+                    }),
+                ),
+            ]);
+            if focused && cur >= items.len() && k == start {
+                line = line.style(Style::new().bg(th.sel));
+            }
+            lines.push(line);
+        }
     }
     put(f, inner, lines);
 }
@@ -1062,7 +1424,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
     let (live_w, hour_w, today_w, per_w, share_w, pts_w) =
         (5usize, 9usize, 10usize, 10usize, 6usize, 8usize);
     let name_w = 18usize.min(width / 4).max(10);
-    let fixed = name_w + live_w + hour_w + today_w + per_w + share_w + pts_w + 7;
+    let fixed = name_w + live_w + hour_w + today_w + per_w + 6 + share_w + pts_w + 7;
     let bar_w = width.saturating_sub(fixed).min(40);
     let total: f64 = app
         .analytics
@@ -1085,7 +1447,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             fit_right("LIVE", live_w),
             fit_right("$/HOUR", hour_w),
             fit_right("TODAY", today_w),
-            fit_right(&period.to_uppercase(), per_w),
+            fit_right(&format!("{}      ", period.to_uppercase()), per_w + 6),
             fit("", bar_w),
             fit_right("SHARE", share_w),
             fit_right("≈WEEK", pts_w)
@@ -1158,7 +1520,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
                     " {}",
                     fit_right(
                         &if p.hour > 0.0 {
-                            fmt::money(p.hour)
+                            fmt::usd(p.hour)
                         } else {
                             "·".into()
                         },
@@ -1168,13 +1530,14 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
                 Style::new().fg(if p.hour > 0.0 { th.accent } else { th.faint }),
             ),
             Span::styled(
-                format!(" {}", fit_right(&fmt::money(p.today), today_w)),
+                format!(" {}", fit_right(&fmt::usd(p.today), today_w)),
                 Style::new().fg(th.fg),
             ),
             Span::styled(
-                format!(" {}", fit_right(&fmt::money(p.period), per_w)),
+                format!(" {}", fit_right(&fmt::usd(p.period), per_w)),
                 th.bold(th.fg),
             ),
+            trend_w(app, p.period, p.prev, 6),
             Span::raw(" "),
         ];
         sp.extend(gauge(p.period / max, bar_w, th.fade(th.accent, 0.25), &th));
@@ -1230,13 +1593,13 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width as usize;
     let total: f64 = an.by_model.iter().map(|r| r.cost).sum::<f64>().max(1e-9);
     let show_mix = width >= 95;
-    let fixed = 11 + 9 + 11 + 6 + 8 + 6 + 6 + if show_mix { 24 } else { 0 } + 8;
+    let fixed = 11 + 9 + 11 + 6 + 8 + 6 + 6 + 6 + if show_mix { 24 } else { 0 } + 8;
     let bar_w = width.saturating_sub(fixed).clamp(4, 40);
     let mut header = format!(
         "{} {} {} {} {} {} {} {}",
         fit("MODEL", 11),
         fit_right("REQS", 8),
-        fit_right("COST", 10),
+        fit_right("COST      ", 16),
         fit("SHARE", bar_w),
         fit_right("", 5),
         fit_right("$/REQ", 7),
@@ -1255,12 +1618,23 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(fit(&short_name(&r.key), 11), th.bold(c)),
             Span::styled(
                 format!(
-                    " {} {} ",
+                    " {} {}",
                     fit_right(&fmt::count(r.requests), 8),
-                    fit_right(&fmt::money(r.cost), 10)
+                    fit_right(&fmt::usd(r.cost), 10)
                 ),
                 Style::new().fg(th.fg),
             ),
+            trend_w(
+                app,
+                r.cost,
+                an.prev_models
+                    .iter()
+                    .find(|(k, _)| *k == r.key)
+                    .map(|x| x.1)
+                    .unwrap_or(0.0),
+                6,
+            ),
+            Span::raw(" "),
         ];
         sp.extend(gauge(share, bar_w, c, &th));
         sp.push(Span::styled(
@@ -1270,7 +1644,7 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
         sp.push(Span::styled(
             format!(
                 " {} {} {}",
-                fit_right(&fmt::money(r.cost / r.requests.max(1) as f64), 7),
+                fit_right(&fmt::usd(r.cost / r.requests.max(1) as f64), 7),
                 fit_right(
                     &u.cache_hit_ratio()
                         .map(|x| fmt::pct(x * 100.0))
@@ -1382,7 +1756,7 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
                     row.push(Span::styled(fit_right("·", cell), faint(app)));
                 } else {
                     row.push(Span::styled(
-                        fit_right(&format!("{} ", fmt::money(c)), cell),
+                        fit_right(&format!("{} ", fmt::usd(c)), cell),
                         Style::new()
                             .fg(if k > 0.45 { th.bg } else { th.fg })
                             .bg(th.fade(th.family_name(m), 0.78 - k * 0.78)),
@@ -1435,14 +1809,46 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let heat_h: u16 = 9;
-    let bars_h = inner.height.saturating_sub(heat_h + 1).max(4);
+    // Bars, labels and the selected day's line.
+    let bars_h = inner.height.saturating_sub(heat_h + 1).max(5);
     let col = ((inner.width as usize) / 14).max(2);
-    let h = bars_h.saturating_sub(2) as usize;
+    let h = bars_h.saturating_sub(3) as usize;
     let max = days.iter().map(|d| d.1).fold(0.0, f64::max).max(1e-9);
+    // Per day: (family, cost) from the bottom up, biggest first.
+    let fams = [
+        Family::Opus,
+        Family::Fable,
+        Family::Sonnet,
+        Family::Haiku,
+        Family::Other,
+    ];
+    let mut stacks: std::collections::HashMap<&str, Vec<(Family, f64)>> = Default::default();
+    for (d, m, c) in &app.analytics.days_model {
+        let fam = match Family::of(m) {
+            Family::Mythos => Family::Fable,
+            x => x,
+        };
+        let e = stacks.entry(d.as_str()).or_default();
+        match e.iter_mut().find(|x| x.0 == fam) {
+            Some(x) => x.1 += c,
+            None => e.push((fam, *c)),
+        }
+    }
+    for v in stacks.values_mut() {
+        v.sort_by_key(|x| fams.iter().position(|f| *f == x.0).unwrap_or(9));
+    }
+    let sel = 13usize.saturating_sub(app.cur(Panel::History).min(13));
+    let focused = app.focus == Panel::History;
+    let today_k = today.format("%Y-%m-%d").to_string();
+    let weekend = |k: &str| {
+        chrono::NaiveDate::parse_from_str(k, "%Y-%m-%d")
+            .map(|d| matches!(d.weekday(), chrono::Weekday::Sat | chrono::Weekday::Sun))
+            .unwrap_or(false)
+    };
     let mut lines = Vec::new();
     for r in (0..h).rev() {
         let mut spans = Vec::new();
-        for (k, c) in &days {
+        for (i, (k, c)) in days.iter().enumerate() {
             let level = c / max * h as f64;
             let ch = if level >= r as f64 + 1.0 {
                 '█'
@@ -1451,11 +1857,25 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 ' '
             };
-            let color = if *k == today.format("%Y-%m-%d").to_string() {
-                pulse(app, th.accent, 0.5)
-            } else {
-                th.fade(th.accent, 0.2)
-            };
+            // The family that fills the middle of this cell.
+            let mid = (r as f64 + 0.5).min(level) / h as f64 * max;
+            let mut acc = 0.0;
+            let mut fam = Family::Other;
+            for (f, v) in stacks.get(k.as_str()).map(|v| v.as_slice()).unwrap_or(&[]) {
+                fam = *f;
+                acc += v;
+                if acc >= mid {
+                    break;
+                }
+            }
+            let mut color = th.family(fam);
+            if *k == today_k {
+                color = pulse(app, color, 0.5);
+            } else if focused && i != sel {
+                color = th.fade(color, 0.45);
+            } else if weekend(k) {
+                color = th.fade(color, 0.3);
+            }
             spans.push(Span::styled(
                 format!("{} ", ch.to_string().repeat(col - 1)),
                 Style::new().fg(color),
@@ -1463,23 +1883,59 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
         }
         lines.push(Line::from(spans));
     }
-    let labels: String = days
+    let labels: Vec<Span> = days
         .iter()
-        .map(|(k, _)| fit(k.get(8..10).unwrap_or(""), col))
+        .enumerate()
+        .map(|(i, (k, _))| {
+            let d = fit(k.get(8..10).unwrap_or(""), col);
+            if i == sel && focused {
+                Span::styled(d, Style::new().fg(th.bg).bg(th.accent))
+            } else if *k == today_k {
+                Span::styled(d, th.bold(th.accent))
+            } else if weekend(k) {
+                Span::styled(d, Style::new().fg(th.warn).add_modifier(Modifier::DIM))
+            } else {
+                Span::styled(d, faint(app))
+            }
+        })
         .collect();
-    lines.push(Line::from(Span::styled(labels, faint(app))));
+    lines.push(Line::from(labels));
+    // The selected day (today unless the panel is focused and moved).
+    let (k, c) = &days[sel];
+    let date = chrono::NaiveDate::parse_from_str(k, "%Y-%m-%d").ok();
+    let mut sp = vec![
+        Span::styled(
+            date.map(|d| d.format("%a %d %b").to_string())
+                .unwrap_or_default(),
+            th.bold(th.fg),
+        ),
+        Span::styled(format!(" {}", fmt::usd(*c)), th.bold(th.fg)),
+    ];
+    if sel > 0 {
+        sp.push(trend(app, *c, days[sel - 1].1));
+    }
+    for (fam, v) in stacks.get(k.as_str()).map(|v| v.as_slice()).unwrap_or(&[]) {
+        if *v / c.max(1e-9) >= 0.005 {
+            sp.push(Span::styled(
+                format!("  ■ {} {}", fam.name(), fmt::pct(v / c.max(1e-9) * 100.0)),
+                Style::new().fg(th.family(*fam)),
+            ));
+        }
+    }
+    lines.push(Line::from(sp));
     lines.push(Line::from(Span::styled(
         format!(
-            "max {}/day · 14 days {}",
-            fmt::money(max),
-            fmt::money(days.iter().map(|d| d.1).sum())
+            "max {}/day · 14 days {}{}",
+            fmt::usd(max),
+            fmt::usd(days.iter().map(|d| d.1).sum()),
+            if focused { " · ←→ pick a day" } else { "" }
         ),
         faint(app),
     )));
     put(
         f,
         Rect {
-            height: bars_h,
+            height: bars_h + 1,
             ..inner
         },
         lines,
@@ -1487,8 +1943,8 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Weekday × hour heatmap.
     let heat = Rect {
-        y: inner.y + bars_h + 1,
-        height: inner.height.saturating_sub(bars_h + 1),
+        y: inner.y + bars_h + 2,
+        height: inner.height.saturating_sub(bars_h + 2),
         ..inner
     };
     let mut grid = [[0.0f64; 24]; 7];
@@ -1533,43 +1989,6 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
     }
     lines.push(Line::from(Span::styled(hours, faint(app))));
     put(f, heat, lines);
-}
-
-// ───────────────────────────── EVENTS ─────────────────────────────
-
-pub fn events(f: &mut Frame, app: &mut App, area: Rect) {
-    let n = app.events.len();
-    let inner = frame(f, app, Panel::Events, area, &format!("{n}"), false);
-    let app: &App = app;
-    let th = app.theme;
-    let start = app.cur(Panel::Events).min(n.saturating_sub(1));
-    let mut lines = Vec::new();
-    for e in app.events.iter().skip(start).take(inner.height as usize) {
-        let mut c = app.tone_color(e.tone);
-        let age = e.born.elapsed().as_secs_f32();
-        if age < 1.0 && app.animating() {
-            c = th.glow(c, (1.0 - age) * 0.6);
-        }
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("{} ", e.at.with_timezone(&Local).format("%H:%M:%S")),
-                faint(app),
-            ),
-            Span::styled(format!("{} ", e.glyph), th.bold(c)),
-            Span::styled(
-                e.text.clone(),
-                Style::new().fg(if e.tone == crate::tui::app::Tone::Info {
-                    th.dim
-                } else {
-                    th.fg
-                }),
-            ),
-        ]));
-    }
-    if lines.is_empty() {
-        lines.push(Line::from(Span::styled("listening…", faint(app))));
-    }
-    put(f, inner, lines);
 }
 
 // ───────────────────────────── SYSTEM ─────────────────────────────
@@ -1677,4 +2096,569 @@ pub fn system(f: &mut Frame, app: &mut App, area: Rect) {
         dim(app),
     )));
     put(f, res, lines);
+}
+
+/// The agent's life: what each request cost (bars) and how the context grew (line), from its
+/// first request to now.
+fn agent_life(f: &mut Frame, app: &App, a: &crate::live::Agent, area: Rect) {
+    let th = app.theme;
+    let pts = &app.life.1;
+    let (Some(first), Some(last)) = (pts.first(), pts.last()) else {
+        return;
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" LIFE ", th.heading()),
+        Span::styled(
+            format!(
+                " · {} requests over {} · max {}/req",
+                fmt::count(pts.len() as u64),
+                fmt::duration(Utc::now() - first.ts),
+                fmt::usd(pts.iter().map(|p| p.cost).fold(0.0, f64::max))
+            ),
+            faint(app),
+        ),
+    ])];
+    put(f, Rect { height: 1, ..area }, std::mem::take(&mut lines));
+    let chart = Rect {
+        y: area.y + 1,
+        height: area.height - 2,
+        ..area
+    };
+    let legend = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    };
+    let t0 = first.ts;
+    let span = ((Utc::now() - t0).num_seconds().max(60)) as f64;
+    let x = |t: chrono::DateTime<Utc>| (t - t0).num_seconds() as f64 / span * 100.0;
+    // Costs summed into as many columns as the chart has braille dots.
+    let cols = (chart.width as usize * 2).max(2);
+    let mut bins = vec![0.0f64; cols];
+    for p in pts {
+        let i = ((x(p.ts) / 100.0) * (cols - 1) as f64).round() as usize;
+        bins[i.min(cols - 1)] += p.cost;
+    }
+    let bmax = bins.iter().copied().fold(0.0, f64::max).max(1e-9);
+    let win = a.model.as_deref().map(context_window).unwrap_or(1_000_000) as f64;
+    let ctx_pts: Vec<(f64, f64)> = pts
+        .iter()
+        .map(|p| (x(p.ts), p.context as f64 / win * 100.0))
+        .collect();
+    let (bar_c, ctx_c, track) = (th.family(a.family()), th.thinking, th.track);
+    let compactions: Vec<f64> = pts
+        .windows(2)
+        .filter(|w| w[1].context * 2 < w[0].context && w[0].context > 50_000)
+        .map(|w| x(w[1].ts))
+        .collect();
+    let warn = th.warn;
+    let canvas = Canvas::default()
+        .marker(Marker::Braille)
+        .x_bounds([0.0, 100.0])
+        .y_bounds([0.0, 100.0])
+        .paint(move |ctx| {
+            for (i, b) in bins.iter().enumerate() {
+                if *b > 0.0 {
+                    let xx = i as f64 / (cols - 1) as f64 * 100.0;
+                    ctx.draw(&CLine::new(xx, 0.0, xx, b / bmax * 60.0, bar_c));
+                }
+            }
+            for w in ctx_pts.windows(2) {
+                ctx.draw(&CLine::new(w[0].0, w[0].1, w[1].0, w[1].1, ctx_c));
+            }
+            for c in &compactions {
+                ctx.draw(&CLine::new(*c, 0.0, *c, 100.0, warn));
+            }
+            ctx.draw(&CLine::new(0.0, 0.0, 100.0, 0.0, track));
+        });
+    f.render_widget(canvas, chart);
+    let now_ctx = last.context as f64 / win * 100.0;
+    put(
+        f,
+        legend,
+        vec![Line::from(vec![
+            Span::styled("▮ $ per request  ", Style::new().fg(bar_c)),
+            Span::styled(
+                format!("─ context {}  ", fmt::pct(now_ctx)),
+                Style::new().fg(ctx_c),
+            ),
+            Span::styled("│ compaction", Style::new().fg(th.warn)),
+        ])],
+    );
+}
+
+// ───────────────────────────── EFFICIENCY ─────────────────────────────
+
+/// `245h`, `3.6h`, `12m`, `40s`.
+fn hrs(h: f64) -> String {
+    if h >= 100.0 {
+        format!("{h:.0}h")
+    } else if h >= 1.0 {
+        format!("{h:.1}h")
+    } else if h * 60.0 >= 1.0 {
+        format!("{:.0}m", h * 60.0)
+    } else {
+        format!("{:.0}s", h * 3600.0)
+    }
+}
+
+/// `▲12%` / `▼8%` against the previous period; nothing when there is no base.
+pub fn trend(app: &App, cur: f64, prev: f64) -> Span<'static> {
+    let th = app.theme;
+    if prev <= 0.0 || !cur.is_finite() {
+        return Span::raw("");
+    }
+    let d = (cur - prev) / prev * 100.0;
+    if d.abs() < 1.0 {
+        return Span::styled(" ≈", faint(app));
+    }
+    let (g, c) = if d > 0.0 {
+        ("▲", th.warn)
+    } else {
+        ("▼", th.good)
+    };
+    let v = if d.abs() >= 1000.0 {
+        ">999".to_string()
+    } else {
+        format!("{:.0}", d.abs())
+    };
+    Span::styled(format!(" {g}{v}%"), Style::new().fg(c))
+}
+
+/// `trend` right-aligned in `width` cells (blank when there is no base).
+pub fn trend_w(app: &App, cur: f64, prev: f64, width: usize) -> Span<'static> {
+    let t = trend(app, cur, prev);
+    let style = t.style;
+    Span::styled(fit_right(t.content.trim_start(), width), style)
+}
+
+fn section_head(app: &App, title: &str, note: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {title} "), app.theme.heading()),
+        Span::styled(
+            if note.is_empty() {
+                note
+            } else {
+                format!(" · {note}")
+            },
+            faint(app),
+        ),
+    ])
+}
+
+fn time_widths(cw: usize) -> (usize, usize) {
+    let name_w = 16.min(cw / 3);
+    (name_w, cw.saturating_sub(name_w + 26).clamp(4, 30))
+}
+
+fn time_header(app: &App, first: &str, cw: usize) -> Line<'static> {
+    let (name_w, bar_w) = time_widths(cw);
+    Line::from(Span::styled(
+        format!(
+            "{} {} {:>6} {:>7} {:>5}",
+            fit(first, name_w),
+            " ".repeat(bar_w),
+            "TIME",
+            "CALLS",
+            "ERR"
+        ),
+        faint(app),
+    ))
+}
+
+/// Rows of `name bar value…` for tool-like stats.
+fn time_rows(
+    app: &App,
+    rows: &[crate::index::insights::ToolStat],
+    n: usize,
+    cw: usize,
+) -> Vec<Line<'static>> {
+    let th = app.theme;
+    let max = rows.iter().map(|t| t.hours).fold(0.0, f64::max).max(1e-9);
+    let (name_w, bar_w) = time_widths(cw);
+    rows.iter()
+        .filter(|t| t.hours > 0.0 || t.calls > 0)
+        .take(n)
+        .map(|t| {
+            let err = if t.calls > 0 {
+                t.errors as f64 / t.calls as f64 * 100.0
+            } else {
+                0.0
+            };
+            let mut sp = vec![Span::styled(
+                format!("{} ", fit(&t.name, name_w)),
+                Style::new().fg(th.fg),
+            )];
+            sp.extend(gauge(t.hours / max, bar_w, th.accent, &th));
+            sp.push(Span::styled(
+                format!(" {:>6}", hrs(t.hours)),
+                th.bold(th.fg),
+            ));
+            sp.push(Span::styled(
+                format!(" {:>7}", fmt::count(t.calls)),
+                dim(app),
+            ));
+            sp.push(Span::styled(
+                format!(
+                    " {:>5}",
+                    if err >= 0.05 {
+                        fmt::pct(err)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Style::new().fg(if err >= 5.0 { th.bad } else { th.faint }),
+            ));
+            Line::from(sp)
+        })
+        .collect()
+}
+
+fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
+    let th = app.theme;
+    let Some(e) = &app.analytics.efficiency else {
+        return vec![vec![Line::from(Span::styled("counting…", faint(app)))]];
+    };
+    let mut out = Vec::new();
+
+    // Where agent time goes.
+    let tools: Vec<_> = e
+        .tools
+        .iter()
+        .filter(|t| !matches!(t.name.as_str(), "AskUserQuestion" | "ExitPlanMode"))
+        .cloned()
+        .collect();
+    let total_h: f64 = tools.iter().map(|t| t.hours).sum();
+    let mut s = vec![section_head(
+        app,
+        "WHERE AGENT TIME GOES",
+        format!("{} in tools", hrs(total_h)),
+    )];
+    s.push(time_header(app, "TOOL", cw));
+    s.extend(time_rows(app, &tools, 7, cw));
+    out.push(s);
+
+    let mut s = vec![section_head(
+        app,
+        "SLOWEST COMMANDS",
+        "Bash, by time".into(),
+    )];
+    s.push(time_header(app, "COMMAND", cw));
+    s.extend(time_rows(app, &e.commands, 7, cw));
+    out.push(s);
+
+    // Waiting on the user, and what a prompt buys.
+    let mut s = vec![section_head(app, "WAITING ON YOU", String::new())];
+    for (label, (n, h)) in [("questions", e.questions), ("plan approvals", e.plans)] {
+        if n == 0 {
+            continue;
+        }
+        s.push(Line::from(vec![
+            Span::styled(fit(label, 15), Style::new().fg(th.fg)),
+            Span::styled(format!("{:>5}", fmt::count(n)), th.bold(th.fg)),
+            Span::styled(format!(" · avg {:>4}", hrs(h / n as f64)), dim(app)),
+            Span::styled(
+                format!(" · {} blocked", hrs(h)),
+                Style::new().fg(if h >= 1.0 { th.warn } else { th.dim }),
+            ),
+        ]));
+    }
+    if e.prompts > 0 {
+        s.push(Line::from(vec![
+            Span::styled(fit("your prompts", 15), Style::new().fg(th.fg)),
+            Span::styled(format!("{:>5}", fmt::count(e.prompts)), th.bold(th.fg)),
+            Span::styled(
+                format!(" · {} each", fmt::usd(e.cost / e.prompts as f64)),
+                dim(app),
+            ),
+            Span::styled(
+                format!(
+                    " · {} agent time each",
+                    hrs(e.agent_hours / e.prompts as f64)
+                ),
+                dim(app),
+            ),
+        ]));
+    }
+    if s.len() == 1 {
+        s.push(Line::from(Span::styled(
+            "nothing waited for you",
+            faint(app),
+        )));
+    }
+    out.push(s);
+
+    // Cache and what the money buys.
+    let sp = e.split;
+    let tot = sp.total().max(1e-9);
+    let mut s = vec![section_head(
+        app,
+        "CACHE & TOKENS",
+        format!(
+            "hit {} · saved ≈{}",
+            fmt::pct(e.cache_hit * 100.0),
+            fmt::usd(e.cache_saved)
+        ),
+    )];
+    let parts = [
+        ("input", sp.input, th.sonnet),
+        ("cache write", sp.cache_write, th.warn),
+        ("cache read", sp.cache_read, th.haiku),
+        ("output", sp.output, th.fable),
+    ];
+    let bw = cw.saturating_sub(1).max(10);
+    let mut bar = Vec::new();
+    let mut used = 0usize;
+    for (k, (_, v, c)) in parts.iter().enumerate() {
+        let n = if k == parts.len() - 1 {
+            bw - used.min(bw)
+        } else {
+            ((v / tot) * bw as f64).round() as usize
+        };
+        let n = n.min(bw - used.min(bw));
+        used += n;
+        bar.push(Span::styled("█".repeat(n), Style::new().fg(*c)));
+    }
+    s.push(Line::from(bar));
+    for chunk in parts.chunks(2) {
+        let mut l = Vec::new();
+        for (name, v, c) in chunk {
+            l.push(Span::styled("■ ", Style::new().fg(*c)));
+            l.push(Span::styled(
+                fit(
+                    &format!("{name} {} {}", fmt::usd(*v), fmt::pct(v / tot * 100.0)),
+                    cw / 2 - 2,
+                ),
+                dim(app),
+            ));
+        }
+        s.push(Line::from(l));
+    }
+    out.push(s);
+
+    // Agent types.
+    let mut s = vec![section_head(
+        app,
+        "AGENT TYPES",
+        "cost · lifetime · unfinished".into(),
+    )];
+    let name_w = 16.min(cw / 3);
+    s.push(Line::from(Span::styled(
+        format!(
+            "{} {:>5} {:>9} {:>8} {:>7} {:>5}",
+            fit("TYPE", name_w),
+            "N",
+            "COST",
+            "AVG $",
+            "AVG T",
+            "UNF"
+        ),
+        faint(app),
+    )));
+    for t in e.types.iter().take(7) {
+        s.push(Line::from(vec![
+            Span::styled(format!("{} ", fit(&t.name, name_w)), Style::new().fg(th.fg)),
+            Span::styled(format!("{:>5}", fmt::count(t.agents)), dim(app)),
+            Span::styled(format!(" {:>9}", fmt::usd(t.cost)), th.bold(th.fg)),
+            Span::styled(
+                format!(" {:>8}", fmt::usd(t.cost / t.agents.max(1) as f64)),
+                dim(app),
+            ),
+            Span::styled(format!(" {:>7}", hrs(t.avg_minutes / 60.0)), dim(app)),
+            Span::styled(
+                format!(
+                    " {:>5}",
+                    if t.unfinished > 0 {
+                        t.unfinished.to_string()
+                    } else {
+                        String::new()
+                    }
+                ),
+                Style::new().fg(th.warn),
+            ),
+        ]));
+    }
+    out.push(s);
+
+    // The fleet and its troubles.
+    let peak = e.fleet.iter().copied().max().unwrap_or(0);
+    let peak_at = e.fleet.iter().rposition(|n| *n == peak).unwrap_or(0);
+    let peak_time = (Utc::now() - chrono::Duration::hours(24 - peak_at as i64))
+        .with_timezone(&Local)
+        .format("%H:00");
+    let mut s = vec![section_head(
+        app,
+        "FLEET · 24 h",
+        format!("peak {peak} agents at {peak_time}"),
+    )];
+    let vals: Vec<f64> = e.fleet.iter().map(|n| *n as f64).collect();
+    let reps = (cw.saturating_sub(2) / vals.len().max(1)).clamp(1, 3);
+    let wide: Vec<f64> = vals
+        .iter()
+        .flat_map(|v| std::iter::repeat_n(*v, reps))
+        .collect();
+    s.push(Line::from(spark(&wide, th.accent)));
+    s.push(Line::from(Span::styled(
+        fit(
+            &format!("{:<w$}now", "−24 h", w = (wide.len()).saturating_sub(3)),
+            cw,
+        ),
+        faint(app),
+    )));
+    let mut l = vec![
+        Span::styled(
+            format!("rate limits {}", e.rate_limits),
+            Style::new().fg(if e.rate_limits > 0 { th.bad } else { th.dim }),
+        ),
+        Span::styled(format!(" · API errors {}", e.other_errors), dim(app)),
+        Span::styled(format!(" · compactions {}", e.compactions), dim(app)),
+    ];
+    if e.rate_limits == 0 {
+        l[0] = Span::styled("rate limits 0", dim(app));
+    }
+    s.push(Line::from(l));
+    s.push(Line::from(vec![
+        Span::styled(
+            format!("files edited {}", fmt::count(e.files_edited)),
+            dim(app),
+        ),
+        Span::styled(format!(" ({} edits)", fmt::count(e.edits)), faint(app)),
+        Span::styled(
+            format!(
+                " · {} conflict{}",
+                e.conflicts.len(),
+                if e.conflicts.len() == 1 { "" } else { "s" }
+            ),
+            Style::new().fg(if e.conflicts.is_empty() {
+                th.dim
+            } else {
+                th.warn
+            }),
+        ),
+    ]));
+    for (file, n) in e.conflicts.iter().take(3) {
+        let name = if app.mask {
+            "•••".to_string()
+        } else {
+            file.rsplit('/')
+                .take(2)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("/")
+        };
+        s.push(Line::from(Span::styled(
+            format!(
+                "  ⚠ {} · {n} agents in one hour",
+                fit(&name, cw.saturating_sub(24))
+            ),
+            Style::new().fg(th.warn),
+        )));
+    }
+    out.push(s);
+
+    // What the subscription is worth, when its price is configured.
+    if !app.analytics.subscriptions.is_empty() {
+        let mut s = vec![section_head(
+            app,
+            "SUBSCRIPTION VALUE",
+            "API-equivalent per week".into(),
+        )];
+        for rep in &app.analytics.limits {
+            let Some(price) = app
+                .analytics
+                .subscriptions
+                .iter()
+                .find(|(k, _)| *k == rep.name || *k == rep.account_uuid)
+                .map(|x| x.1)
+            else {
+                continue;
+            };
+            let Some(win) = rep
+                .windows
+                .iter()
+                .find(|w| w.reading.kind == WindowKind::SevenDay)
+            else {
+                continue;
+            };
+            let week_price = price * 12.0 / 52.0;
+            s.push(Line::from(vec![
+                Span::styled(fit(&mask_name(app, &rep.name), 18), Style::new().fg(th.fg)),
+                Span::styled(
+                    format!(
+                        " {} vs {}/wk",
+                        fmt::usd(win.cost_in_window),
+                        fmt::usd(week_price)
+                    ),
+                    dim(app),
+                ),
+                Span::styled(
+                    format!("  ×{:.1}", win.cost_in_window / week_price.max(1e-9)),
+                    th.bold(th.good),
+                ),
+            ]));
+        }
+        if s.len() > 1 {
+            out.push(s);
+        }
+    }
+    out
+}
+
+pub fn efficiency(f: &mut Frame, app: &mut App, area: Rect) {
+    let period = app
+        .analytics
+        .period
+        .as_ref()
+        .map(|p| p.label())
+        .unwrap_or_default();
+    // Lay the sections out in columns, page by page.
+    let probe = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let ncols = ((probe.width as usize + 2) / 48).max(1);
+    let cw = (probe.width as usize / ncols).saturating_sub(2).max(20);
+    let height = probe.height as usize;
+    let sections = efficiency_sections(app, cw);
+    let mut pages: Vec<Vec<Vec<Line<'static>>>> = vec![vec![Vec::new()]];
+    for mut sec in sections {
+        sec.truncate(height);
+        let page = pages.last_mut().unwrap();
+        let col = page.last_mut().unwrap();
+        let need = sec.len() + usize::from(!col.is_empty());
+        if col.len() + need <= height {
+            if !col.is_empty() {
+                col.push(Line::from(""));
+            }
+            col.extend(sec);
+        } else if page.len() < ncols {
+            page.push(sec);
+        } else {
+            pages.push(vec![sec]);
+        }
+    }
+    let n = pages.len();
+    let page_i = app.cur(Panel::Efficiency).min(n - 1);
+    let suffix = if n > 1 {
+        format!("{period} · page {}/{n} · ↑↓", page_i + 1)
+    } else {
+        period
+    };
+    let inner = frame(f, app, Panel::Efficiency, area, &suffix, false);
+    let cols = hsplit(inner, &vec![1; ncols]);
+    for (rect, col) in cols.iter().zip(pages.swap_remove(page_i)) {
+        put(
+            f,
+            Rect {
+                x: rect.x + 1,
+                width: rect.width.saturating_sub(2),
+                ..*rect
+            },
+            col,
+        );
+    }
 }

@@ -78,6 +78,8 @@ pub struct Agent {
     pub context_tokens: u64,
     /// USD per minute over the last 15 minutes.
     pub spark: Vec<f64>,
+    /// What the agent did in each of the last 30 minutes (oldest first), see `Lane`.
+    pub lane: Vec<Lane>,
     pub tmux: Option<String>,
     pub pid: Option<u32>,
     pub account: Option<String>,
@@ -132,6 +134,8 @@ pub struct Snapshot {
     pub errors_last_hour: Vec<(String, u64)>,
     /// Agents that finished in the last hours, newest first.
     pub recent_done: Vec<DoneRow>,
+    /// Files edited by more than one agent in the last 30 minutes.
+    pub conflicts: Vec<(String, u32)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -456,6 +460,7 @@ pub fn build(
             requests: requests as u64,
             context_tokens: ctx_tokens.unwrap_or(0) as u64,
             spark: reuse_spark.unwrap_or(sp),
+            lane: Vec::new(),
             tmux: live_session.and_then(|l| l.tmux.clone()),
             pid: live_session.map(|l| l.pid),
             account,
@@ -486,6 +491,23 @@ pub fn build(
         }
     }
 
+    // Activity lanes: computed with the slow parts, carried over in between.
+    match prev {
+        Some(p) => {
+            for a in agents.iter_mut() {
+                if let Some(o) = p.agents.iter().find(|o| {
+                    o.seat == a.seat && o.session_id == a.session_id && o.agent_id == a.agent_id
+                }) {
+                    a.lane = o.lane.clone();
+                }
+            }
+        }
+        None => {
+            for a in agents.iter_mut() {
+                a.lane = lane(conn, a, now).unwrap_or_default();
+            }
+        }
+    }
     // Session totals for the main rows.
     if let Some(p) = prev {
         for a in agents.iter_mut().filter(|a| a.is_main()) {
@@ -567,7 +589,11 @@ pub fn build(
     // Recently finished agents (the history under the live tree).
     if let Some(p) = prev {
         snap.recent_done = p.recent_done.clone();
+        snap.conflicts = p.conflicts.clone();
     } else {
+        snap.conflicts = idx
+            .edit_conflicts(now - Duration::minutes(30))
+            .unwrap_or_default();
         let mut st = conn.prepare(
             "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
                     (SELECT SUM(MAX(cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
@@ -614,6 +640,123 @@ pub fn build(
         })?
         .collect::<Result<_, _>>()?;
     Ok(snap)
+}
+
+/// What happened before the dashboard started, so the event log is not empty on launch.
+#[derive(Debug, Clone)]
+pub struct PastEvent {
+    pub at: DateTime<Utc>,
+    pub kind: PastKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastKind {
+    Spawned,
+    Done,
+    ApiError,
+    Prompt,
+}
+
+/// Agents spawned and finished, API errors and the user's prompts since `since`, newest first.
+pub fn past_events(
+    idx: &Index,
+    since: DateTime<Utc>,
+    limit: usize,
+) -> anyhow::Result<Vec<PastEvent>> {
+    let conn = &idx.conn;
+    let since_ms = ms(since);
+    let mut out = Vec::new();
+    let mut st = conn.prepare(
+        "SELECT COALESCE(a.description, a.agent_type, a.agent_id), a.first_ts, a.last_ts, a.finished,
+                (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1),
+                (SELECT SUM(MAX(cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                a.effort
+         FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))",
+    )?;
+    let rows = st.query_map(params![since_ms], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, Option<i64>>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, i64>(3)? == 1,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<f64>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (name, first, last, finished, model, cost, effort) = row?;
+        let model = model
+            .as_deref()
+            .map(crate::core::models::short_name)
+            .unwrap_or_default();
+        if let Some(f) = first.filter(|f| *f >= since_ms) {
+            let effort = effort.map(|e| format!("/{e}")).unwrap_or_default();
+            out.push(PastEvent {
+                at: from_ms(f),
+                kind: PastKind::Spawned,
+                text: format!("{name} spawned · {model}{effort}"),
+            });
+        }
+        if let (true, Some(l)) = (finished, last.filter(|l| *l >= since_ms)) {
+            let took = first
+                .map(|f| crate::ui::fmt::duration(from_ms(l) - from_ms(f)))
+                .unwrap_or_default();
+            out.push(PastEvent {
+                at: from_ms(l),
+                kind: PastKind::Done,
+                text: format!(
+                    "{name} done · {took} · {}",
+                    crate::ui::fmt::money(cost.unwrap_or(0.0))
+                ),
+            });
+        }
+    }
+    let mut st = conn.prepare("SELECT ts, kind, text FROM api_errors WHERE ts >= ?1")?;
+    for row in st.query_map(params![since_ms], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, Option<String>>(2)?,
+        ))
+    })? {
+        let (ts, kind, text) = row?;
+        let text = text
+            .map(|t| format!(" · {}", t.lines().next().unwrap_or("")))
+            .unwrap_or_default();
+        out.push(PastEvent {
+            at: from_ms(ts),
+            kind: PastKind::ApiError,
+            text: format!("API error: {kind}{text}"),
+        });
+    }
+    let mut st = conn.prepare(
+        "SELECT p.ts, p.chars, COALESCE(s.title, s.ai_title, '') FROM prompts p
+         LEFT JOIN sessions s ON s.seat = p.seat AND s.session_id = p.session_id WHERE p.ts >= ?1",
+    )?;
+    for row in st.query_map(params![since_ms], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, String>(2)?,
+        ))
+    })? {
+        let (ts, chars, title) = row?;
+        let to = if title.is_empty() {
+            String::new()
+        } else {
+            format!(" → {title}")
+        };
+        out.push(PastEvent {
+            at: from_ms(ts),
+            kind: PastKind::Prompt,
+            text: format!("you{to} · {chars} chars"),
+        });
+    }
+    out.sort_by(|a, b| b.at.cmp(&a.at));
+    out.truncate(limit);
+    Ok(out)
 }
 
 /// A stable tree: running sessions before exited ones, each in the order it started, followed by
@@ -697,6 +840,92 @@ pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
 }
 
 /// The latest tool calls of one agent, newest first.
+/// What an agent did during one minute, most telling first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize)]
+pub enum Lane {
+    #[default]
+    Quiet,
+    Thinking,
+    Tool,
+    /// Waiting for subagents (the `Agent` tool).
+    Agents,
+    /// Waiting for the user (a question or a plan).
+    You,
+}
+
+pub const LANE_MINUTES: i64 = 30;
+
+fn lane(conn: &rusqlite::Connection, a: &Agent, now: DateTime<Utc>) -> anyhow::Result<Vec<Lane>> {
+    let start = now - Duration::minutes(LANE_MINUTES);
+    let mut out = vec![Lane::Quiet; LANE_MINUTES as usize];
+    let slot = |t: i64| ((t - ms(start)) / 60_000).clamp(0, LANE_MINUTES - 1) as usize;
+    let mut st = conn.prepare_cached(
+        "SELECT ts FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4",
+    )?;
+    for t in st.query_map(params![a.seat, a.session_id, a.agent_id, ms(start)], |r| {
+        r.get::<_, i64>(0)
+    })? {
+        let i = slot(t?);
+        out[i] = out[i].max(Lane::Thinking);
+    }
+    let mut st = conn.prepare_cached(
+        "SELECT ts, COALESCE(done_ts, ?5), name FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3
+         AND COALESCE(done_ts, ?5) >= ?4",
+    )?;
+    let rows = st.query_map(
+        params![a.seat, a.session_id, a.agent_id, ms(start), ms(now)],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        },
+    )?;
+    for row in rows {
+        let (t0, t1, name) = row?;
+        let kind = match name.as_str() {
+            "AskUserQuestion" | "ExitPlanMode" => Lane::You,
+            "Agent" | "Task" => Lane::Agents,
+            _ => Lane::Tool,
+        };
+        for v in &mut out[slot(t0)..=slot(t1.max(t0))] {
+            *v = (*v).max(kind);
+        }
+    }
+    if matches!(a.state, State::NeedsYou(_)) {
+        out[LANE_MINUTES as usize - 1] = Lane::You;
+    }
+    Ok(out)
+}
+
+/// One request of an agent: when, what it cost, how big the context was.
+#[derive(Debug, Clone, Copy)]
+pub struct LifePoint {
+    pub ts: DateTime<Utc>,
+    pub cost: f64,
+    pub context: u64,
+}
+
+/// The agent's requests, oldest first (the last 2000).
+pub fn life(idx: &Index, a: &Agent) -> anyhow::Result<Vec<LifePoint>> {
+    let mut st = idx.conn.prepare_cached(
+        "SELECT ts, MAX(cost, 0), input + cw5 + cw1h + cread FROM requests
+         WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 2000",
+    )?;
+    let mut v: Vec<LifePoint> = st
+        .query_map(params![a.seat, a.session_id, a.agent_id], |r| {
+            Ok(LifePoint {
+                ts: from_ms(r.get(0)?),
+                cost: r.get(1)?,
+                context: r.get::<_, i64>(2)?.max(0) as u64,
+            })
+        })?
+        .collect::<Result<_, _>>()?;
+    v.reverse();
+    Ok(v)
+}
+
 pub fn tool_timeline(idx: &Index, a: &Agent, limit: usize) -> anyhow::Result<Vec<ToolLine>> {
     let mut st = idx.conn.prepare(
         "SELECT ts, name, summary, done_ts, is_error FROM tool_calls WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT ?4",
@@ -748,6 +977,7 @@ mod tests {
             cpu: 0.0,
             memory: 0,
             last_request_ts: None,
+            lane: Vec::new(),
         }
     }
 

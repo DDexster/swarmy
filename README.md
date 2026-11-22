@@ -32,7 +32,18 @@ On a big terminal everything is on one wall; nothing hides behind tabs.
 | ![column](docs/img/column.png) **Half a screen (160×81)** — mana and attention on top, the swarm, the selected agent, projects and events stacked | ![tabs](docs/img/tabs.png) **A laptop terminal (140×34)** — the same panels grouped into five tabs |
 | ![vault](docs/img/vault-picker.png) **Switching a login** — Enter on a seat lists the saved logins, the one with the most limit left first | |
 
-The panels: **1 SWARM** (live agent tree, then what finished recently) · **2 MANA · SEATS** (limits per account, seats and the login vault) · **3 BURN** · **4 ATTENTION** (needs you, stalled, limits about to run out, unsaved or expiring logins) · **5 AGENT** (card, last message, tool timeline) · **6 PROJECTS** · **7 MODELS** · **8 HISTORY** · **9 EVENTS** · **0 SYSTEM**.
+The panels:
+
+- **1 SWARM** — live agents grouped by session (sessions are separated, project names stand out), each with a 30-minute activity lane (thinking · tool · waiting for agents · waiting for you; `v` switches to spend), then what finished recently
+- **2 MANA · SEATS** — limits per account, seats and the login vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
+- **3 BURN** — dollars per hour and per minute by model
+- **4 ATTENTION** — needs you, stalled, limits about to run out, two agents editing one file, unsaved or expiring logins; the event log under it (filled from the last 3 hours on launch)
+- **5 AGENT** — card, last message, the agent's life (cost of each request, context growth, compactions), tool timeline
+- **6 PROJECTS** — live agents, $/hour, today, the period with ▲▼ against the previous one, share of the week
+- **7 MODELS** — spend, trends, cache, thinking, effort, project × model
+- **8 HISTORY** — 14 days stacked by model (`←→` picks a day), weekday × hour heat map
+- **9 EFFICIENCY** — where agent time goes (tools, slowest commands), how long agents waited for you, what a prompt costs, cache savings and the token cost split, agent types, fleet size over 24 h, rate limits, compactions, file conflicts, subscription value (with `[subscription]` in the config)
+- **0 SYSTEM** — Claude Code processes, CPU, RAM, disk
 
 Try it without touching your own data:
 
@@ -86,6 +97,8 @@ below that (`L` cycles them).
 | `/` | filter: words, `p:project`, `m:model`, `s:seat`, `state:needs` |
 | `:` | `switch <seat> <login>`, `capture <seat> [label]`, `period 7d`, `layout wall` |
 | `J` | jump to the selected agent's Claude Code in tmux |
+| `v` | SWARM: activity lanes of 30 min ↔ spend of 15 min |
+| `←→` in HISTORY | pick a day: its spend by model and the change against the day before |
 | `t` · `g` | period (today, 7d, 30d, all) · spend grouping |
 | MANA: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
 | `m` · `p` · `T` · `?` · `q` | mask · pause animations · theme · help · quit |
@@ -93,9 +106,10 @@ below that (`L` cycles them).
 ### Light on the battery
 
 Only the running sessions' transcripts are read every second, and only the files that changed;
-totals of idle agents are reused; period aggregates refresh every two minutes, limits every
-minute; the process table and disks are read only while SYSTEM is open. On a 4K wall with 20+ live
-agents it uses about 1.8 CPU-seconds per minute (≈3% of one core). On battery (Linux, macOS) or
+totals of idle agents are reused; activity lanes and session totals every 10 seconds; period
+aggregates every two minutes, limits every minute, efficiency figures every five, the previous
+period every ten; the process table and disks are read only while SYSTEM is open. On a 4K wall
+with 15–20 live agents it uses about 2 CPU-seconds per minute (≈3.4% of one core). On battery (Linux, macOS) or
 with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
 
 ## How the numbers are made

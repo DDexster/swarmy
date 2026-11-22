@@ -51,7 +51,19 @@ pub struct Analytics {
     pub by_model: Vec<Row>,
     pub total: Option<Row>,
     pub days: Vec<Row>,
+    /// Day × model spend for the daily bars (14 days).
+    pub days_model: Vec<(String, String, f64)>,
     pub heat: Vec<(String, String, f64)>,
+    /// Where time and money go (the EFFICIENCY panel).
+    pub efficiency: Option<crate::index::insights::Efficiency>,
+    /// Spend of the period before this one, for ▲▼ trends (none for "all").
+    pub prev_total: Option<f64>,
+    pub prev_models: Vec<(String, f64)>,
+    /// When the slow parts were computed (efficiency, the previous period).
+    pub efficiency_at: Option<Instant>,
+    pub prev_at: Option<Instant>,
+    /// Monthly subscription prices from the config, by account label or uuid.
+    pub subscriptions: Vec<(String, f64)>,
     pub effort: Vec<(String, String, f64)>,
     pub substitutions: Vec<(String, String, u64)>,
     pub project_model: Vec<(String, String, f64)>,
@@ -72,6 +84,8 @@ pub struct ProjectRow {
     pub today: f64,
     pub period: f64,
     pub requests: u64,
+    /// Spend in the previous period of the same length.
+    pub prev: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +117,9 @@ pub enum Msg {
     Snapshot(Box<Snapshot>, Vec<LiveSession>, Box<SystemView>),
     Analytics(Box<Analytics>),
     /// Tool calls and the last thing the agent said.
-    Timeline(String, Vec<ToolLine>, Option<String>),
+    Timeline(String, Vec<ToolLine>, Option<String>, Vec<live::LifePoint>),
+    /// What happened before launch, sent once.
+    Past(Vec<live::PastEvent>),
     Error(String),
 }
 
@@ -391,11 +407,18 @@ fn worker(
     let mut last_power = Instant::now();
     let mut last_full_analytics: Option<Instant> = None;
     let mut last_heavy: Option<Instant> = None;
+    let mut past_sent = false;
     let mut last_limits: Option<Instant> = None;
     let mut prev_snap: Option<live::Snapshot> = None;
     let mut prev_analytics: Option<Analytics> = None;
     let mut last_procs = Instant::now() - Duration::from_secs(60);
-    let mut slow: Option<(Instant, Vec<Row>, Vec<(String, String, f64)>)> = None;
+    #[allow(clippy::type_complexity)]
+    let mut slow: Option<(
+        Instant,
+        Vec<Row>,
+        Vec<(String, String, f64)>,
+        Vec<(String, String, f64)>,
+    )> = None;
     loop {
         tick += 1;
         let tick_start = Instant::now();
@@ -494,6 +517,14 @@ fn worker(
                 } else {
                     SystemView::default()
                 };
+                if !past_sent {
+                    past_sent = true;
+                    if let Ok(p) =
+                        live::past_events(&idx, ctx.now - chrono::Duration::hours(3), 200)
+                    {
+                        let _ = send(Msg::Past(p));
+                    }
+                }
                 if !send(Msg::Snapshot(
                     Box::new(snap),
                     live_sessions.clone(),
@@ -511,7 +542,12 @@ fn worker(
         let tt = Instant::now();
         if let Some(a) = &w.agent
             && let Ok(t) = live::tool_timeline(&idx, a, 200)
-            && !send(Msg::Timeline(a.key(), t, live::last_message(&idx, a)))
+            && !send(Msg::Timeline(
+                a.key(),
+                t,
+                live::last_message(&idx, a),
+                live::life(&idx, a).unwrap_or_default(),
+            ))
         {
             return;
         }
@@ -551,11 +587,12 @@ fn worker(
                     start: ctx.now - chrono::Duration::days(28),
                     end: ctx.now + chrono::Duration::seconds(1),
                 };
-                if let (Ok(d), Ok(h)) = (
+                if let (Ok(d), Ok(h), Ok(dm)) = (
                     idx.spend_by(Dim::Day, days_span, &f),
                     idx.matrix(Dim::Weekday, Dim::Hour, heat_span, &f),
+                    idx.days_by_model(days_span),
                 ) {
-                    slow = Some((Instant::now(), d, h));
+                    slow = Some((Instant::now(), d, h, dm));
                 }
             }
             // Period aggregates change slowly: recompute them every minute or when asked.
@@ -570,13 +607,15 @@ fn worker(
                 &idx,
                 &w,
                 &disk_cache,
-                slow.as_ref().map(|(_, d, h)| (d.clone(), h.clone())),
+                slow.as_ref()
+                    .map(|(_, d, h, dm)| (d.clone(), h.clone(), dm.clone())),
                 reuse,
                 if limits_due {
                     None
                 } else {
                     prev_analytics.as_ref().map(|p| &p.limits)
                 },
+                prev_analytics.as_ref(),
             );
             if limits_due && res.is_ok() {
                 last_limits = Some(Instant::now());
@@ -644,16 +683,28 @@ fn analytics(
     idx: &Index,
     w: &Wants,
     disk: &[(String, u64)],
-    slow: Option<(Vec<Row>, Vec<(String, String, f64)>)>,
+    slow: Option<(
+        Vec<Row>,
+        Vec<(String, String, f64)>,
+        Vec<(String, String, f64)>,
+    )>,
     prev: Option<&Analytics>,
     prev_limits: Option<&Vec<limits::AccountReport>>,
+    // The last analytics whatever the cadence: slow parts are reused from it while fresh.
+    last: Option<&Analytics>,
 ) -> anyhow::Result<Analytics> {
-    let (days_cached, heat_cached) = slow.unwrap_or_default();
+    let t_start = Instant::now();
+    let (days_cached, heat_cached, days_model) = slow.unwrap_or_default();
     let period = w.period.clone().unwrap_or(Period::Days(7));
     let span = period.span(ctx.now, ctx.limit_week(None));
     let f = Filter::default();
     let group = w.group.unwrap_or(Dim::Project);
     let reuse = prev.filter(|p| p.period.as_ref() == Some(&period) && p.group == Some(group));
+    let same = last.filter(|p| p.period.as_ref() == Some(&period));
+    let eff_reuse = same.filter(|p| {
+        p.efficiency.is_some() && p.efficiency_at.is_some_and(|t| t.elapsed().as_secs() < 300)
+    });
+    let prev_reuse = same.filter(|p| p.prev_at.is_some_and(|t| t.elapsed().as_secs() < 600));
     let mut groups = match reuse {
         Some(p) => p.groups.clone(),
         None => idx.spend_by(group, span, &f)?,
@@ -709,6 +760,11 @@ fn analytics(
         .map(|t| t.with_timezone(&Utc))
         .unwrap_or(ctx.now);
     let end = ctx.now + chrono::Duration::seconds(1);
+    // The period before, of the same length, for trends.
+    let prev_span = (!matches!(period, Period::All)).then(|| Span {
+        start: span.start - (span.end - span.start),
+        end: span.start,
+    });
     let mut projects: Vec<ProjectRow> = match reuse {
         Some(prev) => prev
             .projects
@@ -718,6 +774,7 @@ fn analytics(
                 name: p.name.clone(),
                 period: p.period,
                 requests: p.requests,
+                prev: p.prev,
                 ..Default::default()
             })
             .collect(),
@@ -745,6 +802,29 @@ fn analytics(
                 p.period = r.cost;
                 p.requests = r.requests;
             });
+            match (prev_reuse, prev_span) {
+                (Some(l), _) => {
+                    let rows: Vec<Row> = l
+                        .projects
+                        .iter()
+                        .filter(|p| p.prev > 0.0)
+                        .map(|p| Row {
+                            key: p.key.clone(),
+                            label: p.name.clone(),
+                            requests: 0,
+                            usage: Default::default(),
+                            cost: p.prev,
+                            unpriced: 0,
+                        })
+                        .collect();
+                    upsert(rows, &|p, r| p.prev = r.cost);
+                }
+                (None, Some(ps)) => upsert(
+                    timed!("prev_projects", idx.spend_by(Dim::Project, ps, &f)?),
+                    &|p, r| p.prev = r.cost,
+                ),
+                (None, None) => {}
+            }
         }
         upsert(
             idx.spend_by(
@@ -769,6 +849,11 @@ fn analytics(
             &|p, r| p.hour = r.cost,
         );
     }
+    if dbg {
+        eprintln!("  projects+vault {:?}", t_start.elapsed());
+    }
+    // Projects seen only in the previous period stay out of the list.
+    projects.retain(|p| p.period > 0.0 || p.today > 0.0 || p.hour > 0.0);
     projects.sort_by(|a, b| {
         b.hour
             .total_cmp(&a.hour)
@@ -790,7 +875,43 @@ fn analytics(
             None => timed!("total", Some(idx.total(span, &f)?)),
         },
         days: days_cached,
+        days_model,
         heat: heat_cached,
+        efficiency: match eff_reuse {
+            Some(p) => p.efficiency.clone(),
+            None => timed!("efficiency", idx.efficiency(span, &ctx.prices).ok()),
+        },
+        efficiency_at: match eff_reuse {
+            Some(p) => p.efficiency_at,
+            None => Some(Instant::now()),
+        },
+        prev_at: match prev_reuse.or(reuse) {
+            Some(p) => p.prev_at,
+            None => Some(Instant::now()),
+        },
+        prev_total: match prev_reuse.or(reuse) {
+            Some(p) => p.prev_total,
+            None => match prev_span {
+                Some(ps) => Some(timed!("prev_total", idx.total(ps, &f)?.cost)),
+                None => None,
+            },
+        },
+        subscriptions: ctx
+            .config
+            .subscription
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect(),
+        prev_models: match prev_reuse.or(reuse) {
+            Some(p) => p.prev_models.clone(),
+            None => match prev_span {
+                Some(ps) => timed!("prev_models", idx.spend_by(Dim::Model, ps, &f)?)
+                    .into_iter()
+                    .map(|r| (r.key, r.cost))
+                    .collect(),
+                None => Vec::new(),
+            },
+        },
         effort: match reuse {
             Some(p) => p.effort.clone(),
             None => timed!("effort", idx.matrix(Dim::Model, Dim::Effort, span, &f)?),

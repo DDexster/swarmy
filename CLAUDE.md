@@ -16,8 +16,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
   GIFs come only from `agentmana demo`. Check the staged diff before every commit.
 - **Never test the vault on real config dirs.** Use temp dirs (see `src/vault/tests.rs`) or a fake
   `HOME`.
-- **Battery budget.** The dashboard must stay around 2 CPU-seconds per minute (≈3% of one core) on
-  a 4K wall with 20+ live agents.
+- **Battery budget.** The dashboard must stay around 2 CPU-seconds per minute (≈3.4% of one core)
+  on a 4K wall with 15–20 live agents.
   Measure CPU time of the process, not wall time (other agents load the machine):
   ```sh
   P=$(pgrep -x agentmana); T0=$(awk '{print $14+$15}' /proc/$P/stat); sleep 30
@@ -27,7 +27,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `/proc/<pid>/task/*/stat`. `AGENTMANA_DEBUG=1 agentmana 2>log` prints per-tick and per-frame
   timings. Per-second work may only touch running sessions (`Index::refresh_hot` with cached dir
   listings, `ProcTable::for_pids`, per-agent totals reused when no new request arrived); period
-  aggregates (2 min), limits (1 min), history charts (5 min), the full process table and disks
+  aggregates (2 min), limits (1 min), efficiency (5 min), the previous period (10 min), lanes and
+  session totals (10 s), history charts (5 min), the full process table and disks
   (SYSTEM open) run rarely or on demand. `.claude.json` is rewritten by Claude Code every few
   seconds — never trigger heavy work on its mtime.
 - Prices are versioned data (`src/core/pricing.rs`, overridable by Claude Code's cache and
@@ -39,7 +40,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 |---|---|
 | `src/core/` | pure domain: usage, pricing, periods, limits math (no I/O) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
-| `src/index/` | SQLite index (incremental by inode/offset), schema, queries |
+| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts) |
 | `src/live/` | live agent states for the dashboard |
 | `src/vault/` | login vault and switching |
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices, shell-alias |
@@ -59,6 +60,10 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - `.claude.json`: `cachedUsageUtilization` (limits, no network needed), `additionalModelCostsCache`
   (prices), `oauthAccount`. For `~/.claude` it lives at `~/.claude.json`, otherwise inside the dir.
 - Unknown record types are counted; `agentmana doctor` reports them (format drift).
+- Projects: a cwd resolves to its git root; removed worktrees under `<repo>-wt/` fold into
+  `<repo>`; a dir outside any repo (gone, or a scratch dir) takes the project of the session it ran
+  in, or the session's own dir when it lies under it (never a home dir). Changing these rules means
+  bumping `PROJECTS_REV` in `src/index/mod.rs`, which recomputes the table once.
 
 ## Commands
 
@@ -90,6 +95,8 @@ Style rules the owner asked for:
 - Panel titles and in-panel section headings sit on a plate (`Theme::heading()`, the
   `title`/`title_bg` colours of each theme); the focused panel's plate is the accent colour. New
   headings use `heading()`, not bold text in a data colour.
+- Sessions in SWARM are separated by a rule; project and directory names use the theme's `dir`
+  colour everywhere (session rows, agent card, recently done).
 - Big block digits (`bigdigits.rs`) show the number only, with a blank column on each side of
   the decimal point; the unit goes in the caption under them (`$ per hour`), because a block `$`
   reads as another digit.

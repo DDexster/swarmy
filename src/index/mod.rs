@@ -4,6 +4,7 @@
 //! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
 //! start. The first run reads everything in parallel.
 
+pub mod insights;
 pub mod query;
 pub mod schema;
 
@@ -23,6 +24,9 @@ use crate::claude::seats::Seat;
 use crate::claude::transcript::{self, Event, TitleKind};
 use crate::core::pricing::PriceBook;
 use crate::core::usage::Usage;
+
+/// Revision of the cwd → project rules; a change recomputes the `projects` table.
+const PROJECTS_REV: &str = "4";
 
 pub struct Index {
     pub conn: Connection,
@@ -405,7 +409,16 @@ impl Index {
                 }
             }
         }
-        if !changed {
+        let rev_ok = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'projects_rev'",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+            .as_deref()
+            == Some(PROJECTS_REV);
+        if !changed && rev_ok {
             tx.commit()?;
             return Ok(());
         }
@@ -424,19 +437,92 @@ impl Index {
                 tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.label])?;
             }
         }
-        // Projects of new working directories.
-        let mut known_cwd = tx.prepare("SELECT 1 FROM projects WHERE cwd = ?1")?;
-        let cwds: Vec<&String> = new_cwds
-            .iter()
-            .filter(|c| !known_cwd.exists([c.as_str()]).unwrap_or(false))
-            .collect();
-        drop(known_cwd);
-        for cwd in cwds {
-            let p = resolver.resolve(&cwd);
+        // Projects of new working directories. Rule revision 2 (sibling worktrees, orphans taking
+        // the session's project) recomputes every cwd once.
+        let cwds: Vec<String> = if rev_ok {
+            let mut known_cwd = tx.prepare("SELECT 1 FROM projects WHERE cwd = ?1")?;
+            new_cwds
+                .iter()
+                .filter(|c| !known_cwd.exists([c.as_str()]).unwrap_or(false))
+                .cloned()
+                .collect()
+        } else {
+            tx.execute("DELETE FROM projects", [])?;
+            let mut st = tx.prepare("SELECT DISTINCT cwd FROM requests WHERE cwd IS NOT NULL")?;
+            let v = st
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            v
+        };
+        let mut orphans: Vec<String> = Vec::new();
+        for cwd in &cwds {
+            let p = resolver.resolve(cwd);
+            if p.orphan {
+                orphans.push(cwd.clone());
+            }
             tx.execute(
                 "INSERT OR REPLACE INTO projects(cwd, key, name, worktree) VALUES (?1, ?2, ?3, ?4)",
                 params![cwd, p.key, p.name, p.worktree],
             )?;
+        }
+        if !orphans.is_empty() {
+            // A dir outside any repository (a removed worktree, a scratch dir) used by a session
+            // that runs in a repository belongs to that repository's project.
+            let set: std::collections::HashSet<&str> = orphans.iter().map(String::as_str).collect();
+            let mut votes: HashMap<String, HashMap<String, i64>> = HashMap::new();
+            {
+                let mut st = tx.prepare(
+                    "SELECT r.cwd, s.cwd, count(*) FROM requests r JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id
+                     WHERE s.cwd IS NOT NULL AND s.cwd != r.cwd GROUP BY r.cwd, s.cwd",
+                )?;
+                let rows = st.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (cwd, main, n) = row?;
+                    if set.contains(cwd.as_str()) {
+                        *votes.entry(cwd).or_default().entry(main).or_default() += n;
+                    }
+                }
+            }
+            // Never fold into a home dir or anything as shallow (`/home/x/work` is the least).
+            let under = |dir: &str, root: &str| {
+                root.matches(['/', '\\']).count() >= 4
+                    && dir.starts_with(root)
+                    && dir[root.len()..].starts_with(['/', '\\'])
+            };
+            let mut done: std::collections::HashSet<String> = Default::default();
+            for (cwd, mains) in votes {
+                // A repository the session runs in; else the session's own dir when this one lies
+                // under it (subdirs and `.claude/worktrees/*` of a dir that is gone now).
+                let best = mains
+                    .iter()
+                    .map(|(m, n)| (resolver.resolve(m), *n))
+                    .filter(|(p, _)| !p.orphan)
+                    .max_by_key(|(_, n)| *n)
+                    .map(|x| x.0)
+                    .or_else(|| {
+                        mains
+                            .keys()
+                            .filter(|m| under(&cwd, m))
+                            .max_by_key(|m| m.len())
+                            .map(|m| resolver.resolve(m))
+                    });
+                if let Some(p) = best {
+                    tx.execute(
+                        "UPDATE projects SET key = ?2, name = ?3, worktree = ?1 WHERE cwd = ?1",
+                        params![cwd, p.key, p.name],
+                    )?;
+                    done.insert(cwd);
+                }
+            }
+        }
+        if !rev_ok {
+            tx.execute("INSERT INTO meta(key, value) VALUES ('projects_rev', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [PROJECTS_REV])?;
         }
         for (t, n) in types {
             tx.execute("INSERT INTO record_types(type, count) VALUES (?1, ?2) ON CONFLICT(type) DO UPDATE SET count = count + excluded.count", params![t, *n as i64])?;

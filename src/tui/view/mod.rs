@@ -77,7 +77,7 @@ fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
         Panel::Projects => panels::projects(f, app, area),
         Panel::Models => panels::models(f, app, area),
         Panel::History => panels::history(f, app, area),
-        Panel::Events => panels::events(f, app, area),
+        Panel::Efficiency => panels::efficiency(f, app, area),
         Panel::System => panels::system(f, app, area),
     }
 }
@@ -89,7 +89,12 @@ fn mana_height(app: &App) -> u16 {
 
 /// Everything at once (from about 250×55).
 fn wall(f: &mut Frame, app: &mut App, body: Rect) {
-    let band_a = mana_height(app).clamp(10, 16);
+    // Mana rows plus room for the limit curve under them on tall walls.
+    let band_a = if body.height >= 70 {
+        (mana_height(app) + 9).clamp(14, 21)
+    } else {
+        mana_height(app).clamp(10, 16)
+    };
     let band_c = if body.height >= 75 {
         24
     } else if body.height >= 62 {
@@ -99,18 +104,18 @@ fn wall(f: &mut Frame, app: &mut App, body: Rect) {
     };
     let band_b = body.height.saturating_sub(band_a + band_c);
     let rows = vsplit_fixed(body, &[band_a, band_b, band_c]);
-    let a = hsplit(rows[0], &[42, 30, 28]);
+    let a = hsplit(rows[0], &[46, 26, 28]);
     draw_panel(f, app, Panel::Mana, a[0], false);
     draw_panel(f, app, Panel::Attention, a[1], false);
     draw_panel(f, app, Panel::Burn, a[2], false);
     let b = hsplit(rows[1], &[64, 36]);
     draw_panel(f, app, Panel::Swarm, b[0], false);
     draw_panel(f, app, Panel::Agent, b[1], false);
-    let c = hsplit(rows[2], &[30, 26, 20, 24]);
+    let c = hsplit(rows[2], &[27, 24, 21, 28]);
     draw_panel(f, app, Panel::Projects, c[0], false);
     draw_panel(f, app, Panel::Models, c[1], false);
     draw_panel(f, app, Panel::History, c[2], false);
-    draw_panel(f, app, Panel::Events, c[3], false);
+    draw_panel(f, app, Panel::Efficiency, c[3], false);
 }
 
 /// A narrower stack (from about 150×48).
@@ -128,7 +133,7 @@ fn column(f: &mut Frame, app: &mut App, body: Rect) {
     draw_panel(f, app, Panel::Agent, rows[2], false);
     let c = hsplit(rows[3], &[55, 45]);
     draw_panel(f, app, Panel::Projects, c[0], false);
-    draw_panel(f, app, Panel::Events, c[1], false);
+    draw_panel(f, app, Panel::Efficiency, c[1], false);
 }
 
 /// Small terminals: one tab at a time.
@@ -143,9 +148,7 @@ fn tabs(f: &mut Frame, app: &mut App, body: Rect) {
             draw_panel(f, app, Panel::Mana, rows[0], false);
             draw_panel(f, app, Panel::Swarm, rows[1], false);
             if strip > 0 {
-                let c = hsplit(rows[2], &[50, 50]);
-                draw_panel(f, app, Panel::Attention, c[0], false);
-                draw_panel(f, app, Panel::Events, c[1], false);
+                draw_panel(f, app, Panel::Attention, rows[2], false);
             }
         }
         Tab::Agent => {
@@ -156,7 +159,9 @@ fn tabs(f: &mut Frame, app: &mut App, body: Rect) {
         Tab::Mana => draw_panel(f, app, Panel::Mana, body, true),
         Tab::Spend => {
             let c = hsplit(body, &[52, 48]);
-            draw_panel(f, app, Panel::Projects, c[0], false);
+            let l = vsplit_fixed(c[0], &[c[0].height / 2, c[0].height - c[0].height / 2]);
+            draw_panel(f, app, Panel::Projects, l[0], false);
+            draw_panel(f, app, Panel::Efficiency, l[1], false);
             let r = vsplit_fixed(c[1], &[c[1].height / 2, c[1].height - c[1].height / 2]);
             draw_panel(f, app, Panel::History, r[0], false);
             draw_panel(f, app, Panel::Models, r[1], false);
@@ -183,18 +188,21 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(if fresh { th.good } else { th.dim }),
         ),
         Span::styled("today ", Style::new().fg(th.faint)),
-        Span::styled(fmt::money(s.today_cost), th.bold(th.fg)),
+        Span::styled(fmt::usd(s.today_cost), th.bold(th.fg)),
     ];
     if let (Some(t), Some(p)) = (&app.analytics.total, &app.analytics.period) {
         spans.push(Span::styled(
             format!("  {} ", p.label()),
             Style::new().fg(th.faint),
         ));
-        spans.push(Span::styled(fmt::money(t.cost), th.bold(th.fg)));
+        spans.push(Span::styled(fmt::usd(t.cost), th.bold(th.fg)));
+        if let Some(prev) = app.analytics.prev_total {
+            spans.push(panels::trend(app, t.cost, prev));
+        }
     }
     spans.push(Span::styled("  burn ", Style::new().fg(th.faint)));
     spans.push(Span::styled(
-        format!("{}/h ", fmt::money(s.burn_per_hour)),
+        format!("{}/h ", fmt::usd(s.burn_per_hour)),
         th.bold(th.accent),
     ));
     if area.width >= 170 {
@@ -276,8 +284,8 @@ fn panel_keys(p: Panel) -> &'static str {
         Panel::Attention => "↑↓ · Enter go there · n/N next",
         Panel::Projects => "↑↓ · Enter its agents · t period · g group",
         Panel::Models | Panel::Burn => "t period",
-        Panel::History => "",
-        Panel::Events => "↑↓ scroll",
+        Panel::Efficiency => "↑↓ page (when it does not fit)",
+        Panel::History => "←→ pick a day",
         Panel::System => "",
     }
 }
@@ -540,6 +548,10 @@ fn help(f: &mut Frame, app: &App, area: Rect) {
         ),
         ("t · g", "period (today · 7d · 30d · all) · spend grouping"),
         ("J", "jump to the selected agent's Claude Code in tmux"),
+        (
+            "v",
+            "SWARM column: activity lanes of 30 min · spend of 15 min",
+        ),
         ("L", "layout: auto · wall · column · tabs"),
         ("m · p · T", "mask names · pause animations · theme"),
         (

@@ -32,6 +32,20 @@ pub fn money(x: f64) -> String {
     format!("{}${body}", if neg { "-" } else { "" })
 }
 
+/// Money for the dashboard: cents only below $1,000 (`$8,675`, `$12.40`).
+pub fn usd(x: f64) -> String {
+    if x.is_finite() && x.abs() >= 1000.0 {
+        let neg = x < 0.0;
+        format!(
+            "{}${}",
+            if neg { "-" } else { "" },
+            group(x.abs().round() as u64)
+        )
+    } else {
+        money(x)
+    }
+}
+
 /// `950`, `12.3k`, `4.56M`, `1.20B`.
 pub fn tokens(n: u64) -> String {
     let f = n as f64;

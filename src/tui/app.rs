@@ -39,7 +39,7 @@ pub enum Panel {
     Projects,
     Models,
     History,
-    Events,
+    Efficiency,
     System,
 }
 
@@ -53,7 +53,7 @@ impl Panel {
         Panel::Projects,
         Panel::Models,
         Panel::History,
-        Panel::Events,
+        Panel::Efficiency,
         Panel::System,
     ];
 
@@ -67,7 +67,7 @@ impl Panel {
             Panel::Projects => 6,
             Panel::Models => 7,
             Panel::History => 8,
-            Panel::Events => 9,
+            Panel::Efficiency => 9,
             Panel::System => 0,
         }
     }
@@ -89,7 +89,7 @@ impl Panel {
             Panel::Projects => "PROJECTS",
             Panel::Models => "MODELS",
             Panel::History => "HISTORY",
-            Panel::Events => "EVENTS",
+            Panel::Efficiency => "EFFICIENCY",
             Panel::System => "SYSTEM",
         }
     }
@@ -196,6 +196,8 @@ pub enum ManaRow {
 pub struct App {
     pub theme: Theme,
     pub mask: bool,
+    /// SWARM shows activity lanes (true) or the spend sparkline (false); `v` toggles.
+    pub lanes: bool,
     pub paused: bool,
     pub eco: bool,
     pub bell: bool,
@@ -212,6 +214,8 @@ pub struct App {
     pub system: SystemView,
     pub analytics: Analytics,
     pub timeline: (String, Vec<ToolLine>, Option<String>),
+    /// The selected agent's requests (key, points).
+    pub life: (String, Vec<crate::live::LifePoint>),
     pub events: VecDeque<EventLine>,
     prev_states: HashMap<String, (State, String, f64)>,
     /// The selected agent, by key: rows move, the selection does not.
@@ -258,6 +262,7 @@ impl App {
         App {
             theme,
             mask,
+            lanes: true,
             paused: false,
             eco: false,
             bell: true,
@@ -280,6 +285,7 @@ impl App {
             system: SystemView::default(),
             analytics: Analytics::default(),
             timeline: (String::new(), Vec::new(), None),
+            life: (String::new(), Vec::new()),
             events: VecDeque::new(),
             prev_states: HashMap::new(),
             selected_key: None,
@@ -577,6 +583,23 @@ impl App {
                 });
             }
         }
+        // Two agents editing the same file within the last half hour.
+        for (file, n) in &self.snapshot.conflicts {
+            let short: Vec<&str> = file.rsplit('/').take(2).collect();
+            let short = if self.mask {
+                "•••".to_string()
+            } else {
+                short.into_iter().rev().collect::<Vec<_>>().join("/")
+            };
+            out.push(Attn {
+                severity: 3,
+                glyph: "⚠",
+                tone: Tone::Warn,
+                text: format!("{n} agents edited {short} in the last 30 min"),
+                since: None,
+                target: AttnTarget::None,
+            });
+        }
         out.sort_by_key(|a| a.severity);
         out
     }
@@ -676,7 +699,36 @@ impl App {
                 }
                 self.analytics = *a;
             }
-            Msg::Timeline(k, t, last) => self.timeline = (k, t, last),
+            Msg::Timeline(k, t, last, life) => {
+                self.life = (k.clone(), life);
+                self.timeline = (k, t, last);
+            }
+            Msg::Past(p) => {
+                use crate::live::PastKind;
+                // Old news: no highlight.
+                let born = Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(600))
+                    .unwrap_or_else(Instant::now);
+                for e in p {
+                    let (glyph, tone) = match e.kind {
+                        PastKind::Spawned => ("+", Tone::Accent),
+                        PastKind::Done => ("✓", Tone::Good),
+                        PastKind::ApiError => ("!", Tone::Bad),
+                        PastKind::Prompt => ("✎", Tone::Info),
+                    };
+                    self.events.push_back(EventLine {
+                        at: e.at,
+                        glyph,
+                        text: e.text,
+                        tone,
+                        born,
+                    });
+                }
+                self.events
+                    .make_contiguous()
+                    .sort_by(|a, b| b.at.cmp(&a.at));
+                self.events.truncate(300);
+            }
             Msg::Error(e) => self.error = Some(e),
         }
     }
@@ -847,7 +899,7 @@ impl App {
                 Panel::Projects,
                 Panel::Models,
                 Panel::History,
-                Panel::Events,
+                Panel::Efficiency,
             ],
             Shape::Column => vec![
                 Panel::Swarm,
@@ -855,13 +907,18 @@ impl App {
                 Panel::Mana,
                 Panel::Attention,
                 Panel::Projects,
-                Panel::Events,
+                Panel::Efficiency,
             ],
             Shape::Tabs => match self.tab {
-                Tab::Ops => vec![Panel::Swarm, Panel::Mana, Panel::Attention, Panel::Events],
+                Tab::Ops => vec![Panel::Swarm, Panel::Mana, Panel::Attention],
                 Tab::Agent => vec![Panel::Swarm, Panel::Agent],
                 Tab::Mana => vec![Panel::Mana],
-                Tab::Spend => vec![Panel::Projects, Panel::Models, Panel::History],
+                Tab::Spend => vec![
+                    Panel::Projects,
+                    Panel::Efficiency,
+                    Panel::Models,
+                    Panel::History,
+                ],
                 Tab::System => vec![Panel::System],
             },
         }
@@ -1012,6 +1069,17 @@ impl App {
             KeyCode::Char('n') => self.jump_attention(1),
             KeyCode::Char('N') => self.jump_attention(-1),
             KeyCode::Char('J') => self.jump(),
+            KeyCode::Char('v') => {
+                self.lanes = !self.lanes;
+                self.toast(
+                    if self.lanes {
+                        "SWARM: activity of the last 30 min (thinking · tool · waiting for agents · waiting for you)"
+                    } else {
+                        "SWARM: spend of the last 15 min"
+                    },
+                    Tone::Info,
+                );
+            }
             KeyCode::Char('m') => {
                 self.mask = !self.mask;
                 self.toast(
@@ -1078,9 +1146,13 @@ impl App {
 
     fn list_len(&self, p: Panel) -> usize {
         match p {
-            Panel::Attention => self.attention().len(),
+            // Alerts, then the event log under them.
+            Panel::Attention => self.attention().len() + self.events.len(),
+            // Pages of the efficiency panel.
+            Panel::Efficiency => 3,
+            // Days of the daily bars (0 = today).
+            Panel::History => 14,
             Panel::Projects => self.analytics.projects.len(),
-            Panel::Events => self.events.len(),
             Panel::Agent => self.timeline.1.len(),
             _ => 0,
         }
@@ -1120,7 +1192,25 @@ impl App {
                     self.focus_panel(Panel::Swarm);
                 }
             }
-            p @ (Panel::Attention | Panel::Projects | Panel::Events | Panel::Agent)
+            Panel::History
+                if matches!(
+                    k.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char('h') | KeyCode::Char('l')
+                ) =>
+            {
+                let step = if matches!(k.code, KeyCode::Left | KeyCode::Char('h')) {
+                    1
+                } else {
+                    -1
+                };
+                let v = (self.cur(Panel::History) as isize + step).clamp(0, 13) as usize;
+                self.set_cur(Panel::History, v);
+            }
+            p @ (Panel::Attention
+            | Panel::Projects
+            | Panel::Efficiency
+            | Panel::Agent
+            | Panel::History)
                 if step != 0 =>
             {
                 let n = self.list_len(p).max(1);

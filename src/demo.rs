@@ -136,7 +136,9 @@ fn assistant(
     tool: usize,
 ) -> (serde_json::Value, String) {
     let (name, key, val) = TOOLS[tool % TOOLS.len()];
-    let tool_id = format!("toolu_demo{seed:x}");
+    // Ids must be unique across sessions and agents, or tool results land on the wrong call.
+    let who = agent.unwrap_or("main");
+    let tool_id = format!("toolu_demo{seed:x}_{who}_{}", t.timestamp_millis());
     let mut v = json!({
         "type": "assistant", "timestamp": ts(t), "cwd": cwd, "effort": effort, "requestedModel": model,
         "message": {"id": format!("msg_demo{seed:x}"), "model": model,
