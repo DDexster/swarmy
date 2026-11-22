@@ -11,8 +11,16 @@ pub struct Theme {
     pub bg: Color,
     pub fg: Color,
     pub dim: Color,
+    /// Secondary text (timestamps, hints): readable, at least 3:1 on the background.
     pub faint: Color,
+    /// Gauge tracks and separators: barely visible on purpose.
+    pub track: Color,
+    /// Selected row background.
+    pub sel: Color,
     pub border: Color,
+    /// Panel titles and section headings: bright text on a plate, so they stand out from data.
+    pub title: Color,
+    pub title_bg: Color,
     pub accent: Color,
     pub good: Color,
     pub warn: Color,
@@ -30,9 +38,13 @@ const OPS: Theme = Theme {
     name: "ops",
     bg: Color::Rgb(10, 13, 18),
     fg: Color::Rgb(205, 214, 224),
-    dim: Color::Rgb(108, 120, 134),
-    faint: Color::Rgb(46, 54, 66),
+    dim: Color::Rgb(140, 150, 164),
+    faint: Color::Rgb(104, 114, 130),
+    track: Color::Rgb(44, 52, 64),
+    sel: Color::Rgb(24, 56, 76),
     border: Color::Rgb(40, 66, 82),
+    title: Color::Rgb(240, 244, 250),
+    title_bg: Color::Rgb(30, 64, 98),
     accent: Color::Rgb(0, 215, 255),
     good: Color::Rgb(80, 250, 123),
     warn: Color::Rgb(255, 184, 0),
@@ -51,8 +63,12 @@ const PHOSPHOR: Theme = Theme {
     bg: Color::Rgb(2, 10, 4),
     fg: Color::Rgb(120, 255, 140),
     dim: Color::Rgb(40, 140, 60),
-    faint: Color::Rgb(16, 60, 26),
+    faint: Color::Rgb(40, 130, 60),
+    track: Color::Rgb(16, 60, 26),
+    sel: Color::Rgb(14, 70, 30),
     border: Color::Rgb(24, 100, 40),
+    title: Color::Rgb(210, 255, 215),
+    title_bg: Color::Rgb(18, 84, 36),
     accent: Color::Rgb(170, 255, 180),
     good: Color::Rgb(120, 255, 140),
     warn: Color::Rgb(230, 255, 120),
@@ -71,8 +87,12 @@ const AMBER: Theme = Theme {
     bg: Color::Rgb(12, 8, 2),
     fg: Color::Rgb(255, 190, 90),
     dim: Color::Rgb(160, 110, 40),
-    faint: Color::Rgb(70, 46, 14),
+    faint: Color::Rgb(150, 100, 40),
+    track: Color::Rgb(70, 46, 14),
+    sel: Color::Rgb(70, 46, 10),
     border: Color::Rgb(110, 72, 20),
+    title: Color::Rgb(255, 238, 200),
+    title_bg: Color::Rgb(96, 60, 12),
     accent: Color::Rgb(255, 214, 140),
     good: Color::Rgb(255, 200, 100),
     warn: Color::Rgb(255, 240, 160),
@@ -92,7 +112,11 @@ const PLAIN: Theme = Theme {
     fg: Color::Reset,
     dim: Color::DarkGray,
     faint: Color::DarkGray,
+    track: Color::DarkGray,
+    sel: Color::DarkGray,
     border: Color::DarkGray,
+    title: Color::White,
+    title_bg: Color::Blue,
     accent: Color::Cyan,
     good: Color::Green,
     warn: Color::Yellow,
@@ -129,6 +153,14 @@ impl Theme {
 
     pub fn base(&self) -> Style {
         Style::new().fg(self.fg).bg(self.bg)
+    }
+
+    /// A section heading inside a panel.
+    pub fn heading(&self) -> Style {
+        Style::new()
+            .fg(self.title)
+            .bg(self.title_bg)
+            .add_modifier(ratatui::style::Modifier::BOLD)
     }
 
     pub fn bold(&self, c: Color) -> Style {

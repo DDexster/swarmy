@@ -366,6 +366,38 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The newest reading of every account and window kind.
+    pub fn latest_readings(&self) -> anyhow::Result<Vec<(String, Vec<Reading>)>> {
+        let mut st = self.conn.prepare(
+            "SELECT r.account_uuid, r.kind, r.fetched_at, r.utilization, r.resets_at FROM readings r
+             JOIN (SELECT account_uuid, kind, MAX(fetched_at) AS m FROM readings GROUP BY 1, 2) x
+               ON x.account_uuid = r.account_uuid AND x.kind = r.kind AND x.m = r.fetched_at
+             ORDER BY 1, 2",
+        )?;
+        let mut out: BTreeMap<String, Vec<Reading>> = BTreeMap::new();
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (acct, kind, f, u, z) = row?;
+            if let Some(kind) = WindowKind::from_key(&kind) {
+                out.entry(acct).or_default().push(Reading {
+                    kind,
+                    fetched_at: from_ms(f),
+                    utilization: u,
+                    resets_at: from_ms(z),
+                });
+            }
+        }
+        Ok(out.into_iter().collect())
+    }
+
     pub fn account_labels(
         &self,
     ) -> anyhow::Result<BTreeMap<String, (Option<String>, Option<String>)>> {

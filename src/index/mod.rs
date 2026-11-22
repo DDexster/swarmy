@@ -26,6 +26,15 @@ use crate::core::usage::Usage;
 
 pub struct Index {
     pub conn: Connection,
+    /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
+    /// again only when a file was added to it.
+    session_dirs: HashMap<
+        (String, String),
+        (
+            Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+            Vec<TranscriptFile>,
+        ),
+    >,
 }
 
 /// What `.claude.json` of a seat says right now.
@@ -107,7 +116,10 @@ impl Index {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
         )?;
-        let idx = Index { conn };
+        let idx = Index {
+            conn,
+            session_dirs: HashMap::new(),
+        };
         if idx.meta("schema_version")?.as_deref() != Some(schema::VERSION) {
             for t in schema::TABLES {
                 idx.conn
@@ -185,12 +197,50 @@ impl Index {
             let Some(seat) = seats.iter().find(|s| &s.label == seat_label) else {
                 continue;
             };
-            out.extend(files::list_session(seat, sid));
+            out.extend(self.session_files(seat, sid));
         }
         let mut seen = std::collections::HashSet::new();
         out.retain(|f| seen.insert(f.path.clone()));
         let mut quiet = |_p: Progress| {};
         self.refresh_files(out, seat_info, resolver, prices, &mut quiet)
+    }
+
+    /// The files of a live session, listed again only when one of its dirs changed.
+    fn session_files(&mut self, seat: &Seat, sid: &str) -> Vec<TranscriptFile> {
+        let key = (seat.label.clone(), sid.to_string());
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        if let Some((dirs, cached)) = self.session_dirs.get(&key)
+            && !dirs.is_empty()
+            && dirs.iter().all(|(d, t)| mtime(d) == *t)
+        {
+            return cached.clone();
+        }
+        let list = files::list_session(seat, sid);
+        // Watch the dirs that hold these files (main dir, subagents, workflow runs).
+        let mut dirs: Vec<std::path::PathBuf> = list
+            .iter()
+            .filter_map(|f| f.path.parent().map(|p| p.to_path_buf()))
+            .collect();
+        // Also dirs that may not exist yet: creating them is how a first subagent shows up.
+        for f in list.iter().filter(|f| f.kind == FileKind::Main) {
+            if let Some(pdir) = f.path.parent() {
+                let base = pdir.join(sid);
+                dirs.push(base.join("subagents").join("workflows"));
+                dirs.push(base.join("subagents"));
+                dirs.push(base);
+            }
+        }
+        dirs.sort();
+        dirs.dedup();
+        let stamped = dirs
+            .into_iter()
+            .map(|d| {
+                let t = mtime(&d);
+                (d, t)
+            })
+            .collect();
+        self.session_dirs.insert(key, (stamped, list.clone()));
+        list
     }
 
     fn refresh_files(
@@ -281,10 +331,18 @@ impl Index {
         let mut type_counts: HashMap<String, u64> = HashMap::new();
         let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
         for batch in work.chunks(48) {
-            let parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = batch
-                .par_iter()
-                .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
-                .collect();
+            // A few small files parse faster on this thread than by waking the whole pool.
+            let parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
+                batch
+                    .iter()
+                    .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
+                    .collect()
+            } else {
+                batch
+                    .par_iter()
+                    .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
+                    .collect()
+            };
             let tx = self.conn.transaction()?;
             for (w, chunk) in parsed {
                 let Ok(chunk) = chunk else { continue };

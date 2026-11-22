@@ -267,6 +267,9 @@ pub fn analyze(
 }
 
 fn tier_of(ctx: &Ctx, account: &str) -> Option<String> {
+    if let Some(t) = ctx.login_tiers.get(account) {
+        return Some(t.clone());
+    }
     ctx.seat_info
         .iter()
         .filter_map(|s| s.account.as_ref())
@@ -276,7 +279,21 @@ fn tier_of(ctx: &Ctx, account: &str) -> Option<String> {
 
 /// Analyses every account with a cached reading, using cross-account references per tier.
 pub fn all_reports(ctx: &Ctx, idx: &Index) -> anyhow::Result<Vec<AccountReport>> {
-    let readings = ctx.latest_readings();
+    // Every account ever read, not only those in a seat now: a login parked in the vault keeps
+    // its last known limit and reset time.
+    let mut merged: std::collections::BTreeMap<String, Vec<Reading>> =
+        idx.latest_readings()?.into_iter().collect();
+    for (acct, rs) in ctx.latest_readings() {
+        let e = merged.entry(acct).or_default();
+        for r in rs {
+            match e.iter_mut().find(|x| x.kind == r.kind) {
+                Some(x) if x.fetched_at < r.fetched_at => *x = r,
+                Some(_) => {}
+                None => e.push(r),
+            }
+        }
+    }
+    let readings: Vec<(String, Vec<Reading>)> = merged.into_iter().collect();
     let mut refs: HashMap<(String, WindowKind), Reference> = HashMap::new();
     for (acct, rs) in &readings {
         let Some(tier) = tier_of(ctx, acct) else {

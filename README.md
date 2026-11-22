@@ -23,11 +23,16 @@ Everything is read from what Claude Code already writes to disk. Nothing leaves 
 
 ## Screens
 
+On a big terminal everything is on one wall; nothing hides behind tabs.
+
+![the wall at 326×81](docs/img/wall.png)
+
 | | |
 |---|---|
-| ![OPS](docs/img/ops.png) **OPS** — limits, burn rate, the live agent tree, where the week went | ![AGENTS](docs/img/agents.png) **AGENTS** — any agent's state, model, cost, context and tool timeline |
-| ![SPEND](docs/img/spend.png) **SPEND** — by project / model / agent type / account, daily bars, weekday × hour heatmap | ![MODELS](docs/img/models.png) **MODELS** — cost share, cache hits, thinking, effort mix, project × model |
-| ![MANA](docs/img/mana.png) **MANA** — each account's 5-hour and weekly window, ETA, shares, usage elsewhere | ![VAULT](docs/img/vault.png) **VAULT** — saved logins and seats; pick, switch, save, rename from the keyboard |
+| ![column](docs/img/column.png) **Half a screen (160×81)** — mana and attention on top, the swarm, the selected agent, projects and events stacked | ![tabs](docs/img/tabs.png) **A laptop terminal (140×34)** — the same panels grouped into five tabs |
+| ![vault](docs/img/vault-picker.png) **Switching a login** — Enter on a seat lists the saved logins, the one with the most limit left first | |
+
+The panels: **1 SWARM** (live agent tree, then what finished recently) · **2 MANA · SEATS** (limits per account, seats and the login vault) · **3 BURN** · **4 ATTENTION** (needs you, stalled, limits about to run out, unsaved or expiring logins) · **5 AGENT** (card, last message, tool timeline) · **6 PROJECTS** · **7 MODELS** · **8 HISTORY** · **9 EVENTS** · **0 SYSTEM**.
 
 Try it without touching your own data:
 
@@ -67,26 +72,31 @@ and `--format table|json|csv`. `--mask` hides emails, names and full paths (for 
 
 ### The dashboard
 
+The layout follows the terminal: a **wall** from about 250×55, a **column** from 150×48, **tabs**
+below that (`L` cycles them).
+
 | Key | Action |
 |---|---|
-| `F1`–`F7`, `1`–`7`, `Tab` | OPS · AGENTS · SPEND · MODELS · MANA · VAULT · SYSTEM |
-| `↑↓` / `j k` | select an agent; `Enter` for details and its tool timeline |
-| `J` | jump to the agent's Claude Code in tmux |
-| `/` | filter agents |
-| `:` | command: `switch <seat> <login>`, `capture <seat> [label]`, `period 7d`, `theme amber` |
-| `t` / `s` | cycle period / grouping (SPEND) |
-| `m` · `p` · `T` | mask · pause animations · theme (ops, phosphor, amber, plain) |
-| VAULT: `←→` `↑↓` `Enter` | pick a seat and a login to put into it (or a login, then its seat) |
-| VAULT: `c` · `a` · `r` · `d` | save the selected seat's login · log into a new account · rename · forget |
-| `?` · `q` | help · quit |
+| `Tab` / `Shift-Tab` | next / previous panel; the focused one has a bright border and its keys in the footer |
+| `1`–`9`, `0` | focus the panel with that number (again: zoom it); in tabs, `1`–`5` switch tabs |
+| `z` · `Esc` | zoom the focused panel · back (closes dialogs, zoom, filter) |
+| `↑↓` `PgUp` `PgDn` | move inside the focused panel (agents, alerts, projects, tools, events) |
+| `Enter` | agent → its details · alert → go to it · project → its agents · seat → pick a login |
+| `n` / `N` | next / previous thing that needs attention |
+| `/` | filter: words, `p:project`, `m:model`, `s:seat`, `state:needs` |
+| `:` | `switch <seat> <login>`, `capture <seat> [label]`, `period 7d`, `layout wall` |
+| `J` | jump to the selected agent's Claude Code in tmux |
+| `t` · `g` | period (today, 7d, 30d, all) · spend grouping |
+| MANA: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
+| `m` · `p` · `T` · `?` · `q` | mask · pause animations · theme · help · quit |
 
 ### Light on the battery
 
-The dashboard redraws at 10 frames a second only while something animates and reads only the
-transcripts of running sessions every second; the full scan runs once a minute, history charts
-every five minutes, the full process table only on the SYSTEM screen. On a busy machine it uses
-about 1 CPU-second per minute (under 2% of one core). On battery (Linux, macOS) or with `--eco` it
-drops to 4 frames and a refresh every 3 seconds.
+Only the running sessions' transcripts are read every second, and only the files that changed;
+totals of idle agents are reused; period aggregates refresh every two minutes, limits every
+minute; the process table and disks are read only while SYSTEM is open. On a 4K wall with 20+ live
+agents it uses about 1.8 CPU-seconds per minute (≈3% of one core). On battery (Linux, macOS) or
+with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
 
 ## How the numbers are made
 

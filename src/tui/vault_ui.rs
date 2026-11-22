@@ -1,26 +1,11 @@
-//! The VAULT screen, driven from the keyboard: pick a seat or a login, save, switch, rename,
-//! forget, log into a new account.
+//! The vault, operated inside the MANA · SEATS panel: seats first, then the logins parked in the
+//! vault. Enter on a seat opens a picker of logins sorted by limit left (the best one first);
+//! Enter on a parked login picks its seat. `S` puts the best login into the selected seat.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::app::{App, Tone};
+use super::app::{App, ManaRow, Panel, Tone};
 use crate::vault::{Login, Vault};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Focus {
-    #[default]
-    Seats,
-    Logins,
-}
-
-/// A two-step switch: the first choice waits for its counterpart.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Pick {
-    /// A seat was chosen; now choose the login to put into it.
-    LoginFor(String),
-    /// A login was chosen; now choose the seat to put it into.
-    SeatFor(String),
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
@@ -48,6 +33,23 @@ pub enum Modal {
     },
 }
 
+/// What a picker chooses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PickFor {
+    /// A login for this seat.
+    Seat(String),
+    /// A seat for this login.
+    Login(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Picker {
+    pub what: PickFor,
+    /// Login labels (for a seat) or seat labels (for a login), best first.
+    pub items: Vec<String>,
+    pub sel: usize,
+}
+
 /// Work that needs the real terminal (runs `claude` for a new login).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum External {
@@ -56,12 +58,9 @@ pub enum External {
 
 #[derive(Debug, Default)]
 pub struct VaultUi {
-    pub focus: Focus,
-    pub seat_sel: usize,
-    pub login_sel: usize,
-    pub pick: Option<Pick>,
     pub logins: Vec<Login>,
     pub loaded: bool,
+    pub picker: Option<Picker>,
     pub modal: Option<Modal>,
     pub external: Option<External>,
 }
@@ -78,44 +77,66 @@ impl App {
             }
             Err(e) => self.toast(format!("vault: {e:#}"), Tone::Bad),
         }
-        self.vault.login_sel = self
-            .vault
-            .login_sel
-            .min(self.vault.logins.len().saturating_sub(1));
-    }
-
-    fn selected_seat_label(&self) -> Option<String> {
-        self.seats.get(self.vault.seat_sel).map(|s| s.label.clone())
-    }
-
-    fn selected_login_label(&self) -> Option<String> {
-        self.vault
-            .logins
-            .get(self.vault.login_sel)
-            .map(|l| l.label.clone())
     }
 
     fn live_in(&self, seat: &str) -> usize {
         self.live.iter().filter(|l| l.seat == seat).count()
     }
 
-    /// Asks for confirmation when Claude Code runs in the seat, otherwise switches at once.
-    fn request_switch(&mut self, seat: String, login: String) {
-        self.vault.pick = None;
+    /// Limit used by a login's account: the larger of the 5-hour and weekly estimates (unknown
+    /// sorts last).
+    pub fn login_pressure(&self, l: &Login) -> f64 {
+        let (five, week, _) = self.mana_of(l.account_uuid.as_deref());
+        match (five, week) {
+            (None, None) => 1_000.0,
+            (f, w) => f.unwrap_or(0.0).max(w.unwrap_or(0.0)),
+        }
+    }
+
+    /// Logins that could go into `seat`, the most limit left first.
+    pub fn candidates_for(&self, _seat: &str) -> Vec<String> {
+        // Logins mounted in another seat are left out: one grant in two seats breaks one of them.
+        let mut v: Vec<&Login> = self
+            .vault
+            .logins
+            .iter()
+            .filter(|l| l.mounted.is_none())
+            .collect();
+        v.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
+        v.into_iter().map(|l| l.label.clone()).collect()
+    }
+
+    fn selected_row(&self) -> Option<ManaRow> {
+        self.mana_rows().get(self.cur(Panel::Mana)).cloned()
+    }
+
+    /// Asks for confirmation (always naming what is saved first), then switches.
+    pub fn request_switch(&mut self, seat: String, login: String) {
+        self.vault.picker = None;
         let live = self.live_in(&seat);
-        let text = if live > 0 {
+        let current = self.analytics.seats.iter().find(|s| s.label == seat);
+        let keeps = match current {
+            Some(s) if s.login.is_some() => format!(
+                "Its current login '{}' stays in the vault.",
+                s.login.clone().unwrap_or_default()
+            ),
+            Some(s) if s.state.fingerprint.is_some() => {
+                format!("Its current login is not saved yet: it is saved first, as '{seat}'.")
+            }
+            _ => String::new(),
+        };
+        let running = if live > 0 {
             format!(
-                "Put '{login}' into seat '{seat}'?\n\nClaude Code runs there ({live} session{}). It re-reads the login when the file changes \
-                 and goes on under the new account; the account it shows stays stale until restart.\n\n[y] switch   [n] cancel",
+                "\n\nClaude Code runs there ({live} session{}): it picks up the new login on its next request; restart it to refresh the account it shows.",
                 if live == 1 { "" } else { "s" }
             )
         } else {
-            format!(
-                "Put '{login}' into seat '{seat}'?\n\nThe seat's current login is saved first.\n\n[y] switch   [n] cancel"
-            )
+            String::new()
         };
         self.vault.modal = Some(Modal::Confirm {
-            text,
+            text: format!(
+                "Put '{login}' into seat '{seat}'?\n\n{keeps}{running}\n\n[y] switch   [n] cancel"
+            ),
             action: ConfirmAction::Switch { seat, login },
         });
     }
@@ -139,7 +160,7 @@ impl App {
                 if let Some(saved) = &r.auto_saved {
                     self.log_event(
                         "⚿",
-                        format!("seat {}'s previous login auto-saved as '{saved}'", r.seat),
+                        format!("seat {}'s previous login saved as '{saved}'", r.seat),
                         Tone::Good,
                     );
                 }
@@ -159,8 +180,8 @@ impl App {
             }
             Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
         }
-        self.request_analytics();
         self.vault_reload();
+        self.request_analytics();
     }
 
     fn do_capture(&mut self, seat: &str, label: &str) {
@@ -182,171 +203,93 @@ impl App {
             }
             Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
         }
-        self.request_analytics();
         self.vault_reload();
+        self.request_analytics();
     }
 
-    /// Keys of the VAULT screen. Returns true when the key was used.
+    /// Keys of the MANA · SEATS panel and of its dialogs. Returns true when the key was used.
     pub fn vault_key(&mut self, k: KeyEvent) -> bool {
         if !self.vault.loaded {
             self.vault_reload();
         }
         if let Some(m) = self.vault.modal.clone() {
-            match m {
-                Modal::Input {
-                    title,
-                    mut value,
-                    action,
-                } => match k.code {
-                    KeyCode::Esc => self.vault.modal = None,
-                    KeyCode::Enter => {
-                        self.vault.modal = None;
-                        match action {
-                            InputAction::Capture(seat) => self.do_capture(&seat, &value),
-                            InputAction::Rename(old) => {
-                                let res = Vault::open(&self.vault_dir)
-                                    .and_then(|mut v| v.rename(&old, value.trim()));
-                                match res {
-                                    Ok(()) => self.toast(
-                                        format!("renamed to '{}'", value.trim()),
-                                        Tone::Good,
-                                    ),
-                                    Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
-                                }
-                                self.vault_reload();
-                                self.request_analytics();
-                            }
-                            InputAction::Add => {
-                                if value.trim().is_empty() {
-                                    self.toast("a label is needed", Tone::Warn);
-                                } else {
-                                    self.vault.external =
-                                        Some(External::AddLogin(value.trim().to_string()));
-                                }
-                            }
+            self.modal_key(m, k);
+            return true;
+        }
+        if let Some(mut p) = self.vault.picker.clone() {
+            match k.code {
+                KeyCode::Esc => self.vault.picker = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    p.sel = (p.sel + 1).min(p.items.len().saturating_sub(1));
+                    self.vault.picker = Some(p);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    p.sel = p.sel.saturating_sub(1);
+                    self.vault.picker = Some(p);
+                }
+                KeyCode::Enter => {
+                    if let Some(item) = p.items.get(p.sel).cloned() {
+                        match p.what {
+                            PickFor::Seat(seat) => self.request_switch(seat, item),
+                            PickFor::Login(login) => self.request_switch(item, login),
                         }
                     }
-                    KeyCode::Backspace => {
-                        value.pop();
-                        self.vault.modal = Some(Modal::Input {
-                            title,
-                            value,
-                            action,
-                        });
-                    }
-                    KeyCode::Char(c) if !c.is_control() => {
-                        value.push(c);
-                        self.vault.modal = Some(Modal::Input {
-                            title,
-                            value,
-                            action,
-                        });
-                    }
-                    _ => {}
-                },
-                Modal::Confirm { action, .. } => match k.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                        self.vault.modal = None;
-                        match action {
-                            ConfirmAction::Switch { seat, login } => self.do_switch(&seat, &login),
-                            ConfirmAction::Remove(login) => {
-                                let res = Vault::open(&self.vault_dir)
-                                    .and_then(|mut v| v.remove(&login, true));
-                                match res {
-                                    Ok(l) => {
-                                        self.toast(format!("forgot '{}'", l.label), Tone::Good)
-                                    }
-                                    Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
-                                }
-                                self.vault_reload();
-                                self.request_analytics();
-                            }
-                        }
-                    }
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                        self.vault.modal = None
-                    }
-                    _ => {}
-                },
+                }
+                _ => {}
             }
             return true;
         }
-        let v = &mut self.vault;
+        let rows = self.mana_rows();
+        let cur = self.cur(Panel::Mana).min(rows.len().saturating_sub(1));
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                match v.focus {
-                    Focus::Seats => v.seat_sel = v.seat_sel.saturating_sub(1),
-                    Focus::Logins => v.login_sel = v.login_sel.saturating_sub(1),
-                }
-                true
-            }
             KeyCode::Down | KeyCode::Char('j') => {
-                match v.focus {
-                    Focus::Seats => {
-                        v.seat_sel = (v.seat_sel + 1).min(self.seats.len().saturating_sub(1))
-                    }
-                    Focus::Logins => {
-                        v.login_sel = (v.login_sel + 1).min(v.logins.len().saturating_sub(1))
+                self.cursor
+                    .insert(Panel::Mana, (cur + 1).min(rows.len().saturating_sub(1)));
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.cursor.insert(Panel::Mana, cur.saturating_sub(1));
+            }
+            KeyCode::Enter => match self.selected_row() {
+                Some(ManaRow::Seat(seat)) => {
+                    let items = self.candidates_for(&seat);
+                    if items.is_empty() {
+                        self.toast("no free saved login (the others are in seats): c saves this seat's login, a adds one", Tone::Warn);
+                    } else {
+                        self.vault.picker = Some(Picker {
+                            what: PickFor::Seat(seat),
+                            items,
+                            sel: 0,
+                        });
                     }
                 }
-                true
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                v.focus = Focus::Seats;
-                true
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                v.focus = Focus::Logins;
-                true
-            }
-            KeyCode::Esc if v.pick.is_some() => {
-                v.pick = None;
-                true
-            }
-            KeyCode::Enter => {
-                match (v.focus, v.pick.clone()) {
-                    (Focus::Logins, Some(Pick::LoginFor(seat))) => {
-                        if let Some(l) = self.selected_login_label() {
-                            self.request_switch(seat, l);
-                        }
-                    }
-                    (Focus::Seats, Some(Pick::SeatFor(login))) => {
-                        if let Some(s) = self.selected_seat_label() {
-                            self.request_switch(s, login);
-                        }
-                    }
-                    (Focus::Seats, _) => {
-                        if self.vault.logins.is_empty() {
-                            self.toast("no saved logins yet: press c to save this seat's login, a to add one", Tone::Warn);
-                        } else if let Some(s) = self.selected_seat_label() {
-                            self.vault.pick = Some(Pick::LoginFor(s));
-                            self.vault.focus = Focus::Logins;
-                        }
-                    }
-                    (Focus::Logins, _) => {
-                        if let Some(l) = self.selected_login_label() {
-                            self.vault.pick = Some(Pick::SeatFor(l));
-                            self.vault.focus = Focus::Seats;
-                        }
+                Some(ManaRow::Login(login)) => {
+                    let items: Vec<String> = self.seats.iter().map(|s| s.label.clone()).collect();
+                    self.vault.picker = Some(Picker {
+                        what: PickFor::Login(login),
+                        items,
+                        sel: 0,
+                    });
+                }
+                None => {}
+            },
+            KeyCode::Char('S') => {
+                if let Some(ManaRow::Seat(seat)) = self.selected_row() {
+                    match self.candidates_for(&seat).first().cloned() {
+                        Some(best) => self.request_switch(seat, best),
+                        None => self.toast("no other saved login to switch to", Tone::Warn),
                     }
                 }
-                true
             }
             KeyCode::Char('c') => {
-                if let Some(s) = self.selected_seat_label() {
+                if let Some(ManaRow::Seat(s)) = self.selected_row() {
                     self.vault.modal = Some(Modal::Input {
                         title: format!("Save the login of seat '{s}' as"),
                         value: s.clone(),
                         action: InputAction::Capture(s),
                     });
+                } else {
+                    self.toast("select a seat to save its login", Tone::Info);
                 }
-                true
-            }
-            KeyCode::Char('R') => {
-                self.vault_reload();
-                self.request_analytics();
-                self.toast("re-reading seats and logins…", Tone::Info);
-                true
             }
             KeyCode::Char('a') => {
                 self.vault.modal = Some(Modal::Input {
@@ -354,37 +297,123 @@ impl App {
                     value: String::new(),
                     action: InputAction::Add,
                 });
-                true
             }
-            KeyCode::Char('r') if v.focus == Focus::Logins => {
-                if let Some(l) = self.selected_login_label() {
+            KeyCode::Char('r') => {
+                let label = match self.selected_row() {
+                    Some(ManaRow::Login(l)) => Some(l),
+                    Some(ManaRow::Seat(s)) => self
+                        .analytics
+                        .seats
+                        .iter()
+                        .find(|x| x.label == s)
+                        .and_then(|x| x.login.clone()),
+                    None => None,
+                };
+                if let Some(l) = label {
                     self.vault.modal = Some(Modal::Input {
                         title: format!("Rename '{l}' to"),
                         value: l.clone(),
                         action: InputAction::Rename(l),
                     });
                 }
-                true
             }
-            KeyCode::Char('d') | KeyCode::Delete if v.focus == Focus::Logins => {
-                if let Some(l) = self.vault.logins.get(self.vault.login_sel).cloned() {
-                    let note = match &l.mounted {
-                        Some(s) => format!(
-                            "\n\nIt is in use in seat '{s}'; the seat keeps working, the vault forgets its copy."
-                        ),
-                        None => String::new(),
-                    };
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(ManaRow::Login(label)) = self.selected_row() {
                     self.vault.modal = Some(Modal::Confirm {
                         text: format!(
-                            "Forget the saved login '{}'?{note}\n\n[y] forget   [n] cancel",
-                            l.label
+                            "Forget the saved login '{label}'?\n\nIts tokens are deleted from the vault.\n\n[y] forget   [n] cancel"
                         ),
-                        action: ConfirmAction::Remove(l.label),
+                        action: ConfirmAction::Remove(label),
+                    });
+                } else {
+                    self.toast(
+                        "select a saved login (below the seats) to forget it",
+                        Tone::Info,
+                    );
+                }
+            }
+            KeyCode::Char('R') => {
+                self.vault_reload();
+                self.request_analytics();
+                self.toast("re-reading seats and logins…", Tone::Info);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    fn modal_key(&mut self, m: Modal, k: KeyEvent) {
+        match m {
+            Modal::Input {
+                title,
+                mut value,
+                action,
+            } => match k.code {
+                KeyCode::Esc => self.vault.modal = None,
+                KeyCode::Enter => {
+                    self.vault.modal = None;
+                    match action {
+                        InputAction::Capture(seat) => self.do_capture(&seat, &value),
+                        InputAction::Rename(old) => {
+                            let res = Vault::open(&self.vault_dir)
+                                .and_then(|mut v| v.rename(&old, value.trim()));
+                            match res {
+                                Ok(()) => {
+                                    self.toast(format!("renamed to '{}'", value.trim()), Tone::Good)
+                                }
+                                Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
+                            }
+                            self.vault_reload();
+                            self.request_analytics();
+                        }
+                        InputAction::Add => {
+                            if value.trim().is_empty() {
+                                self.toast("a label is needed", Tone::Warn);
+                            } else {
+                                self.vault.external =
+                                    Some(External::AddLogin(value.trim().to_string()));
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    value.pop();
+                    self.vault.modal = Some(Modal::Input {
+                        title,
+                        value,
+                        action,
                     });
                 }
-                true
-            }
-            _ => false,
+                KeyCode::Char(c) if !c.is_control() => {
+                    value.push(c);
+                    self.vault.modal = Some(Modal::Input {
+                        title,
+                        value,
+                        action,
+                    });
+                }
+                _ => {}
+            },
+            Modal::Confirm { action, .. } => match k.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.vault.modal = None;
+                    match action {
+                        ConfirmAction::Switch { seat, login } => self.do_switch(&seat, &login),
+                        ConfirmAction::Remove(login) => {
+                            let res = Vault::open(&self.vault_dir)
+                                .and_then(|mut v| v.remove(&login, true));
+                            match res {
+                                Ok(l) => self.toast(format!("forgot '{}'", l.label), Tone::Good),
+                                Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
+                            }
+                            self.vault_reload();
+                            self.request_analytics();
+                        }
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.vault.modal = None,
+                _ => {}
+            },
         }
     }
 
@@ -399,11 +428,10 @@ impl App {
         );
         let res = (|| -> anyhow::Result<()> {
             std::fs::create_dir_all(&scratch)?;
-            let status = std::process::Command::new("claude")
+            std::process::Command::new("claude")
                 .env("CLAUDE_CONFIG_DIR", &scratch)
                 .status()
                 .map_err(|e| anyhow::anyhow!("cannot start `claude`: {e}"))?;
-            let _ = status;
             let seat = crate::claude::seats::Seat {
                 label: format!("scratch-{label}"),
                 claude_json: scratch.join(".claude.json"),

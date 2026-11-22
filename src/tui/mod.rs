@@ -5,10 +5,11 @@
 //! animations stay smooth while transcripts are being read.
 
 mod app;
+mod bigdigits;
 mod boot;
-mod draw;
 mod theme;
 mod vault_ui;
+mod view;
 
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,12 @@ use crate::live::{self, Snapshot, ToolLine};
 use crate::vault::{Login, Vault};
 
 pub use app::App;
+
+/// `AGENTMANA_DEBUG=1` prints timings to stderr (read once).
+fn debug() -> bool {
+    static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *D.get_or_init(|| std::env::var_os("AGENTMANA_DEBUG").is_some())
+}
 pub use boot::hash;
 
 /// Heavier, slower-changing numbers for the analytics screens.
@@ -48,11 +55,23 @@ pub struct Analytics {
     pub effort: Vec<(String, String, f64)>,
     pub substitutions: Vec<(String, String, u64)>,
     pub project_model: Vec<(String, String, f64)>,
+    /// Per project: spend in the last hour, today and in the period.
+    pub projects: Vec<ProjectRow>,
     pub limits: Vec<AccountReport>,
     pub logins: Vec<Login>,
     pub seats: Vec<SeatRow>,
     pub transcripts_bytes: Vec<(String, u64)>,
     pub index_bytes: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectRow {
+    pub key: String,
+    pub name: String,
+    pub hour: f64,
+    pub today: f64,
+    pub period: f64,
+    pub requests: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +102,8 @@ pub enum Msg {
     },
     Snapshot(Box<Snapshot>, Vec<LiveSession>, Box<SystemView>),
     Analytics(Box<Analytics>),
-    Timeline(String, Vec<ToolLine>),
+    /// Tool calls and the last thing the agent said.
+    Timeline(String, Vec<ToolLine>, Option<String>),
     Error(String),
 }
 
@@ -101,7 +121,7 @@ pub struct Wants {
 pub fn run(ctx: Ctx, no_boot: bool, force_eco: bool) -> anyhow::Result<()> {
     let (tx, rx) = channel::<Msg>();
     let wants = Arc::new(Mutex::new(Wants {
-        period: Some(Period::LimitWeek),
+        period: Some(Period::Days(7)),
         group: Some(Dim::Project),
         ..Default::default()
     }));
@@ -140,14 +160,18 @@ fn ui_loop(
         let frame_time = Duration::from_millis(if !app.animating() {
             500
         } else if app.eco {
-            250
+            500
         } else {
-            100
+            200
         });
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
         }
-        terminal.draw(|f| draw::draw(f, app))?;
+        let td = Instant::now();
+        terminal.draw(|f| view::draw(f, app))?;
+        if debug() {
+            eprintln!("draw {:?}", td.elapsed());
+        }
         let timeout = frame_time
             .saturating_sub(started.elapsed())
             .max(Duration::from_millis(5));
@@ -172,15 +196,23 @@ fn ui_loop(
                 Event::Resize(..) => {}
                 _ => {}
             }
-            let mut w = wants.lock().unwrap();
-            w.period = Some(app.period.clone());
-            w.group = Some(app.group);
-            w.agent = app.selected_agent().cloned();
-            w.system = app.screen == app::Screen::System;
-            if app.take_analytics_request() {
-                w.refresh_analytics = true;
-            }
         }
+        sync_wants(app, wants);
+    }
+}
+
+/// Tells the worker what the UI shows: the selected agent (for its timeline), the period…
+fn sync_wants(app: &mut App, wants: &Arc<Mutex<Wants>>) {
+    let mut w = wants.lock().unwrap();
+    w.period = Some(app.period.clone());
+    w.group = Some(app.group);
+    let sel = app.selected_agent().cloned();
+    if w.agent.as_ref().map(|a| a.key()) != sel.as_ref().map(|a| a.key()) {
+        w.agent = sel;
+    }
+    w.system = app.zoom == Some(app::Panel::System) || app.focus == app::Panel::System;
+    if app.take_analytics_request() {
+        w.refresh_analytics = true;
     }
 }
 
@@ -199,7 +231,7 @@ pub fn record(
     use ratatui::style::Color;
     let (tx, rx) = channel::<Msg>();
     let wants = Arc::new(Mutex::new(Wants {
-        period: Some(Period::LimitWeek),
+        period: Some(Period::Days(7)),
         group: Some(Dim::Project),
         ..Default::default()
     }));
@@ -236,17 +268,10 @@ pub fn record(
                     c => KeyCode::Char(*c),
                 };
                 app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
-                let mut w = wants.lock().unwrap();
-                w.period = Some(app.period.clone());
-                w.group = Some(app.group);
-                w.agent = app.selected_agent().cloned();
-                w.system = app.screen == app::Screen::System;
-                if app.take_analytics_request() {
-                    w.refresh_analytics = true;
-                }
             }
         }
-        term.draw(|f| draw::draw(f, &mut app))?;
+        term.draw(|f| view::draw(f, &mut app))?;
+        sync_wants(&mut app, &wants);
         if live && !app.analytics.limits.is_empty() || app.boot.is_some() && frame == usize::MAX {
             let buf = term.backend().buffer();
             let mut rows = Vec::new();
@@ -278,11 +303,12 @@ pub fn record(
     Ok(())
 }
 
-/// Modification times of every seat's credentials and `.claude.json`: two `stat`s per seat.
+/// Modification times of every seat's credentials file (`.claude.json` changes every few seconds
+/// and is re-read on a timer instead).
 fn login_files_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
     ctx.seats
         .iter()
-        .flat_map(|s| [s.credentials_file(), s.claude_json.clone()])
+        .map(|s| s.credentials_file())
         .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         .collect()
 }
@@ -361,11 +387,19 @@ fn worker(
     let mut tick = 0u64;
     let mut last_full = Instant::now();
     let mut login_stamp = login_files_stamp(&ctx);
+    let mut seats_changed = false;
     let mut last_power = Instant::now();
+    let mut last_full_analytics: Option<Instant> = None;
+    let mut last_heavy: Option<Instant> = None;
+    let mut last_limits: Option<Instant> = None;
+    let mut prev_snap: Option<live::Snapshot> = None;
+    let mut prev_analytics: Option<Analytics> = None;
     let mut last_procs = Instant::now() - Duration::from_secs(60);
     let mut slow: Option<(Instant, Vec<Row>, Vec<(String, String, f64)>)> = None;
     loop {
         tick += 1;
+        let tick_start = Instant::now();
+        let mut marks: Vec<(&str, Instant)> = Vec::new();
         ctx.now = Utc::now();
         let tp = Instant::now();
         let want_system = wants.lock().unwrap().system;
@@ -382,20 +416,23 @@ fn worker(
                 ctx.procs = ProcTable::for_pids(s, &pids);
             }
         }
-        if std::env::var_os("AGENTMANA_DEBUG").is_some() {
+        if debug() {
             eprintln!("procs {:?} ({} nodes)", tp.elapsed(), ctx.procs.nodes.len());
         }
         // A login file changed (a refresh, a /login, a copied backup): re-read at once.
+        marks.push(("procs", Instant::now()));
         let stamp = login_files_stamp(&ctx);
         if stamp != login_stamp || last_info.elapsed() > Duration::from_secs(20) {
             if stamp != login_stamp {
-                wants.lock().unwrap().refresh_analytics = true;
+                // A login changed: refresh seats and limits now, not the period aggregates.
+                seats_changed = true;
                 login_stamp = stamp;
             }
             reload_seat_info(&mut ctx);
             last_info = Instant::now();
         }
-        let dbg = std::env::var_os("AGENTMANA_DEBUG").is_some();
+        marks.push(("seatinfo", Instant::now()));
+        let dbg = debug();
         let t0 = Instant::now();
         let live_sessions: Vec<LiveSession> = ctx
             .seats
@@ -428,14 +465,35 @@ fn worker(
         if let Err(e) = res {
             send(Msg::Error(format!("{e:#}")));
         }
+        marks.push(("sessions+refresh", Instant::now()));
         let t1 = Instant::now();
-        let built = live::build(&idx, &live_sessions, &opts, ctx.now);
+        let heavy = last_heavy.is_none_or(|t| t.elapsed() > Duration::from_secs(10));
+        let built = live::build(
+            &idx,
+            &live_sessions,
+            &ctx.procs,
+            &opts,
+            ctx.now,
+            if heavy { None } else { prev_snap.as_ref() },
+            prev_snap.as_ref(),
+        );
+        if heavy {
+            last_heavy = Some(Instant::now());
+        }
+        if let Ok(s) = &built {
+            prev_snap = Some(s.clone());
+        }
         if dbg {
             eprintln!("refresh {:?} build {:?}", t1 - t0, t1.elapsed());
         }
         match built {
             Ok(snap) => {
-                let sysview = system_view(&ctx, &live_sessions, sys.as_ref());
+                // Only the SYSTEM panel shows this; listing disks is not free.
+                let sysview = if want_system {
+                    system_view(&ctx, &live_sessions, sys.as_ref())
+                } else {
+                    SystemView::default()
+                };
                 if !send(Msg::Snapshot(
                     Box::new(snap),
                     live_sessions.clone(),
@@ -448,15 +506,22 @@ fn worker(
                 send(Msg::Error(format!("{e:#}")));
             }
         }
+        marks.push(("build+send", Instant::now()));
         let w = wants.lock().unwrap().clone();
+        let tt = Instant::now();
         if let Some(a) = &w.agent
-            && let Ok(t) = live::tool_timeline(&idx, a, 40)
-            && !send(Msg::Timeline(a.key(), t))
+            && let Ok(t) = live::tool_timeline(&idx, a, 200)
+            && !send(Msg::Timeline(a.key(), t, live::last_message(&idx, a)))
         {
             return;
         }
-        let due = last_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(15))
-            || w.refresh_analytics;
+        marks.push(("timeline", Instant::now()));
+        if dbg {
+            eprintln!("timeline {:?}", tt.elapsed());
+        }
+        let due = last_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(30))
+            || w.refresh_analytics
+            || std::mem::take(&mut seats_changed);
         if due {
             if last_disk.is_none_or(|t| t.elapsed() > Duration::from_secs(300)) {
                 disk_cache = ctx
@@ -493,18 +558,38 @@ fn worker(
                     slow = Some((Instant::now(), d, h));
                 }
             }
+            // Period aggregates change slowly: recompute them every minute or when asked.
+            let full = w.refresh_analytics
+                || last_full_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(120));
+            let reuse = if full { None } else { prev_analytics.as_ref() };
+            // Limits every minute (their inputs move slowly; the reading itself is cached by Claude Code).
+            let limits_due =
+                full || last_limits.is_none_or(|t| t.elapsed() > Duration::from_secs(55));
             let res = analytics(
                 &ctx,
                 &idx,
                 &w,
                 &disk_cache,
                 slow.as_ref().map(|(_, d, h)| (d.clone(), h.clone())),
+                reuse,
+                if limits_due {
+                    None
+                } else {
+                    prev_analytics.as_ref().map(|p| &p.limits)
+                },
             );
+            if limits_due && res.is_ok() {
+                last_limits = Some(Instant::now());
+            }
+            if full && res.is_ok() {
+                last_full_analytics = Some(Instant::now());
+            }
             if dbg {
                 eprintln!("analytics {:?}", ta.elapsed());
             }
             match res {
                 Ok(a) => {
+                    prev_analytics = Some(a.clone());
                     if !send(Msg::Analytics(Box::new(a))) {
                         return;
                     }
@@ -522,6 +607,22 @@ fn worker(
                 std::sync::atomic::Ordering::Relaxed,
             );
             last_power = Instant::now();
+        }
+        if debug() {
+            let mut prev = tick_start;
+            let parts: Vec<String> = marks
+                .iter()
+                .map(|(n, t)| {
+                    let d = *t - prev;
+                    prev = *t;
+                    format!("{n}={:.1}", d.as_secs_f64() * 1000.0)
+                })
+                .collect();
+            eprintln!(
+                "tick {:.1}ms {}",
+                tick_start.elapsed().as_secs_f64() * 1000.0,
+                parts.join(" ")
+            );
         }
         // One second per tick (three on battery), but answer UI requests sooner.
         let steps = if eco.load(std::sync::atomic::Ordering::Relaxed) {
@@ -544,13 +645,19 @@ fn analytics(
     w: &Wants,
     disk: &[(String, u64)],
     slow: Option<(Vec<Row>, Vec<(String, String, f64)>)>,
+    prev: Option<&Analytics>,
+    prev_limits: Option<&Vec<limits::AccountReport>>,
 ) -> anyhow::Result<Analytics> {
     let (days_cached, heat_cached) = slow.unwrap_or_default();
-    let period = w.period.clone().unwrap_or(Period::LimitWeek);
+    let period = w.period.clone().unwrap_or(Period::Days(7));
     let span = period.span(ctx.now, ctx.limit_week(None));
     let f = Filter::default();
     let group = w.group.unwrap_or(Dim::Project);
-    let mut groups = idx.spend_by(group, span, &f)?;
+    let reuse = prev.filter(|p| p.period.as_ref() == Some(&period) && p.group == Some(group));
+    let mut groups = match reuse {
+        Some(p) => p.groups.clone(),
+        None => idx.spend_by(group, span, &f)?,
+    };
     if group == Dim::Account {
         for r in &mut groups {
             r.label = ctx.account_name(&r.key);
@@ -582,7 +689,7 @@ fn analytics(
             state,
         });
     }
-    let dbg = std::env::var_os("AGENTMANA_DEBUG").is_some();
+    let dbg = debug();
     macro_rules! timed {
         ($name:expr, $e:expr) => {{
             let t = Instant::now();
@@ -593,22 +700,116 @@ fn analytics(
             v
         }};
     }
+    let midnight = chrono::Local::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(ctx.now);
+    let end = ctx.now + chrono::Duration::seconds(1);
+    let mut projects: Vec<ProjectRow> = match reuse {
+        Some(prev) => prev
+            .projects
+            .iter()
+            .map(|p| ProjectRow {
+                key: p.key.clone(),
+                name: p.name.clone(),
+                period: p.period,
+                requests: p.requests,
+                ..Default::default()
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    {
+        let mut upsert = |rows: Vec<Row>, set: &dyn Fn(&mut ProjectRow, &Row)| {
+            for r in rows {
+                match projects.iter_mut().find(|p| p.key == r.key) {
+                    Some(p) => set(p, &r),
+                    None => {
+                        let mut p = ProjectRow {
+                            key: r.key.clone(),
+                            name: r.label.clone(),
+                            ..Default::default()
+                        };
+                        set(&mut p, &r);
+                        projects.push(p);
+                    }
+                }
+            }
+        };
+        if reuse.is_none() {
+            upsert(idx.spend_by(Dim::Project, span, &f)?, &|p, r| {
+                p.period = r.cost;
+                p.requests = r.requests;
+            });
+        }
+        upsert(
+            idx.spend_by(
+                Dim::Project,
+                Span {
+                    start: midnight,
+                    end,
+                },
+                &f,
+            )?,
+            &|p, r| p.today = r.cost,
+        );
+        upsert(
+            idx.spend_by(
+                Dim::Project,
+                Span {
+                    start: ctx.now - chrono::Duration::hours(1),
+                    end,
+                },
+                &f,
+            )?,
+            &|p, r| p.hour = r.cost,
+        );
+    }
+    projects.sort_by(|a, b| {
+        b.hour
+            .total_cmp(&a.hour)
+            .then(b.today.total_cmp(&a.today))
+            .then(b.period.total_cmp(&a.period))
+    });
     Ok(Analytics {
+        projects,
         period: Some(period),
         span: Some(span),
         group: Some(group),
         groups,
-        by_model: timed!("by_model", idx.spend_by(Dim::Model, span, &f)?),
-        total: timed!("total", Some(idx.total(span, &f)?)),
+        by_model: match reuse {
+            Some(p) => p.by_model.clone(),
+            None => timed!("by_model", idx.spend_by(Dim::Model, span, &f)?),
+        },
+        total: match reuse {
+            Some(p) => p.total.clone(),
+            None => timed!("total", Some(idx.total(span, &f)?)),
+        },
         days: days_cached,
         heat: heat_cached,
-        effort: timed!("effort", idx.matrix(Dim::Model, Dim::Effort, span, &f)?),
-        substitutions: timed!("subs", idx.model_substitutions(span, &f)?),
-        project_model: timed!(
-            "proj×model",
-            idx.matrix(Dim::Project, Dim::Model, span, &f)?
-        ),
-        limits: timed!("limits", limits::all_reports(ctx, idx)?),
+        effort: match reuse {
+            Some(p) => p.effort.clone(),
+            None => timed!("effort", idx.matrix(Dim::Model, Dim::Effort, span, &f)?),
+        },
+        substitutions: match reuse {
+            Some(p) => p.substitutions.clone(),
+            None => timed!("subs", idx.model_substitutions(span, &f)?),
+        },
+        project_model: match reuse {
+            Some(p) => p.project_model.clone(),
+            None => timed!(
+                "proj×model",
+                idx.matrix(Dim::Project, Dim::Model, span, &f)?
+            ),
+        },
+        limits: match prev_limits {
+            Some(l) => l.clone(),
+            None => timed!("limits", limits::all_reports(ctx, idx)?),
+        },
         logins: vault_logins,
         seats,
         transcripts_bytes: disk.to_vec(),

@@ -462,7 +462,6 @@ impl Vault {
                         self.save()?;
                     }
                 }
-                _ => {}
             }
         }
         Ok(())

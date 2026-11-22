@@ -1,17 +1,26 @@
-//! Dashboard state and input handling.
+//! Dashboard state and input.
+//!
+//! The screen is a set of panels. On a large terminal they are all visible at once (the "wall");
+//! on a medium one some are stacked in a column; on a small one they are grouped into tabs. One
+//! panel has the keyboard focus (Tab, or its number); `z` zooms it to the whole screen.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
 use chrono::{DateTime, Local, Utc};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 
 use super::theme::Theme;
 use super::{Analytics, Msg, SystemView};
 use crate::claude::registry::LiveSession;
 use crate::claude::seats::Seat;
+use crate::core::limits::WindowKind;
+use crate::core::models::context_window;
 use crate::core::period::Period;
 use crate::index::Progress;
 use crate::index::query::Dim;
@@ -19,25 +28,118 @@ use crate::live::{Agent, Snapshot, State, ToolLine};
 use crate::ui::fmt;
 use crate::vault::Vault;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Screen {
-    Ops,
-    Agents,
-    Spend,
-    Models,
+/// Every panel; the number is the key that focuses it and appears in its title.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Panel {
+    Swarm,
     Mana,
-    Vault,
+    Burn,
+    Attention,
+    Agent,
+    Projects,
+    Models,
+    History,
+    Events,
     System,
 }
 
-pub const SCREENS: [(Screen, &str); 7] = [
-    (Screen::Ops, "OPS"),
-    (Screen::Agents, "AGENTS"),
-    (Screen::Spend, "SPEND"),
-    (Screen::Models, "MODELS"),
-    (Screen::Mana, "MANA"),
-    (Screen::Vault, "VAULT"),
-    (Screen::System, "SYSTEM"),
+impl Panel {
+    pub const ALL: [Panel; 10] = [
+        Panel::Swarm,
+        Panel::Mana,
+        Panel::Burn,
+        Panel::Attention,
+        Panel::Agent,
+        Panel::Projects,
+        Panel::Models,
+        Panel::History,
+        Panel::Events,
+        Panel::System,
+    ];
+
+    pub fn number(self) -> u8 {
+        match self {
+            Panel::Swarm => 1,
+            Panel::Mana => 2,
+            Panel::Burn => 3,
+            Panel::Attention => 4,
+            Panel::Agent => 5,
+            Panel::Projects => 6,
+            Panel::Models => 7,
+            Panel::History => 8,
+            Panel::Events => 9,
+            Panel::System => 0,
+        }
+    }
+
+    pub fn from_number(n: u8) -> Panel {
+        Panel::ALL
+            .into_iter()
+            .find(|p| p.number() == n)
+            .unwrap_or(Panel::Swarm)
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Panel::Swarm => "SWARM",
+            Panel::Mana => "MANA · SEATS",
+            Panel::Burn => "BURN",
+            Panel::Attention => "ATTENTION",
+            Panel::Agent => "AGENT",
+            Panel::Projects => "PROJECTS",
+            Panel::Models => "MODELS",
+            Panel::History => "HISTORY",
+            Panel::Events => "EVENTS",
+            Panel::System => "SYSTEM",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    Auto,
+    Wall,
+    Column,
+    Tabs,
+}
+
+/// The arrangement actually drawn, chosen from the terminal size (or forced with `L`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Wall,
+    Column,
+    Tabs,
+}
+
+impl Shape {
+    pub fn pick(mode: LayoutMode, area: Rect) -> Shape {
+        match mode {
+            LayoutMode::Wall => Shape::Wall,
+            LayoutMode::Column => Shape::Column,
+            LayoutMode::Tabs => Shape::Tabs,
+            LayoutMode::Auto if area.width >= 250 && area.height >= 55 => Shape::Wall,
+            LayoutMode::Auto if area.width >= 150 && area.height >= 48 => Shape::Column,
+            LayoutMode::Auto => Shape::Tabs,
+        }
+    }
+}
+
+/// Screens of the tabs arrangement (small terminals).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Ops,
+    Agent,
+    Mana,
+    Spend,
+    System,
+}
+
+pub const TABS: [(Tab, &str, Panel); 5] = [
+    (Tab::Ops, "OPS", Panel::Swarm),
+    (Tab::Agent, "AGENT", Panel::Agent),
+    (Tab::Mana, "MANA", Panel::Mana),
+    (Tab::Spend, "SPEND", Panel::Projects),
+    (Tab::System, "SYSTEM", Panel::System),
 ];
 
 #[derive(Debug, Clone)]
@@ -66,25 +168,56 @@ pub struct Boot {
     pub skip: bool,
 }
 
+/// Something that needs a look, in order of urgency.
+#[derive(Debug, Clone)]
+pub struct Attn {
+    pub severity: u8,
+    pub glyph: &'static str,
+    pub tone: Tone,
+    pub text: String,
+    pub since: Option<DateTime<Utc>>,
+    pub target: AttnTarget,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttnTarget {
+    Agent(String),
+    Mana,
+    None,
+}
+
+/// One row of the MANA · SEATS panel.
+#[derive(Debug, Clone)]
+pub enum ManaRow {
+    Seat(String),
+    Login(String),
+}
+
 pub struct App {
     pub theme: Theme,
     pub mask: bool,
     pub paused: bool,
-    /// Low-power mode (on battery or --eco).
     pub eco: bool,
-    pub screen: Screen,
+    pub bell: bool,
+    pub layout: LayoutMode,
+    pub shape: Shape,
+    pub tab: Tab,
+    pub focus: Panel,
+    pub zoom: Option<Panel>,
     pub help: bool,
-    pub zoom: bool,
     pub boot: Option<Boot>,
     pub started: Instant,
     pub snapshot: Snapshot,
     pub live: Vec<LiveSession>,
     pub system: SystemView,
     pub analytics: Analytics,
-    pub timeline: (String, Vec<ToolLine>),
+    pub timeline: (String, Vec<ToolLine>, Option<String>),
     pub events: VecDeque<EventLine>,
     prev_states: HashMap<String, (State, String, f64)>,
-    pub selected: usize,
+    /// The selected agent, by key: rows move, the selection does not.
+    pub selected_key: Option<String>,
+    /// Per-panel cursor (lists) or scroll offset (text).
+    pub cursor: HashMap<Panel, usize>,
     pub period: Period,
     pub group: Dim,
     pub command: Option<String>,
@@ -93,6 +226,8 @@ pub struct App {
     pub toast: Option<(String, Tone, Instant)>,
     pub error: Option<String>,
     pub alerts: HashMap<String, Instant>,
+    /// Where each panel was drawn last frame, for the mouse.
+    pub rects: Vec<(Panel, Rect)>,
     analytics_request: bool,
     pub(super) seats: Vec<Seat>,
     pub(super) vault_dir: PathBuf,
@@ -100,7 +235,7 @@ pub struct App {
     pub home: PathBuf,
 }
 
-const PERIODS: [&str; 5] = ["today", "week", "7d", "30d", "all"];
+const PERIODS: [&str; 4] = ["today", "7d", "30d", "all"];
 const GROUPS: [Dim; 6] = [
     Dim::Project,
     Dim::Model,
@@ -125,9 +260,13 @@ impl App {
             mask,
             paused: false,
             eco: false,
-            screen: Screen::Ops,
+            bell: true,
+            layout: LayoutMode::Auto,
+            shape: Shape::Wall,
+            tab: Tab::Ops,
+            focus: Panel::Swarm,
+            zoom: None,
             help: false,
-            zoom: false,
             boot: Some(Boot {
                 started: Instant::now(),
                 progress: Progress::default(),
@@ -140,11 +279,12 @@ impl App {
             live: Vec::new(),
             system: SystemView::default(),
             analytics: Analytics::default(),
-            timeline: (String::new(), Vec::new()),
+            timeline: (String::new(), Vec::new(), None),
             events: VecDeque::new(),
             prev_states: HashMap::new(),
-            selected: 0,
-            period: Period::LimitWeek,
+            selected_key: None,
+            cursor: HashMap::new(),
+            period: Period::Days(7),
             group: Dim::Project,
             command: None,
             filter: None,
@@ -152,6 +292,7 @@ impl App {
             toast: None,
             error: None,
             alerts: HashMap::new(),
+            rects: Vec::new(),
             analytics_request: false,
             seats,
             vault_dir,
@@ -164,7 +305,6 @@ impl App {
         !self.paused && self.theme.animate
     }
 
-    /// Seconds since start, frozen while paused: drives every animation.
     pub fn t(&self) -> f64 {
         self.started.elapsed().as_secs_f64()
     }
@@ -177,26 +317,294 @@ impl App {
         std::mem::take(&mut self.analytics_request)
     }
 
+    pub fn cur(&self, p: Panel) -> usize {
+        self.cursor.get(&p).copied().unwrap_or(0)
+    }
+
+    fn set_cur(&mut self, p: Panel, v: usize) {
+        self.cursor.insert(p, v);
+    }
+
+    // ───────────── agents ─────────────
+
+    /// Filter chips: `p:project m:model s:seat state:needs`, anything else matches names.
     pub fn visible_agents(&self) -> Vec<&Agent> {
-        let f = self.filter.as_deref().map(str::to_lowercase);
+        let f = self.filter.as_deref().unwrap_or("").to_lowercase();
+        let terms: Vec<&str> = f.split_whitespace().collect();
         self.snapshot
             .agents
             .iter()
-            .filter(|a| match &f {
-                Some(f) if !f.is_empty() => {
-                    a.name.to_lowercase().contains(f)
-                        || a.project.to_lowercase().contains(f)
-                        || a.model.as_deref().unwrap_or("").contains(f.as_str())
-                }
-                _ => true,
+            .filter(|a| {
+                terms.iter().all(|t| match t.split_once(':') {
+                    Some(("p", v)) => a.project.to_lowercase().contains(v),
+                    Some(("m", v)) => a.model.as_deref().unwrap_or("").to_lowercase().contains(v),
+                    Some(("s", v)) => a.seat.to_lowercase().contains(v),
+                    Some(("state", v)) => format!("{:?}", a.state).to_lowercase().contains(v),
+                    _ => a.name.to_lowercase().contains(t) || a.project.to_lowercase().contains(t),
+                })
             })
             .collect()
     }
 
+    pub fn selected_index(&self) -> usize {
+        let v = self.visible_agents();
+        match &self.selected_key {
+            Some(k) => v.iter().position(|a| a.key() == *k).unwrap_or(0),
+            None => 0,
+        }
+    }
+
     pub fn selected_agent(&self) -> Option<&Agent> {
         let v = self.visible_agents();
-        v.get(self.selected.min(v.len().saturating_sub(1))).copied()
+        v.get(self.selected_index()).copied()
     }
+
+    fn move_agent(&mut self, delta: isize) {
+        let keys: Vec<String> = self.visible_agents().iter().map(|a| a.key()).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let i = self.selected_index() as isize + delta;
+        let i = i.clamp(0, keys.len() as isize - 1) as usize;
+        self.selected_key = Some(keys[i].clone());
+        self.cursor.insert(Panel::Agent, 0);
+    }
+
+    pub fn select_agent(&mut self, key: &str) {
+        self.selected_key = Some(key.to_string());
+        self.filter = None;
+        self.cursor.insert(Panel::Agent, 0);
+    }
+
+    // ───────────── accounts ─────────────
+
+    /// The 5-hour and weekly estimate of an account, with the weekly reset.
+    pub fn mana_of(
+        &self,
+        account: Option<&str>,
+    ) -> (Option<f64>, Option<f64>, Option<DateTime<Utc>>) {
+        let Some(a) = account else {
+            return (None, None, None);
+        };
+        let Some(rep) = self.analytics.limits.iter().find(|r| r.account_uuid == a) else {
+            return (None, None, None);
+        };
+        let five = rep
+            .windows
+            .iter()
+            .find(|w| w.reading.kind == WindowKind::FiveHour)
+            .map(|w| w.estimate_now);
+        let week = rep
+            .windows
+            .iter()
+            .find(|w| w.reading.kind == WindowKind::SevenDay);
+        (
+            five,
+            week.map(|w| w.estimate_now),
+            week.map(|w| w.window.end),
+        )
+    }
+
+    pub fn account_label(&self, uuid: &str) -> String {
+        self.analytics
+            .limits
+            .iter()
+            .find(|r| r.account_uuid == uuid)
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| format!("acct-{}", &uuid[..uuid.len().min(8)]))
+    }
+
+    /// Rows of the MANA · SEATS panel: every seat, then every saved login that is in no seat.
+    pub fn mana_rows(&self) -> Vec<ManaRow> {
+        let mut rows: Vec<ManaRow> = self
+            .seats
+            .iter()
+            .map(|s| ManaRow::Seat(s.label.clone()))
+            .collect();
+        let mut parked: Vec<&crate::vault::Login> = self
+            .vault
+            .logins
+            .iter()
+            .filter(|l| l.mounted.is_none())
+            .collect();
+        parked.sort_by(|a, b| {
+            let (fa, wa, _) = self.mana_of(a.account_uuid.as_deref());
+            let (fb, wb, _) = self.mana_of(b.account_uuid.as_deref());
+            let ka = fa.unwrap_or(0.0).max(wa.unwrap_or(200.0));
+            let kb = fb.unwrap_or(0.0).max(wb.unwrap_or(200.0));
+            ka.total_cmp(&kb)
+        });
+        rows.extend(parked.into_iter().map(|l| ManaRow::Login(l.label.clone())));
+        rows
+    }
+
+    // ───────────── attention ─────────────
+
+    pub fn attention(&self) -> Vec<Attn> {
+        let mut out = Vec::new();
+        let now = Utc::now();
+        for a in &self.snapshot.agents {
+            let name = if a.is_main() {
+                format!("{} · {}", a.name, a.project)
+            } else {
+                a.name.clone()
+            };
+            match &a.state {
+                State::NeedsYou(w) => out.push(Attn {
+                    severity: 0,
+                    glyph: "▲",
+                    tone: Tone::Warn,
+                    text: format!("{name}: {w}"),
+                    since: Some(a.since),
+                    target: AttnTarget::Agent(a.key()),
+                }),
+                State::Stalled => out.push(Attn {
+                    severity: 2,
+                    glyph: "✖",
+                    tone: Tone::Bad,
+                    text: format!("{name}: stalled"),
+                    since: Some(a.last_activity),
+                    target: AttnTarget::Agent(a.key()),
+                }),
+                State::Tool { name: tool, .. } if (now - a.since).num_minutes() >= 10 => {
+                    out.push(Attn {
+                        severity: 4,
+                        glyph: "◷",
+                        tone: Tone::Warn,
+                        text: format!("{name}: {tool} running {}", fmt::duration(now - a.since)),
+                        since: Some(a.since),
+                        target: AttnTarget::Agent(a.key()),
+                    })
+                }
+                _ => {}
+            }
+            if let Some(m) = &a.model {
+                let frac = a.context_tokens as f64 / context_window(m) as f64;
+                if frac >= 0.8 && a.state.is_active() {
+                    out.push(Attn {
+                        severity: 5,
+                        glyph: "◔",
+                        tone: Tone::Warn,
+                        text: format!("{name}: context {:.0}% full", frac * 100.0),
+                        since: None,
+                        target: AttnTarget::Agent(a.key()),
+                    });
+                }
+            }
+        }
+        for (kind, n) in &self.snapshot.errors_last_hour {
+            out.push(Attn {
+                severity: 3,
+                glyph: "!",
+                tone: Tone::Bad,
+                text: format!("API error {kind} ×{n} in the last hour"),
+                since: None,
+                target: AttnTarget::None,
+            });
+        }
+        for rep in &self.analytics.limits {
+            for w in &rep.windows {
+                let label = format!("{} {}", rep.name, w.reading.kind.label());
+                if w.estimate_now >= 100.0 && !w.reset_passed {
+                    out.push(Attn {
+                        severity: 1,
+                        glyph: "◆",
+                        tone: Tone::Bad,
+                        text: format!(
+                            "{label}: limit reached · resets in {}",
+                            fmt::duration(w.window.end - now)
+                        ),
+                        since: None,
+                        target: AttnTarget::Mana,
+                    });
+                } else if let Some(eta) = w.eta.filter(|d| d.num_hours() < 6) {
+                    out.push(Attn {
+                        severity: 1,
+                        glyph: "◆",
+                        tone: Tone::Warn,
+                        text: format!(
+                            "{label}: {} · empty in {}",
+                            fmt::pct(w.estimate_now),
+                            fmt::duration(eta)
+                        ),
+                        since: None,
+                        target: AttnTarget::Mana,
+                    });
+                } else if w.estimate_now >= 85.0 {
+                    out.push(Attn {
+                        severity: 6,
+                        glyph: "◆",
+                        tone: Tone::Warn,
+                        text: format!("{label}: {} used", fmt::pct(w.estimate_now)),
+                        since: None,
+                        target: AttnTarget::Mana,
+                    });
+                }
+            }
+        }
+        for s in &self.analytics.seats {
+            if s.state.unverified_since.is_some() {
+                out.push(Attn {
+                    severity: 5,
+                    glyph: "⚿",
+                    tone: Tone::Warn,
+                    text: format!("seat {}: new login, account not confirmed", s.label),
+                    since: s.state.unverified_since,
+                    target: AttnTarget::Mana,
+                });
+            } else if s.state.fingerprint.is_some() && s.login.is_none() {
+                out.push(Attn {
+                    severity: 7,
+                    glyph: "⚿",
+                    tone: Tone::Info,
+                    text: format!("seat {}: login not saved (c to save)", s.label),
+                    since: None,
+                    target: AttnTarget::Mana,
+                });
+            }
+        }
+        for l in &self.vault.logins {
+            if let Some(t) = l.meta.refresh_expires_at
+                && (t - now).num_days() < 7
+            {
+                out.push(Attn {
+                    severity: 6,
+                    glyph: "⚿",
+                    tone: Tone::Warn,
+                    text: format!("login {} expires in {}", l.label, fmt::duration(t - now)),
+                    since: None,
+                    target: AttnTarget::Mana,
+                });
+            }
+        }
+        out.sort_by_key(|a| a.severity);
+        out
+    }
+
+    fn jump_attention(&mut self, delta: isize) {
+        let items = self.attention();
+        if items.is_empty() {
+            self.toast("nothing needs attention", Tone::Good);
+            return;
+        }
+        let i =
+            (self.cur(Panel::Attention) as isize + delta).rem_euclid(items.len() as isize) as usize;
+        self.set_cur(Panel::Attention, i);
+        self.act_on_attention(&items[i]);
+    }
+
+    fn act_on_attention(&mut self, a: &Attn) {
+        match &a.target {
+            AttnTarget::Agent(k) => {
+                self.select_agent(k);
+                self.focus_panel(Panel::Swarm);
+            }
+            AttnTarget::Mana => self.focus_panel(Panel::Mana),
+            AttnTarget::None => {}
+        }
+    }
+
+    // ───────────── messages ─────────────
 
     pub(super) fn log_event(&mut self, glyph: &'static str, text: String, tone: Tone) {
         self.events.push_front(EventLine {
@@ -206,7 +614,13 @@ impl App {
             tone,
             born: Instant::now(),
         });
-        self.events.truncate(200);
+        self.events.truncate(300);
+    }
+
+    fn ring(&self) {
+        if self.bell {
+            print!("\x07");
+        }
     }
 
     pub fn on_msg(&mut self, m: Msg) {
@@ -239,26 +653,30 @@ impl App {
                 self.snapshot = *s;
                 self.live = live;
                 self.system = *sys;
-                let n = self.visible_agents().len();
-                if n > 0 && self.selected >= n {
-                    self.selected = n - 1;
+                if self.selected_key.is_none()
+                    || self
+                        .selected_agent()
+                        .is_none_or(|a| Some(a.key()) != self.selected_key)
+                {
+                    // Keep the selection when its agent is still listed, otherwise take the first.
+                    let keep = self
+                        .selected_key
+                        .as_ref()
+                        .is_some_and(|k| self.visible_agents().iter().any(|a| a.key() == *k));
+                    if !keep {
+                        self.selected_key = self.visible_agents().first().map(|a| a.key());
+                    }
                 }
             }
             Msg::Analytics(a) => {
                 self.limit_alerts(&a);
-                // The worker re-reads the vault with every analytics pass (and at once when a
-                // login file changes), so the VAULT screen follows changes made elsewhere.
-                if self.vault.modal.is_none() {
+                if self.vault.modal.is_none() && self.vault.picker.is_none() {
                     self.vault.logins = a.logins.clone();
                     self.vault.loaded = true;
-                    self.vault.login_sel = self
-                        .vault
-                        .login_sel
-                        .min(self.vault.logins.len().saturating_sub(1));
                 }
                 self.analytics = *a;
             }
-            Msg::Timeline(k, t) => self.timeline = (k, t),
+            Msg::Timeline(k, t, last) => self.timeline = (k, t, last),
             Msg::Error(e) => self.error = Some(e),
         }
     }
@@ -266,6 +684,7 @@ impl App {
     fn diff_events(&mut self, s: &Snapshot) {
         let first = self.prev_states.is_empty() && self.snapshot.taken_at.is_none();
         let mut next = HashMap::new();
+        let mut ring = false;
         for a in &s.agents {
             let key = a.key();
             let name = if a.is_main() {
@@ -299,10 +718,11 @@ impl App {
                     }
                     Some((prev, _, cost)) if *prev != a.state => match &a.state {
                         State::Done => {
+                            let took = fmt::duration(a.last_activity - a.first_seen);
                             self.log_event(
                                 "✓",
                                 format!(
-                                    "{name} done · {} · +{}",
+                                    "{name} done · {took} · {} (+{})",
                                     fmt::money(a.cost),
                                     fmt::money((a.cost - cost).max(0.0))
                                 ),
@@ -313,15 +733,16 @@ impl App {
                         State::NeedsYou(w) => {
                             self.log_event("▲", format!("{name} needs you: {w}"), Tone::Warn);
                             self.alerts.insert(key.clone(), Instant::now());
-                            if self.theme.animate {
-                                print!("\x07");
-                            }
+                            ring = true;
                         }
-                        State::Stalled => self.log_event(
-                            "✖",
-                            format!("{name} stalled (no activity for a while)"),
-                            Tone::Bad,
-                        ),
+                        State::Stalled => {
+                            self.log_event(
+                                "✖",
+                                format!("{name} stalled (no activity for a while)"),
+                                Tone::Bad,
+                            );
+                            ring = true;
+                        }
                         State::Gone if a.is_main() => {
                             self.log_event("○", format!("{name} exited"), Tone::Info)
                         }
@@ -344,10 +765,14 @@ impl App {
                 self.log_event("!", format!("API error: {kind} ×{}", n - prev), Tone::Bad);
             }
         }
+        if ring {
+            self.ring();
+        }
         self.prev_states = next;
     }
 
     fn limit_alerts(&mut self, a: &Analytics) {
+        let mut ring = false;
         for rep in &a.limits {
             for w in &rep.windows {
                 let prev = self
@@ -371,6 +796,7 @@ impl App {
                             );
                             self.alerts
                                 .insert(format!("mana:{}", rep.account_uuid), Instant::now());
+                            ring |= th >= 90.0;
                         }
                     }
                     if p >= 50.0 && w.estimate_now < 5.0 {
@@ -384,6 +810,9 @@ impl App {
                     }
                 }
             }
+        }
+        if ring {
+            self.ring();
         }
     }
 
@@ -401,14 +830,83 @@ impl App {
         }
     }
 
+    // ───────────── focus ─────────────
+
+    /// Panels on screen in the current arrangement, in Tab order.
+    pub fn visible_panels(&self) -> Vec<Panel> {
+        if let Some(z) = self.zoom {
+            return vec![z];
+        }
+        match self.shape {
+            Shape::Wall => vec![
+                Panel::Swarm,
+                Panel::Agent,
+                Panel::Mana,
+                Panel::Attention,
+                Panel::Burn,
+                Panel::Projects,
+                Panel::Models,
+                Panel::History,
+                Panel::Events,
+            ],
+            Shape::Column => vec![
+                Panel::Swarm,
+                Panel::Agent,
+                Panel::Mana,
+                Panel::Attention,
+                Panel::Projects,
+                Panel::Events,
+            ],
+            Shape::Tabs => match self.tab {
+                Tab::Ops => vec![Panel::Swarm, Panel::Mana, Panel::Attention, Panel::Events],
+                Tab::Agent => vec![Panel::Swarm, Panel::Agent],
+                Tab::Mana => vec![Panel::Mana],
+                Tab::Spend => vec![Panel::Projects, Panel::Models, Panel::History],
+                Tab::System => vec![Panel::System],
+            },
+        }
+    }
+
+    /// Focus a panel; if it is not on screen, zoom it (or switch to the tab that has it).
+    pub fn focus_panel(&mut self, p: Panel) {
+        self.focus = p;
+        if self.zoom.is_some() && self.zoom != Some(p) {
+            self.zoom = None;
+        }
+        if self.shape == Shape::Tabs {
+            if !self.visible_panels().contains(&p) {
+                self.tab = match p {
+                    Panel::Agent => Tab::Agent,
+                    Panel::Mana | Panel::Burn => Tab::Mana,
+                    Panel::Projects | Panel::Models | Panel::History => Tab::Spend,
+                    Panel::System => Tab::System,
+                    _ => Tab::Ops,
+                };
+            }
+            if !self.visible_panels().contains(&p) {
+                self.zoom = Some(p);
+            }
+        } else if !self.visible_panels().contains(&p) {
+            self.zoom = Some(p);
+        }
+        if p == Panel::Mana && !self.vault.loaded {
+            self.vault_reload();
+        }
+    }
+
+    fn cycle_focus(&mut self, delta: isize) {
+        let v = self.visible_panels();
+        let i = v.iter().position(|p| *p == self.focus).unwrap_or(0) as isize;
+        self.focus = v[(i + delta).rem_euclid(v.len() as isize) as usize];
+    }
+
+    // ───────────── keys ─────────────
+
     /// Returns true to quit.
     pub fn on_key(&mut self, k: KeyEvent) -> bool {
         if let Some(b) = &mut self.boot {
             b.skip = true;
-            if k.code == KeyCode::Char('q') {
-                return true;
-            }
-            return false;
+            return k.code == KeyCode::Char('q');
         }
         if let Some(cmd) = &mut self.command {
             match k.code {
@@ -440,74 +938,80 @@ impl App {
                 KeyCode::Char(c) => f.push(c),
                 _ => {}
             }
-            self.selected = 0;
             return false;
         }
         if self.help {
-            self.help = false;
+            if matches!(
+                k.code,
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
+            ) {
+                self.help = false;
+            }
             return false;
         }
-        if self.screen == Screen::Vault && self.vault_key(k) {
+        // Dialogs of the vault take every key.
+        if (self.vault.modal.is_some() || self.vault.picker.is_some()) && self.vault_key(k) {
             return false;
         }
-        let before = self.screen;
-        let quit = self.global_key(k);
-        if self.screen == Screen::Vault && before != Screen::Vault {
-            self.vault_reload();
+        if self.global_key(k) {
+            return true;
         }
-        quit
+        false
     }
 
+    /// Returns true to quit.
     fn global_key(&mut self, k: KeyEvent) -> bool {
-        let n = self.visible_agents().len();
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
             KeyCode::Char('q') => return true,
-            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => return true,
-            KeyCode::Esc => {
-                if self.zoom {
-                    self.zoom = false;
-                } else if self.filter.is_some() {
-                    self.filter = None;
-                } else if self.screen != Screen::Ops {
-                    self.screen = Screen::Ops;
-                }
-            }
+            KeyCode::Char('c') if ctrl => return true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::F(i) if (1..=7).contains(&i) => self.screen = SCREENS[i as usize - 1].0,
-            KeyCode::Char(c @ '1'..='7') => self.screen = SCREENS[c as usize - '1' as usize].0,
-            KeyCode::Tab => {
-                let i = SCREENS
-                    .iter()
-                    .position(|(s, _)| *s == self.screen)
-                    .unwrap_or(0);
-                self.screen = SCREENS[(i + 1) % SCREENS.len()].0;
-            }
-            KeyCode::BackTab => {
-                let i = SCREENS
-                    .iter()
-                    .position(|(s, _)| *s == self.screen)
-                    .unwrap_or(0);
-                self.screen = SCREENS[(i + SCREENS.len() - 1) % SCREENS.len()].0;
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.selected = (self.selected + 1).min(n.saturating_sub(1))
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::PageDown => self.selected = (self.selected + 10).min(n.saturating_sub(1)),
-            KeyCode::PageUp => self.selected = self.selected.saturating_sub(10),
-            KeyCode::Home => self.selected = 0,
-            KeyCode::End | KeyCode::Char('G') => self.selected = n.saturating_sub(1),
-            KeyCode::Enter => {
-                if self.screen == Screen::Ops {
-                    self.screen = Screen::Agents;
-                }
-            }
-            KeyCode::Char('z') => self.zoom = !self.zoom,
+            KeyCode::Char(':') => self.command = Some(String::new()),
             KeyCode::Char('/') => {
                 self.filter_edit = true;
                 self.filter.get_or_insert_with(String::new);
             }
-            KeyCode::Char(':') => self.command = Some(String::new()),
+            KeyCode::Tab => self.cycle_focus(1),
+            KeyCode::BackTab => self.cycle_focus(-1),
+            KeyCode::Char(c @ '0'..='9')
+                if self.shape == Shape::Tabs && ('1'..='5').contains(&c) && self.zoom.is_none() =>
+            {
+                let (t, _, p) = TABS[c as usize - '1' as usize];
+                self.tab = t;
+                self.focus = p;
+            }
+            KeyCode::Char(c @ '0'..='9') => {
+                let p = Panel::from_number(c as u8 - b'0');
+                if self.focus == p && self.visible_panels().len() > 1 {
+                    self.zoom = Some(p);
+                } else {
+                    self.focus_panel(p);
+                }
+            }
+            KeyCode::F(n) if n <= 10 => {
+                let p = Panel::from_number((n % 10) as u8);
+                self.focus_panel(p);
+            }
+            KeyCode::Char('z') => {
+                self.zoom = if self.zoom.is_some() {
+                    None
+                } else {
+                    Some(self.focus)
+                }
+            }
+            KeyCode::Esc => {
+                if self.zoom.is_some() {
+                    self.zoom = None;
+                } else if self.filter.is_some() {
+                    self.filter = None;
+                } else if self.shape == Shape::Tabs {
+                    self.tab = Tab::Ops;
+                    self.focus = Panel::Swarm;
+                }
+            }
+            KeyCode::Char('n') => self.jump_attention(1),
+            KeyCode::Char('N') => self.jump_attention(-1),
+            KeyCode::Char('J') => self.jump(),
             KeyCode::Char('m') => {
                 self.mask = !self.mask;
                 self.toast(
@@ -534,6 +1038,19 @@ impl App {
                 self.theme = self.theme.next();
                 self.toast(format!("theme: {}", self.theme.name), Tone::Info);
             }
+            KeyCode::Char('L') => {
+                self.layout = match self.layout {
+                    LayoutMode::Auto => LayoutMode::Wall,
+                    LayoutMode::Wall => LayoutMode::Column,
+                    LayoutMode::Column => LayoutMode::Tabs,
+                    LayoutMode::Tabs => LayoutMode::Auto,
+                };
+                self.zoom = None;
+                self.toast(
+                    format!("layout: {:?}", self.layout).to_lowercase(),
+                    Tone::Info,
+                );
+            }
             KeyCode::Char('t') => {
                 let cur = PERIODS
                     .iter()
@@ -541,33 +1058,126 @@ impl App {
                     .unwrap_or(1);
                 self.period = PERIODS[(cur + 1) % PERIODS.len()]
                     .parse()
-                    .unwrap_or(Period::LimitWeek);
-                self.analytics_request = true;
+                    .unwrap_or(Period::Days(7));
+                self.request_analytics();
                 self.toast(format!("period: {}", self.period.label()), Tone::Info);
             }
-            KeyCode::Char('s') if self.screen == Screen::Spend => {
+            KeyCode::Char('g') => {
                 let cur = GROUPS.iter().position(|g| *g == self.group).unwrap_or(0);
                 self.group = GROUPS[(cur + 1) % GROUPS.len()];
-                self.analytics_request = true;
+                self.request_analytics();
                 self.toast(
-                    format!("group by {}", self.group.title().to_lowercase()),
+                    format!("spend grouped by {}", self.group.title().to_lowercase()),
                     Tone::Info,
                 );
             }
-            KeyCode::Char('J') => self.jump(),
-            _ => {}
+            _ => self.panel_key(k),
         }
         false
     }
 
-    pub fn on_mouse(&mut self, m: MouseEvent) {
-        match m.kind {
-            MouseEventKind::ScrollDown => {
-                self.selected =
-                    (self.selected + 1).min(self.visible_agents().len().saturating_sub(1))
+    fn list_len(&self, p: Panel) -> usize {
+        match p {
+            Panel::Attention => self.attention().len(),
+            Panel::Projects => self.analytics.projects.len(),
+            Panel::Events => self.events.len(),
+            Panel::Agent => self.timeline.1.len(),
+            _ => 0,
+        }
+    }
+
+    fn panel_key(&mut self, k: KeyEvent) {
+        let step: isize = match k.code {
+            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::Up | KeyCode::Char('k') => -1,
+            KeyCode::PageDown => 10,
+            KeyCode::PageUp => -10,
+            KeyCode::Home => -100_000,
+            KeyCode::End => 100_000,
+            _ => 0,
+        };
+        match self.focus {
+            Panel::Swarm => {
+                if step != 0 {
+                    self.move_agent(step);
+                } else if k.code == KeyCode::Enter {
+                    self.focus_panel(Panel::Agent);
+                }
             }
-            MouseEventKind::ScrollUp => self.selected = self.selected.saturating_sub(1),
+            Panel::Mana => {
+                self.vault_key(k);
+            }
+            Panel::Attention if k.code == KeyCode::Enter => {
+                let items = self.attention();
+                if let Some(a) = items.get(self.cur(Panel::Attention)).cloned() {
+                    self.act_on_attention(&a);
+                }
+            }
+            Panel::Projects if k.code == KeyCode::Enter => {
+                if let Some(p) = self.analytics.projects.get(self.cur(Panel::Projects)) {
+                    self.filter = Some(format!("p:{}", p.name.to_lowercase()));
+                    self.toast(format!("agents of {} (Esc clears)", p.name), Tone::Info);
+                    self.focus_panel(Panel::Swarm);
+                }
+            }
+            p @ (Panel::Attention | Panel::Projects | Panel::Events | Panel::Agent)
+                if step != 0 =>
+            {
+                let n = self.list_len(p).max(1);
+                let v = (self.cur(p) as isize + step).clamp(0, n as isize - 1) as usize;
+                self.set_cur(p, v);
+            }
             _ => {}
+        }
+    }
+
+    pub fn on_mouse(&mut self, m: MouseEvent) {
+        let hit = self
+            .rects
+            .iter()
+            .find(|(_, r)| {
+                m.column >= r.x
+                    && m.column < r.x + r.width
+                    && m.row >= r.y
+                    && m.row < r.y + r.height
+            })
+            .map(|(p, r)| (*p, *r));
+        let Some((p, r)) = hit else { return };
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = p;
+                // A click on an agent row selects it (rows start two lines below the border).
+                if p == Panel::Swarm {
+                    let row = m.row.saturating_sub(r.y + 2) as usize;
+                    let keys: Vec<String> = self.visible_agents().iter().map(|a| a.key()).collect();
+                    let first = self.swarm_offset(r.height.saturating_sub(3) as usize);
+                    if let Some(k) = keys.get(first + row) {
+                        self.selected_key = Some(k.clone());
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let prev = self.focus;
+                self.focus = p;
+                let code = if m.kind == MouseEventKind::ScrollDown {
+                    KeyCode::Down
+                } else {
+                    KeyCode::Up
+                };
+                self.panel_key(KeyEvent::new(code, KeyModifiers::NONE));
+                self.focus = prev;
+            }
+            _ => {}
+        }
+    }
+
+    /// First visible row of the agent list for a list `rows` tall (keeps the selection on screen).
+    pub fn swarm_offset(&self, rows: usize) -> usize {
+        let sel = self.selected_index();
+        if rows == 0 || sel < rows {
+            0
+        } else {
+            sel + 1 - rows
         }
     }
 
@@ -585,7 +1195,6 @@ impl App {
             self.toast("this session is not running inside tmux", Tone::Warn);
             return;
         };
-        // "0:@0.%6": session 0, window @0, pane %6.
         let (session, rest) = pane.split_once(':').unwrap_or(("", pane.as_str()));
         let (window, pane_id) = rest.split_once('.').unwrap_or((rest, ""));
         if std::env::var_os("TMUX").is_none() {
@@ -623,11 +1232,20 @@ impl App {
             ["period", p] => match p.parse::<Period>() {
                 Ok(p) => {
                     self.period = p;
-                    self.analytics_request = true;
+                    self.request_analytics();
                 }
                 Err(e) => self.toast(e, Tone::Bad),
             },
             ["theme", t] => self.theme = Theme::named(Some(t)),
+            ["layout", l] => {
+                self.layout = match *l {
+                    "wall" => LayoutMode::Wall,
+                    "column" => LayoutMode::Column,
+                    "tabs" => LayoutMode::Tabs,
+                    _ => LayoutMode::Auto,
+                }
+            }
+            ["filter", rest @ ..] => self.filter = Some(rest.join(" ")),
             ["capture", seat] | ["capture", seat, _] => {
                 let label = parts.get(2).copied();
                 let res = self.with_vault(|v, seats| {
@@ -638,31 +1256,12 @@ impl App {
                     Ok(_) => self.toast(format!("saved the login of seat '{seat}'"), Tone::Good),
                     Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
                 }
-                self.analytics_request = true;
+                self.vault_reload();
+                self.request_analytics();
             }
-            ["switch", seat, login] | ["switch", seat, login, "force"] => {
-                let force = parts.len() == 4;
-                let live_here = self.live.iter().filter(|l| l.seat == *seat).count();
-                if live_here > 0 && !force {
-                    self.toast(format!("Claude Code runs in '{seat}' ({live_here}); add `force` to switch anyway"), Tone::Warn);
-                    return false;
-                }
-                let res = self.with_vault(|v, seats| {
-                    let s = seats.iter().find(|s| s.label == *seat).ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
-                    v.switch(s, login, false)
-                });
-                match res {
-                    Ok(r) => {
-                        self.log_event("⚿", format!("seat {} → {} (was {})", r.seat, r.to, r.from.as_deref().unwrap_or("-")), Tone::Accent);
-                        self.alerts.insert("vault".into(), Instant::now());
-                        self.toast(format!("seat '{}' now uses '{}'", r.seat, r.to), Tone::Good);
-                    }
-                    Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
-                }
-                self.analytics_request = true;
-            }
+            ["switch", seat, login] => self.request_switch(seat.to_string(), login.to_string()),
             [] => {}
-            _ => self.toast("commands: switch <seat> <login> [force] · capture <seat> [label] · period <p> · theme <name> · q", Tone::Info),
+            _ => self.toast("commands: switch <seat> <login> · capture <seat> [label] · period 7d · filter p:shop · layout wall|column|tabs · theme <name> · q", Tone::Info),
         }
         false
     }
@@ -684,10 +1283,9 @@ impl App {
 fn period_key(p: &Period) -> &'static str {
     match p {
         Period::Today => "today",
-        Period::LimitWeek => "week",
         Period::Days(7) => "7d",
         Period::Days(30) => "30d",
         Period::All => "all",
-        _ => "week",
+        _ => "7d",
     }
 }

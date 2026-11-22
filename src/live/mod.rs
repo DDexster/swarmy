@@ -81,6 +81,17 @@ pub struct Agent {
     pub tmux: Option<String>,
     pub pid: Option<u32>,
     pub account: Option<String>,
+    /// When the agent first appeared: the stable sort key of the tree.
+    pub first_seen: DateTime<Utc>,
+    /// Main threads only: the whole session (main thread and all its agents).
+    pub session_cost: f64,
+    /// Main threads only: session spend over the last hour.
+    pub session_burn: f64,
+    /// Main threads only: CPU % and resident bytes of the Claude Code process.
+    pub cpu: f32,
+    pub memory: u64,
+    /// Time of the last request, to tell whether anything changed since the last snapshot.
+    pub last_request_ts: Option<i64>,
 }
 
 impl Agent {
@@ -119,6 +130,18 @@ pub struct Snapshot {
     pub burn_per_hour: f64,
     pub today_cost: f64,
     pub errors_last_hour: Vec<(String, u64)>,
+    /// Agents that finished in the last hours, newest first.
+    pub recent_done: Vec<DoneRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DoneRow {
+    pub name: String,
+    pub project: String,
+    pub model: Option<String>,
+    pub started: DateTime<Utc>,
+    pub finished: DateTime<Utc>,
+    pub cost: f64,
 }
 
 impl Snapshot {
@@ -155,6 +178,7 @@ struct Row {
     effort: Option<String>,
     finished: bool,
     last_ts: Option<i64>,
+    first_ts: Option<i64>,
     title: Option<String>,
     cwd: Option<String>,
 }
@@ -162,8 +186,14 @@ struct Row {
 pub fn build(
     idx: &Index,
     live: &[LiveSession],
+    procs: &crate::claude::procs::ProcTable,
     opts: &Options,
     now: DateTime<Utc>,
+    // Session totals and the recently-done list change slowly: when `prev` is given they are
+    // carried over instead of recomputed.
+    prev: Option<&Snapshot>,
+    // The previous snapshot, always: per-agent totals are reused when nothing new arrived.
+    prev_all: Option<&Snapshot>,
 ) -> anyhow::Result<Snapshot> {
     let conn = &idx.conn;
     let recent = ms(now - Duration::minutes(opts.stall_minutes.max(30)));
@@ -177,7 +207,7 @@ pub fn build(
     {
         let mut st = conn.prepare(
             "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
-                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd
+                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts
              FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
              WHERE a.last_ts >= ?1 OR (a.finished = 0 AND a.last_ts >= ?2) OR a.agent_id = ''",
         )?;
@@ -197,6 +227,7 @@ pub fn build(
                 last_ts: r.get(11)?,
                 title: r.get(12)?,
                 cwd: r.get(13)?,
+                first_ts: r.get(14)?,
             })
         })?;
         for row in it {
@@ -229,6 +260,7 @@ pub fn build(
                 effort: None,
                 finished: true,
                 last_ts: None,
+                first_ts: Some(l.started_at.timestamp_millis()),
                 title: l.name.clone(),
                 cwd: Some(l.cwd.clone()),
             });
@@ -270,10 +302,20 @@ pub fn build(
                 ))
             })
             .unwrap_or((None, None, None, None, None));
-        let (requests, cost): (i64, Option<f64>) = totals
-            .query_row(params![r.seat, r.session_id, r.agent_id], |x| {
+        // Nothing new since the previous snapshot: reuse its totals and sparkline.
+        let unchanged = prev_all
+            .and_then(|p| {
+                p.agents.iter().find(|o| {
+                    o.seat == r.seat && o.session_id == r.session_id && o.agent_id == r.agent_id
+                })
+            })
+            .filter(|o| o.last_request_ts == req_ts);
+        let (requests, cost): (i64, Option<f64>) = match unchanged {
+            Some(o) => (o.requests as i64, Some(o.cost)),
+            None => totals.query_row(params![r.seat, r.session_id, r.agent_id], |x| {
                 Ok((x.get(0)?, x.get(1)?))
-            })?;
+            })?,
+        };
         let tool = match req_ts {
             Some(t) => open_tool
                 .query_row(params![r.seat, r.session_id, r.agent_id, t], |x| {
@@ -290,6 +332,9 @@ pub fn build(
             .query_row(params![r.seat, r.session_id, r.agent_id], |x| x.get(0))
             .unwrap_or(None);
         let mut sp = vec![0.0; 15];
+        let reuse_spark = unchanged
+            .filter(|_| prev.is_some())
+            .map(|o| o.spark.clone());
         let it = spark.query_map(
             params![r.seat, r.session_id, r.agent_id, spark_start],
             |x| {
@@ -299,7 +344,7 @@ pub fn build(
                 ))
             },
         )?;
-        for row in it {
+        for row in it.take(if reuse_spark.is_some() { 0 } else { usize::MAX }) {
             let (i, c) = row?;
             if (0..15).contains(&i) {
                 sp[i as usize] = c;
@@ -410,10 +455,16 @@ pub fn build(
             cost: cost.unwrap_or(0.0),
             requests: requests as u64,
             context_tokens: ctx_tokens.unwrap_or(0) as u64,
-            spark: sp,
+            spark: reuse_spark.unwrap_or(sp),
             tmux: live_session.and_then(|l| l.tmux.clone()),
             pid: live_session.map(|l| l.pid),
             account,
+            first_seen: r.first_ts.map(from_ms).unwrap_or(last),
+            session_cost: 0.0,
+            session_burn: 0.0,
+            cpu: 0.0,
+            memory: 0,
+            last_request_ts: req_ts,
         });
     }
 
@@ -435,6 +486,40 @@ pub fn build(
         }
     }
 
+    // Session totals for the main rows.
+    if let Some(p) = prev {
+        for a in agents.iter_mut().filter(|a| a.is_main()) {
+            if let Some(o) = p
+                .agents
+                .iter()
+                .find(|o| o.is_main() && o.seat == a.seat && o.session_id == a.session_id)
+            {
+                a.session_cost = o.session_cost.max(a.cost);
+                a.session_burn = o.session_burn;
+            }
+            if let Some(n) = a.pid.and_then(|pid| procs.nodes.get(&pid)) {
+                a.cpu = n.cpu;
+                a.memory = n.memory;
+            }
+        }
+    } else {
+        let hour_ago = ms(now - Duration::hours(1));
+        let mut st = conn.prepare(
+            "SELECT SUM(MAX(cost, 0)), SUM(CASE WHEN ts >= ?3 THEN MAX(cost, 0) ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
+        )?;
+        for a in agents.iter_mut().filter(|a| a.is_main()) {
+            let (total, hour): (Option<f64>, Option<f64>) = st
+                .query_row(params![a.seat, a.session_id, hour_ago], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            a.session_cost = total.unwrap_or(0.0);
+            a.session_burn = hour.unwrap_or(0.0);
+            if let Some(n) = a.pid.and_then(|p| procs.nodes.get(&p)) {
+                a.cpu = n.cpu;
+                a.memory = n.memory;
+            }
+        }
+    }
     let agents = order_forest(agents);
     let mut snap = Snapshot {
         taken_at: Some(now),
@@ -479,6 +564,49 @@ pub fn build(
             |r| r.get::<_, Option<f64>>(0),
         )?
         .unwrap_or(0.0);
+    // Recently finished agents (the history under the live tree).
+    if let Some(p) = prev {
+        snap.recent_done = p.recent_done.clone();
+    } else {
+        let mut st = conn.prepare(
+            "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
+                    (SELECT SUM(MAX(cost, 0)) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1)
+             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
+             WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60",
+        )?;
+        let since = ms(now - Duration::hours(6));
+        let rows = st.query_map(params![since], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        for row in rows {
+            let (name, cwd, first, last, cost, model) = row?;
+            let project = cwd
+                .as_ref()
+                .and_then(|c| projects.get(c).cloned())
+                .unwrap_or_else(|| {
+                    cwd.as_deref()
+                        .map(|c| c.rsplit('/').next().unwrap_or(c).to_string())
+                        .unwrap_or_default()
+                });
+            let finished = last.map(from_ms).unwrap_or(now);
+            snap.recent_done.push(DoneRow {
+                name,
+                project,
+                model,
+                started: first.map(from_ms).unwrap_or(finished),
+                finished,
+                cost: cost.unwrap_or(0.0),
+            });
+        }
+    }
     let mut st = conn.prepare("SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 GROUP BY 1")?;
     snap.errors_last_hour = st
         .query_map(params![start], |r| {
@@ -488,13 +616,15 @@ pub fn build(
     Ok(snap)
 }
 
-/// Main threads by state then activity; each followed by its agents as a tree.
+/// A stable tree: running sessions before exited ones, each in the order it started, followed by
+/// its agents in spawn order. States change every second; positions must not, or the selection
+/// and the reader's eye jump around.
 fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
     agents.sort_by(|a, b| {
-        a.state
-            .rank()
-            .cmp(&b.state.rank())
-            .then(b.last_activity.cmp(&a.last_activity))
+        (a.state == State::Gone)
+            .cmp(&(b.state == State::Gone))
+            .then(a.first_seen.cmp(&b.first_seen))
+            .then(a.agent_id.cmp(&b.agent_id))
     });
     let mains: Vec<Agent> = agents.iter().filter(|a| a.is_main()).cloned().collect();
     let mut used = HashSet::new();
@@ -535,6 +665,35 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
         }
     }
     out
+}
+
+/// The last text the agent wrote (read from the tail of its transcript).
+pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path: String = idx
+        .conn
+        .query_row(
+            "SELECT path FROM files WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
+            params![a.seat, a.session_id, a.agent_id],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(256 * 1024);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = String::new();
+    f.read_to_string(&mut buf).ok()?;
+    let mut events = Vec::new();
+    let mut stats = crate::claude::transcript::ParseStats::default();
+    // Skip the first, probably partial, line.
+    for line in buf.lines().skip(if start > 0 { 1 } else { 0 }) {
+        crate::claude::transcript::parse_line(line, &mut events, &mut stats);
+    }
+    events.iter().rev().find_map(|e| match e {
+        crate::claude::transcript::Event::Request(r) => r.text.clone(),
+        _ => None,
+    })
 }
 
 /// The latest tool calls of one agent, newest first.
@@ -583,6 +742,12 @@ mod tests {
             tmux: None,
             pid: None,
             account: None,
+            first_seen: Utc::now(),
+            session_cost: 0.0,
+            session_burn: 0.0,
+            cpu: 0.0,
+            memory: 0,
+            last_request_ts: None,
         }
     }
 

@@ -27,6 +27,9 @@ pub struct Ctx {
     pub painter: Painter,
     pub mask: bool,
     pub now: DateTime<Utc>,
+    /// Saved logins by account: names and plan tiers for accounts not in any seat right now.
+    pub login_labels: std::collections::BTreeMap<String, String>,
+    pub login_tiers: std::collections::BTreeMap<String, String>,
 }
 
 impl Ctx {
@@ -71,6 +74,8 @@ impl Ctx {
             painter,
             mask,
             now: Utc::now(),
+            login_labels: Default::default(),
+            login_tiers: Default::default(),
         };
         ctx.drop_unconfirmed();
         Ok(ctx)
@@ -82,6 +87,19 @@ impl Ctx {
         let Ok(mut v) = crate::vault::Vault::open(&self.dirs.vault_dir()) else {
             return;
         };
+        // Names and plan tiers of saved logins, for accounts that are in no seat right now.
+        self.login_labels.clear();
+        self.login_tiers.clear();
+        for l in v.logins() {
+            if let Some(a) = &l.account_uuid {
+                self.login_labels
+                    .entry(a.clone())
+                    .or_insert_with(|| l.label.clone());
+                if let Some(t) = l.plan.clone().or_else(|| l.meta.rate_limit_tier.clone()) {
+                    self.login_tiers.insert(a.clone(), t);
+                }
+            }
+        }
         let Ok(states) = v.seat_states(&self.seats) else {
             return;
         };
@@ -117,7 +135,7 @@ impl Ctx {
                 utilization: cj.utilization,
             });
         }
-        Ok(Ctx {
+        let mut ctx = Ctx {
             dirs,
             config: Config::default(),
             seats,
@@ -127,7 +145,11 @@ impl Ctx {
             painter,
             mask: false,
             now: Utc::now(),
-        })
+            login_labels: Default::default(),
+            login_tiers: Default::default(),
+        };
+        ctx.drop_unconfirmed();
+        Ok(ctx)
     }
 
     /// Opens the index and reads whatever changed since the last run. The first run shows
@@ -192,6 +214,9 @@ impl Ctx {
             .collect();
         if !seats.is_empty() {
             return seats.join("+");
+        }
+        if let Some(l) = self.login_labels.get(uuid) {
+            return l.clone();
         }
         if !self.mask
             && let Some(e) = self

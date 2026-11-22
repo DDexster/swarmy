@@ -42,6 +42,23 @@ impl Family {
     }
 }
 
+/// Context window in tokens: 1M for the current models, 200K for Haiku 4.5 and older ones.
+pub fn context_window(model: &str) -> u64 {
+    let m = model.to_ascii_lowercase();
+    let old = m.contains("claude-3")
+        || m.contains("haiku-4")
+        || [
+            "opus-4-1",
+            "opus-4-5",
+            "sonnet-4-5",
+            "opus-4-2025",
+            "sonnet-4-2025",
+        ]
+        .iter()
+        .any(|x| m.contains(x));
+    if old { 200_000 } else { 1_000_000 }
+}
+
 /// `claude-opus-5-5` → `opus-5.5`, `claude-haiku-4-5-20251001` → `haiku-4.5`,
 /// `claude-3-5-sonnet-20241022` → `sonnet-3.5`. Unknown ids are returned unchanged.
 pub fn short_name(model: &str) -> String {
