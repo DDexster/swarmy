@@ -118,8 +118,8 @@ impl Ctx {
     pub fn demo(painter: Painter, seats: Vec<Seat>, root: &std::path::Path) -> anyhow::Result<Ctx> {
         let base = Dirs::resolve()?;
         let dirs = Dirs {
-            data: root.join("agentmana-data"),
-            config: root.join("agentmana-config"),
+            data: root.join("swarmy-data"),
+            config: root.join("swarmy-config"),
             home: base.home,
         };
         let mut prices = PriceBook::builtin();

@@ -3,33 +3,6 @@
 version = 4
 
 [[package]]
-name = "agentmana"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "clap_complete",
- "clap_mangen",
- "crossterm",
- "directories",
- "hex",
- "owo-colors",
- "pretty_assertions",
- "ratatui",
- "rayon",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.21",
- "toml",
- "unicode-width",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1861,6 +1834,33 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "swarmy"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "clap_complete",
+ "clap_mangen",
+ "crossterm",
+ "directories",
+ "hex",
+ "owo-colors",
+ "pretty_assertions",
+ "ratatui",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "unicode-width",
 ]
 
 [[package]]

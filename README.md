@@ -1,17 +1,25 @@
-# agentmana
+# swarmy
 
 Mission control for Claude Code agents, in your terminal.
 
-![agentmana dashboard](docs/img/demo.gif)
+![swarmy boot: the swarm assembles](docs/img/boot.gif)
+
+![swarmy dashboard](docs/img/demo.gif)
 
 Run several Claude Code instances (with different `CLAUDE_CONFIG_DIR`s), each with dozens of
 subagents, and see in one place:
 
-- **what every agent is doing right now** — thinking, running `cargo test`, waiting for you,
-  waiting for its children, stalled — as a live tree, with timers, context fill and cost tickers;
+- **dozens of agents across all your Claude Code sessions at once** — what each one is doing right
+  now (thinking, running `cargo test`, waiting for its children, stalled), as a live tree with
+  30-minute activity lanes, timers, context fill and cost;
+- **the moment an agent needs you** — a question, a permission, a plan to approve: it blinks in
+  the tree, rings the terminal bell, goes to the top of ATTENTION, and `n` selects it;
+- **one key to get there** — `J` switches your tmux client to the pane where that Claude Code
+  runs (Claude Code records its tmux pane; swarmy selects that window and pane and switches the
+  client to its session), so you answer and come back;
 - **what it would cost at API prices**, by project, account, model, agent type, session, day;
 - **where your weekly limit went**, in % per project, and **when it will run out** at the current
-  burn rate;
+  burn rate — also when you swap logins between config dirs or reset a limit by hand;
 - **how each model is used** (Opus, Fable, Sonnet, Haiku): cost share, cache hits, thinking, effort
   mix, requested-vs-served substitutions;
 - **CPU, RAM and disk** taken by the agents and their child processes.
@@ -29,13 +37,13 @@ On a big terminal everything is on one wall; nothing hides behind tabs.
 
 | | |
 |---|---|
-| ![column](docs/img/column.png) **Half a screen (160×81)** — mana and attention on top, the swarm, the selected agent, projects and events stacked | ![tabs](docs/img/tabs.png) **A laptop terminal (140×34)** — the same panels grouped into five tabs |
+| ![column](docs/img/column.png) **Half a screen (160×81)** — limits and attention on top, then the swarm, the selected agent, projects and efficiency | ![tabs](docs/img/tabs.png) **A laptop terminal (140×34)** — the same panels grouped into five tabs |
 | ![vault](docs/img/vault-picker.png) **Switching a login** — Enter on a seat lists the saved logins, the one with the most limit left first | |
 
 The panels:
 
 - **1 SWARM** — live agents grouped by session (sessions are separated, project names stand out), each with a 30-minute activity lane (thinking · tool · waiting for agents · waiting for you; `v` switches to spend), then what finished recently
-- **2 MANA · SEATS** — how much of each account's weekly limit is used ("week used", "runs out in …"), seats, and the saved logins of the vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
+- **2 LIMITS · SEATS** — how much of each account's weekly limit is used ("week used", "runs out in …"), seats, and the saved logins of the vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
 - **3 BURN** — dollars per hour and per minute by model
 - **4 ATTENTION** — needs you, stalled, limits about to run out, two agents editing one file, unsaved or expiring logins; the event log under it (filled from the last 3 hours on launch)
 - **5 AGENT** — card, last message, the agent's life (cost of each request, context growth, compactions), tool timeline
@@ -48,7 +56,7 @@ The panels:
 Try it without touching your own data:
 
 ```sh
-agentmana demo
+swarmy demo
 ```
 
 ## Install
@@ -57,24 +65,18 @@ agentmana demo
 cargo install --path .
 ```
 
-Optionally give it a short name (packages ship only `agentmana`, because `am` collides with other
-tools):
-
-```sh
-agentmana shell-alias          # adds `alias am=agentmana` to your shell rc
-```
 
 ## Use
 
 ```sh
-agentmana                       # the live dashboard
-agentmana limits                # weekly / 5-hour limits: shares per project, ETA
-agentmana report --by project   # spend; --by account|seat|model|effort|agent-type|session|agent|day|hour|weekday
-agentmana report -p 30d --by day --format csv
-agentmana models -p 7d          # per-model statistics
-agentmana accounts              # seats, saved logins, limit left on each
-agentmana doctor                # what was found and whether it is readable
-agentmana prices                # the price in force for every model and its source
+swarmy                       # the live dashboard
+swarmy limits                # weekly / 5-hour limits: shares per project, ETA
+swarmy report --by project   # spend; --by account|seat|model|effort|agent-type|session|agent|day|hour|weekday
+swarmy report -p 30d --by day --format csv
+swarmy models -p 7d          # per-model statistics
+swarmy accounts              # seats, saved logins, limit left on each
+swarmy doctor                # what was found and whether it is readable
+swarmy prices                # the price in force for every model and its source
 ```
 
 Periods: `today`, `yesterday`, `week` (the current limit window), `month`, `all`, `24h`, `7d`,
@@ -101,7 +103,7 @@ below that (`L` cycles them).
 | `←→` in HISTORY | pick a day: its spend by model and the change against the day before |
 | `t` · `g` | period (today, 7d, 30d, all) · spend grouping |
 | `?` | keys and a legend of every glyph, number, colour and word (on small screens `Tab` flips between them) |
-| MANA: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
+| LIMITS: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
 | `m` · `p` · `T` · `?` · `q` | mask · pause animations · theme · help · quit |
 
 ### Light on the battery
@@ -129,7 +131,7 @@ with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
   and the gap on the others is shown as *elsewhere*. All of this is an estimate (≈): how Anthropic
   meters limits is not public.
 - **Limit resets.** When a limit is reset early (Claude Code's limit reset), utilization falls
-  while the window is still open; agentmana notices the fall between two readings and counts the
+  while the window is still open; swarmy notices the fall between two readings and counts the
   window from there.
 - **Accounts** are tracked per request (`session-owner` records), so seats logged into the same
   account share one limit, and switching logins does not mix the books.
@@ -138,11 +140,11 @@ with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
 ## The vault
 
 ```sh
-agentmana accounts capture work --label alice      # save the login of seat "work"
-agentmana accounts add --label bob                 # log into another account in a scratch seat
-agentmana accounts switch work bob                 # put bob into seat "work"
-agentmana accounts switch work alice               # and back
-agentmana accounts import old-backup.json --label carol
+swarmy accounts capture work --label alice      # save the login of seat "work"
+swarmy accounts add --label bob                 # log into another account in a scratch seat
+swarmy accounts switch work bob                 # put bob into seat "work"
+swarmy accounts switch work alice               # and back
+swarmy accounts import old-backup.json --label carol
 ```
 
 A switch first saves whatever the seat holds — a login that is not in the vault yet is saved
@@ -157,7 +159,7 @@ shown as *not saved*, and — until Claude Code re-reads the profile in that sea
 *unconfirmed*, so it is not mixed up with the account the stale profile names. In the dashboard the
 VAULT screen updates as soon as a login file changes; `R` forces a re-read.
 
-Secrets are kept in `~/.local/share/agentmana/vault/secrets.json` with mode 0600 — the same
+Secrets are kept in `~/.local/share/swarmy/vault/secrets.json` with mode 0600 — the same
 protection Claude Code gives the same tokens in `.credentials.json`. On macOS, where Claude Code
 keeps the login in the Keychain, the vault cannot switch logins yet.
 
@@ -167,11 +169,11 @@ Use it with your own accounts, within your provider's terms.
 
 - No network access, no telemetry.
 - Claude Code's directories are only read. The only write is an explicit `accounts switch`.
-- The index lives in `~/.local/share/agentmana/` (macOS: `~/Library/Application Support/agentmana`).
+- The index lives in `~/.local/share/swarmy/` (macOS: `~/Library/Application Support/swarmy`).
 
 ## Configuration
 
-Optional, `~/.config/agentmana/config.toml`:
+Optional, `~/.config/swarmy/config.toml`:
 
 ```toml
 stall_minutes = 20                 # unfinished agent with no activity this long = stalled

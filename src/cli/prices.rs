@@ -1,4 +1,4 @@
-//! `agentmana prices`: the price in force for every model, and where it comes from.
+//! `swarmy prices`: the price in force for every model, and where it comes from.
 
 use std::collections::BTreeMap;
 

@@ -1,4 +1,4 @@
-//! `agentmana models`: usage statistics per model.
+//! `swarmy models`: usage statistics per model.
 
 use std::collections::BTreeMap;
 

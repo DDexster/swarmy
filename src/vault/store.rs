@@ -67,7 +67,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .file_name()
         .context("path without a file name")?
         .to_string_lossy();
-    let tmp = dir.join(format!(".{name}.agentmana-{}.tmp", std::process::id()));
+    let tmp = dir.join(format!(".{name}.swarmy-{}.tmp", std::process::id()));
     {
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create(true).truncate(true);
@@ -146,7 +146,7 @@ impl Lock {
                         pid.is_some_and(|p| crate::claude::procs::ProcTable::snapshot().alive(p));
                     if alive {
                         bail!(
-                            "another agentmana is changing the vault (pid {})",
+                            "another swarmy is changing the vault (pid {})",
                             pid.unwrap()
                         );
                     }

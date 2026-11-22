@@ -1,4 +1,4 @@
-//! `agentmana doctor`: what was found, what is readable, what looks off.
+//! `swarmy doctor`: what was found, what is readable, what looks off.
 
 use chrono::Duration;
 
@@ -205,7 +205,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         println!(
             "{}",
             warn(&format!(
-                "{} requests in the last 7 days have no price (see `agentmana prices`)",
+                "{} requests in the last 7 days have no price (see `swarmy prices`)",
                 total.unpriced
             ))
         );

@@ -34,10 +34,10 @@ use crate::vault::{Login, Vault};
 
 pub use app::App;
 
-/// `AGENTMANA_DEBUG=1` prints timings to stderr (read once).
+/// `SWARMY_DEBUG=1` prints timings to stderr (read once).
 fn debug() -> bool {
     static D: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *D.get_or_init(|| std::env::var_os("AGENTMANA_DEBUG").is_some())
+    *D.get_or_init(|| std::env::var_os("SWARMY_DEBUG").is_some())
 }
 pub use boot::hash;
 
@@ -173,7 +173,10 @@ fn ui_loop(
         let started = Instant::now();
         app.eco = eco.load(std::sync::atomic::Ordering::Relaxed);
         // 10 frames a second for animations, 4 in eco mode, 2 when nothing moves.
-        let frame_time = Duration::from_millis(if !app.animating() {
+        let frame_time = Duration::from_millis(if app.boot.is_some() {
+            // The boot swarm: 30 frames a second for two seconds.
+            33
+        } else if !app.animating() {
             500
         } else if app.eco {
             500
@@ -288,7 +291,8 @@ pub fn record(
         }
         term.draw(|f| view::draw(f, &mut app))?;
         sync_wants(&mut app, &wants);
-        if live && !app.analytics.limits.is_empty() || app.boot.is_some() && frame == usize::MAX {
+        let boot_rec = app.boot.is_some() && std::env::var_os("SWARMY_RECORD_BOOT").is_some();
+        if live && !app.analytics.limits.is_empty() || boot_rec {
             let buf = term.backend().buffer();
             let mut rows = Vec::new();
             for y in 0..buf.area.height {
@@ -314,7 +318,10 @@ pub fn record(
             written += 1;
             frame += 1;
         }
-        std::thread::sleep(Duration::from_millis(100).saturating_sub(t.elapsed()));
+        std::thread::sleep(
+            Duration::from_millis(if app.boot.is_some() { 33 } else { 100 })
+                .saturating_sub(t.elapsed()),
+        );
     }
     Ok(())
 }

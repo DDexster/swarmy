@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render frames recorded by `agentmana demo --record` to PNG files and an animated GIF.
+"""Render frames recorded by `swarmy demo --record` to PNG files and an animated GIF.
 
 Usage: tools/render_frames.py FRAMES.jsonl OUT_DIR [--gif NAME.gif] [--png INDEX:NAME ...]
        [--every N] [--scale S]

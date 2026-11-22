@@ -1,4 +1,4 @@
-//! `agentmana demo`: a made-up world of Claude Code config dirs, so the dashboard can be tried
+//! `swarmy demo`: a made-up world of Claude Code config dirs, so the dashboard can be tried
 //! (and recorded for the README) without anyone's real data.
 //!
 //! Two seats on two accounts, four projects, two weeks of history, and a background thread that

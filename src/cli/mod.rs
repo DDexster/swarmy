@@ -1,7 +1,6 @@
 //! Command-line interface.
 
 pub mod accounts;
-pub mod alias;
 pub mod context;
 pub mod doctor;
 pub mod limits;
@@ -17,7 +16,7 @@ use crate::ui::style::{ColorChoice, Painter};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "agentmana",
+    name = "swarmy",
     version,
     about = "Mission control for Claude Code agents: live swarm, API-equivalent spend, weekly-limit attribution, login vault",
     long_about = None,
@@ -63,8 +62,6 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = Format::Table)]
         format: Format,
     },
-    /// Add `alias am=agentmana` (or another name) to your shell's rc file.
-    ShellAlias(alias::AliasArgs),
     /// Try the dashboard on a made-up world of agents (no real data is read).
     Demo {
         /// Record N frames headlessly into this file instead of opening the dashboard.
@@ -153,19 +150,13 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
     let painter = Painter::new(cli.color);
     match cli.command {
         Some(Command::Completions { shell }) => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "agentmana",
-                &mut std::io::stdout(),
-            );
+            clap_complete::generate(shell, &mut Cli::command(), "swarmy", &mut std::io::stdout());
             Ok(())
         }
         Some(Command::Man) => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;
             Ok(())
         }
-        Some(Command::ShellAlias(a)) => alias::run(&a, &painter),
         Some(Command::Demo {
             record,
             frames,
@@ -234,12 +225,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                         limits::run(&ctx, Format::Table, 8)
                     }
                 }
-                Some(
-                    Command::Completions { .. }
-                    | Command::Man
-                    | Command::ShellAlias(_)
-                    | Command::Demo { .. },
-                ) => {
+                Some(Command::Completions { .. } | Command::Man | Command::Demo { .. }) => {
                     unreachable!()
                 }
             }

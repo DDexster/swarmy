@@ -25,6 +25,9 @@ use crate::claude::transcript::{self, Event, TitleKind};
 use crate::core::pricing::PriceBook;
 use crate::core::usage::Usage;
 
+/// The account of a request from its seat's login history (see `seat_accounts`).
+const SEAT_ACCOUNT_AT: &str = "COALESCE((SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1), requests.account_uuid)";
+
 /// Revision of the cwd → project rules; a change recomputes the `projects` table.
 const PROJECTS_REV: &str = "4";
 
@@ -134,6 +137,8 @@ impl Index {
             idx.conn
                 .execute("DELETE FROM meta WHERE key = 'price_fp'", [])?;
         }
+        // Tables added without a version bump (all `IF NOT EXISTS`), then extra indexes.
+        idx.conn.execute_batch(schema::SQL)?;
         idx.conn.execute_batch(schema::EXTRA_INDEXES)?;
         Ok(idx)
     }
@@ -409,6 +414,45 @@ impl Index {
                 }
             }
         }
+        // What each seat has logged in now, with the time the seat itself recorded it. A change of
+        // account re-attributes the seat's requests from that moment on.
+        let mut reattribute: Vec<(String, i64)> = Vec::new();
+        for si in seat_info {
+            let Some(a) = &si.account else { continue };
+            let mut events: Vec<(i64, &str)> = Vec::new();
+            if let Some(t) = a.profile_fetched_at {
+                events.push((ms(t), a.account_uuid.as_str()));
+            }
+            if let Some(u) = si
+                .utilization
+                .as_ref()
+                .filter(|u| u.account_uuid == a.account_uuid)
+            {
+                events.push((ms(u.fetched_at), u.account_uuid.as_str()));
+            }
+            for (ts, acc) in events {
+                let before: Option<String> = tx
+                    .query_row(
+                        "SELECT account_uuid FROM seat_accounts WHERE seat = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1",
+                        params![si.label, ts],
+                        |r| r.get(0),
+                    )
+                    .ok();
+                let added = tx.execute(
+                    "INSERT OR IGNORE INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)",
+                    params![si.label, ts, acc],
+                )?;
+                if added > 0 && before.as_deref() != Some(acc) {
+                    reattribute.push((si.label.clone(), ts));
+                }
+            }
+        }
+        for (seat, ts) in &reattribute {
+            tx.execute(
+                &format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"),
+                params![seat, ts],
+            )?;
+        }
         let rev_ok = tx
             .query_row(
                 "SELECT value FROM meta WHERE key = 'projects_rev'",
@@ -422,6 +466,14 @@ impl Index {
             tx.commit()?;
             return Ok(());
         }
+        // New requests follow their seat too (only when something new arrived).
+        tx.execute(
+            &format!(
+                "UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT}
+                 WHERE ts >= ?1 AND EXISTS (SELECT 1 FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts)"
+            ),
+            params![now - 30 * 60_000],
+        )?;
         // The account of subagent requests comes from the session's owner at that time.
         tx.execute_batch(
             "UPDATE requests SET account_uuid = (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat

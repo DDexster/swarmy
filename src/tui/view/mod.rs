@@ -223,7 +223,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let n = |p: &dyn Fn(&State) -> bool| s.count(p);
     let needs = n(&|x| matches!(x, State::NeedsYou(_)));
     let mut spans = vec![
-        Span::styled(" AGENT·MANA ", th.bold(th.bg).bg(th.accent)),
+        Span::styled(" SWARMY ", th.bold(th.bg).bg(th.accent)),
         Span::styled(
             if fresh { " ● " } else { " ○ " },
             Style::new().fg(if fresh { th.good } else { th.dim }),
@@ -636,7 +636,7 @@ fn help(f: &mut Frame, app: &App, area: Rect) {
     let focus_keys = if tabs {
         (
             "1-5",
-            "switch tab (OPS · AGENT · MANA · SPEND · SYSTEM); Tab moves between its panels",
+            "switch tab (OPS · AGENT · LIMITS · SPEND · SYSTEM); Tab moves between its panels",
         )
     } else {
         (

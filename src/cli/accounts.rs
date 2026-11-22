@@ -1,4 +1,4 @@
-//! `agentmana accounts`: the login vault.
+//! `swarmy accounts`: the login vault.
 
 use std::path::PathBuf;
 
@@ -349,7 +349,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         println!(
             "  {}",
             p.paint(
-                "empty — save the current logins with `agentmana accounts capture <seat>`",
+                "empty — save the current logins with `swarmy accounts capture <seat>`",
                 Tone::Dim
             )
         );
@@ -421,7 +421,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     println!("{}", t.render(p));
     if let Some((u, label)) = best {
         println!();
-        println!("{}", p.paint(&format!("tip: '{label}' has the most limit left ({} used): agentmana accounts switch <seat> {label}", fmt::pct(u)), Tone::Accent));
+        println!("{}", p.paint(&format!("tip: '{label}' has the most limit left ({} used): swarmy accounts switch <seat> {label}", fmt::pct(u)), Tone::Accent));
     }
     Ok(())
 }

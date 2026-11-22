@@ -1,4 +1,4 @@
-//! `agentmana report`: API-equivalent spend grouped by a dimension.
+//! `swarmy report`: API-equivalent spend grouped by a dimension.
 
 use crate::core::models::{Family, short_name};
 use crate::index::query::{Dim, Filter, Row};
@@ -185,7 +185,7 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     ]);
     println!("{}", t.render(p));
     if total.unpriced > 0 {
-        println!("{}", p.paint(&format!("! {} requests use models without a known price (counted as $0); see `agentmana prices`", total.unpriced), Tone::Warn));
+        println!("{}", p.paint(&format!("! {} requests use models without a known price (counted as $0); see `swarmy prices`", total.unpriced), Tone::Warn));
     }
     println!(
         "{}",

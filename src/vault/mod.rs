@@ -476,14 +476,14 @@ impl Vault {
     ) -> anyhow::Result<SwitchReport> {
         let _lock = store::Lock::acquire(&self.dir.join("lock"))?;
         let target = self.find(login_key).cloned().with_context(|| {
-            format!("no login '{login_key}' in the vault (see `agentmana accounts`)")
+            format!("no login '{login_key}' in the vault (see `swarmy accounts`)")
         })?;
         if let Some(other) = target.mounted.as_deref().filter(|m| *m != seat.label)
             && !allow_shared
         {
             bail!(
                 "login '{}' is in use in seat '{other}'. One OAuth grant in two seats breaks one of them when the token rotates. \
-                 Log in separately there (`agentmana accounts add`), or pass --share to copy it anyway.",
+                 Log in separately there (`swarmy accounts add`), or pass --share to copy it anyway.",
                 target.label
             );
         }

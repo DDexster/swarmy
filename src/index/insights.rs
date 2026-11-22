@@ -141,7 +141,7 @@ impl Index {
         let (a, b) = (ms(span.start), ms(span.end));
         let mut e = Efficiency::default();
         let t0 = std::time::Instant::now();
-        let dbg = std::env::var_os("AGENTMANA_DEBUG").is_some();
+        let dbg = std::env::var_os("SWARMY_DEBUG").is_some();
         let mark = |n: &str| {
             if dbg {
                 eprintln!("    eff {n} {:?}", t0.elapsed());

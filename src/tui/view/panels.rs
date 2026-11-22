@@ -67,7 +67,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                     faint(app),
                 )),
                 Line::from(Span::styled(
-                    "`agentmana doctor` lists the seats and accounts that were found · ? explains the screen",
+                    "`swarmy doctor` lists the seats and accounts that were found · ? explains the screen",
                     faint(app),
                 )),
             ]

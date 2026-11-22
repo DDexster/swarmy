@@ -24,14 +24,25 @@ impl Dirs {
     pub fn resolve() -> anyhow::Result<Dirs> {
         let base = directories::BaseDirs::new().context("cannot determine the home directory")?;
         let home = base.home_dir().to_path_buf();
-        let pd = directories::ProjectDirs::from("", "", "agentmana")
+        let pd = directories::ProjectDirs::from("", "", "swarmy")
             .context("cannot determine data directories")?;
-        let data = std::env::var_os("AGENTMANA_DATA_DIR")
+        let data = std::env::var_os("SWARMY_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| pd.data_dir().to_path_buf());
-        let config = std::env::var_os("AGENTMANA_CONFIG_DIR")
+        let config = std::env::var_os("SWARMY_CONFIG_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| pd.config_dir().to_path_buf());
+        // The tool was called agentmana before: move its data and config (index, vault of saved
+        // logins, config.toml) over once. Never while the old program runs (it would recreate
+        // and write its dirs), and never over anything already in the new place.
+        if let Some(old) = directories::ProjectDirs::from("", "", "agentmana")
+            && (old.data_dir().exists() || old.config_dir().exists())
+            && !old_program_running()
+        {
+            for (from, to) in [(old.data_dir(), &data), (old.config_dir(), &config)] {
+                migrate_dir(from, to);
+            }
+        }
         Ok(Dirs { data, config, home })
     }
 
@@ -182,4 +193,37 @@ mod tests {
             "typos are reported"
         );
     }
+}
+
+fn old_program_running() -> bool {
+    let Ok(mut sys) = sysinfo::System::new() else {
+        // Cannot tell: assume it runs, and migrate another time.
+        return true;
+    };
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.processes()
+        .values()
+        .any(|p| p.name().to_string_lossy().starts_with("agentmana"))
+}
+
+/// Moves `from` into `to` entry by entry; entries that already exist in `to` stay where they are.
+fn migrate_dir(from: &std::path::Path, to: &std::path::Path) {
+    if !from.is_dir() || from == to {
+        return;
+    }
+    let _ = std::fs::create_dir_all(to);
+    if let Ok(entries) = std::fs::read_dir(from) {
+        for e in entries.flatten() {
+            let dest = to.join(e.file_name());
+            if dest.exists() {
+                if e.path().is_dir() && dest.is_dir() {
+                    migrate_dir(&e.path(), &dest);
+                }
+                continue;
+            }
+            let _ = std::fs::rename(e.path(), &dest);
+        }
+    }
+    // Remove the old dir only when everything moved.
+    let _ = std::fs::remove_dir(from);
 }

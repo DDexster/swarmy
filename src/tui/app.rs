@@ -82,7 +82,7 @@ impl Panel {
     pub fn title(self) -> &'static str {
         match self {
             Panel::Swarm => "SWARM",
-            Panel::Mana => "MANA · SEATS",
+            Panel::Mana => "LIMITS · SEATS",
             Panel::Burn => "BURN",
             Panel::Attention => "ATTENTION",
             Panel::Agent => "AGENT",
@@ -137,7 +137,7 @@ pub enum Tab {
 pub const TABS: [(Tab, &str, Panel); 5] = [
     (Tab::Ops, "OPS", Panel::Swarm),
     (Tab::Agent, "AGENT", Panel::Agent),
-    (Tab::Mana, "MANA", Panel::Mana),
+    (Tab::Mana, "LIMITS", Panel::Mana),
     (Tab::Spend, "SPEND", Panel::Projects),
     (Tab::System, "SYSTEM", Panel::System),
 ];
@@ -863,7 +863,7 @@ impl App {
                             self.log_event(
                                 "▲",
                                 format!(
-                                    "MANA {} {} crossed {th:.0}%",
+                                    "LIMIT {} {} crossed {th:.0}%",
                                     rep.name,
                                     w.reading.kind.label()
                                 ),
@@ -877,7 +877,7 @@ impl App {
                     if p >= 50.0 && w.estimate_now < 5.0 {
                         self.log_event(
                             "◆",
-                            format!("MANA RESTORED · {} {}", rep.name, w.reading.kind.label()),
+                            format!("LIMIT RESET · {} {}", rep.name, w.reading.kind.label()),
                             Tone::Good,
                         );
                         self.alerts

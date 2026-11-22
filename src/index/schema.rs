@@ -94,6 +94,16 @@ CREATE TABLE IF NOT EXISTS agents (
   PRIMARY KEY (seat, session_id, agent_id)
 );
 
+-- Which account each seat (config dir) had logged in, and since when: from the seat's own
+-- `.claude.json` (profile time, usage readings). Sessions keep writing their old owner after a
+-- login is swapped under them, so for a seat with these rows the seat decides.
+CREATE TABLE IF NOT EXISTS seat_accounts (
+  seat TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  account_uuid TEXT NOT NULL,
+  PRIMARY KEY (seat, ts)
+);
+
 CREATE TABLE IF NOT EXISTS owners (
   seat TEXT NOT NULL,
   session_id TEXT NOT NULL,
@@ -168,6 +178,7 @@ pub const TABLES: &[&str] = &[
     "sessions",
     "agents",
     "owners",
+    "seat_accounts",
     "projects",
     "accounts",
     "prompts",

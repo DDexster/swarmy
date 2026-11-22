@@ -1,4 +1,4 @@
-# CLAUDE.md — agentmana
+# CLAUDE.md — swarmy
 
 Mission control for Claude Code agents: a Rust CLI + TUI that reads what Claude Code writes to disk
 (transcripts, session registry, `.claude.json`) across several config dirs, shows the live agent
@@ -13,18 +13,18 @@ logins. Users run it in a spare terminal, mostly on laptops.
   first, backs up both files, writes atomically and keeps `mcpOAuth`.
 - **No personal data in git**: no real home paths, user names, emails, account UUIDs or real config
   dir names in code, tests, fixtures, docs or screenshots. Tests use synthetic data; screenshots and
-  GIFs come only from `agentmana demo`. Check the staged diff before every commit.
+  GIFs come only from `swarmy demo`. Check the staged diff before every commit.
 - **Never test the vault on real config dirs.** Use temp dirs (see `src/vault/tests.rs`) or a fake
   `HOME`.
 - **Battery budget.** The dashboard must stay around 2 CPU-seconds per minute (≈3.4% of one core)
   on a 4K wall with 15–20 live agents.
   Measure CPU time of the process, not wall time (other agents load the machine):
   ```sh
-  P=$(pgrep -x agentmana); T0=$(awk '{print $14+$15}' /proc/$P/stat); sleep 30
+  P=$(pgrep -x swarmy); T0=$(awk '{print $14+$15}' /proc/$P/stat); sleep 30
   T1=$(awk '{print $14+$15}' /proc/$P/stat); echo "$(( (T1-T0)/30 ))% of a core"
   ```
-  Measure *your* process (`pgrep -x agentmana` may find the owner's own instance), per thread from
-  `/proc/<pid>/task/*/stat`. `AGENTMANA_DEBUG=1 agentmana 2>log` prints per-tick and per-frame
+  Measure *your* process (`pgrep -x swarmy` may find the owner's own instance), per thread from
+  `/proc/<pid>/task/*/stat`. `SWARMY_DEBUG=1 swarmy 2>log` prints per-tick and per-frame
   timings. Per-second work may only touch running sessions (`Index::refresh_hot` with cached dir
   listings, `ProcTable::for_pids`, per-agent totals reused when no new request arrived); period
   aggregates (2 min), limits (1 min), efficiency (5 min), the previous period (10 min), lanes and
@@ -43,10 +43,10 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts) |
 | `src/live/` | live agent states for the dashboard |
 | `src/vault/` | login vault and switching |
-| `src/cli/` | commands: report, models, limits, accounts, doctor, prices, shell-alias |
-| `src/tui/` | dashboard: worker thread + UI loop (`mod.rs`), state and keys (`app.rs`), vault in the MANA panel (`vault_ui.rs`), boot animation, themes |
+| `src/cli/` | commands: report, models, limits, accounts, doctor, prices |
+| `src/tui/` | dashboard: worker thread + UI loop (`mod.rs`), state and keys (`app.rs`), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
 | `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer, dialogs (`mod.rs`); panels that fill any rect (`panels.rs`); primitives (`kit.rs`) |
-| `src/demo.rs` | made-up world for `agentmana demo` and README media |
+| `src/demo.rs` | made-up world for `swarmy demo` and README media |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
 
@@ -59,7 +59,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `procStart` (check it against `/proc/<pid>/stat` to ignore reused pids).
 - `.claude.json`: `cachedUsageUtilization` (limits, no network needed), `additionalModelCostsCache`
   (prices), `oauthAccount`. For `~/.claude` it lives at `~/.claude.json`, otherwise inside the dir.
-- Unknown record types are counted; `agentmana doctor` reports them (format drift).
+- Unknown record types are counted; `swarmy doctor` reports them (format drift).
 - Projects: a cwd resolves to its git root; removed worktrees under `<repo>-wt/` fold into
   `<repo>`; a dir outside any repo (gone, or a scratch dir) takes the project of the session it ran
   in, or the session's own dir when it lies under it (never a home dir). Changing these rules means
@@ -77,13 +77,13 @@ cargo run --release -- demo                # try the dashboard on fake data
 
 # static Linux binary (zig 0.16 + cargo-zigbuild)
 cargo zigbuild --release --target x86_64-unknown-linux-musl
-readelf -l target/x86_64-unknown-linux-musl/release/agentmana | grep -c INTERP   # must print 0
+readelf -l target/x86_64-unknown-linux-musl/release/swarmy | grep -c INTERP   # must print 0
 
 tools/record-readme.sh                     # refresh docs/img (screenshots + demo.gif)
 ```
 
 Visual changes to the dashboard: record at the sizes that matter (326×81 wall, 160×81 column,
-140×34 tabs) with `agentmana demo --record … --size WxH --keys …` and `tools/render_frames.py`,
+140×34 tabs) with `swarmy demo --record … --size WxH --keys …` and `tools/render_frames.py`,
 look at the PNGs, fix, repeat; `tools/record-readme.sh` refreshes the README media.
 
 UX principles (from the owner): use the whole screen — no tabs of mostly empty space on a big
@@ -95,7 +95,7 @@ Words on screen (keep them, and the legend in `view/mod.rs::legend_lines`, in sy
 - **seat** = a Claude Code config dir; **login** = an OAuth sign-in (saved ones live in the vault);
   **account** = the Anthropic account behind a login, named after its saved login.
 - Limits: "week used N%", "runs out in 7h (Mon 03:34)", "limit reached"; shares as "% of week",
-  "1% ≈ $X". Never "mana N%" or "pt" on screen (mana is only the product's name).
+  "1% ≈ $X". Never "mana" or "pt" on screen.
 - Trends say what they compare with ("▲▼ vs previous 7d", "vs day before").
 - Every new glyph, unit or colour gets a legend line; the footer keeps "? help & legend" visible.
 - `--mask` blanks emails and the OS user name in the finished frame (`mask_user`).

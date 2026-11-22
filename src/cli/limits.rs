@@ -1,4 +1,4 @@
-//! `agentmana limits`: where each account's limit went, and when it runs out.
+//! `swarmy limits`: where each account's limit went, and when it runs out.
 //!
 //! The utilization Anthropic reports covers everything the account did: Claude Code on this
 //! machine, but also claude.ai, the desktop app and other computers, none of which leave

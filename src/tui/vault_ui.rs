@@ -424,7 +424,7 @@ impl App {
             .vault_dir
             .join(format!("new-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
         println!(
-            "\nagentmana: starting Claude Code in a scratch seat for '{label}'. Run /login, choose the account, then /exit.\n"
+            "\nswarmy: starting Claude Code in a scratch seat for '{label}'. Run /login, choose the account, then /exit.\n"
         );
         let res = (|| -> anyhow::Result<()> {
             std::fs::create_dir_all(&scratch)?;
