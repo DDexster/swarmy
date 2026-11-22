@@ -122,20 +122,6 @@ pub fn with_login(text: Option<&str>, login: &Secret) -> anyhow::Result<String> 
     Ok(serde_json::to_string(&m)?)
 }
 
-/// The macOS Keychain item Claude Code uses for a config dir: service
-/// `Claude Code-credentials` for the default dir, `Claude Code-credentials-<sha256(dir)[..8]>` when
-/// `CLAUDE_CONFIG_DIR` is set; account = `$USER`. (Read from Claude Code 2.1.329; to verify on
-/// macOS.)
-pub fn keychain_service(config_dir_env: Option<&str>) -> String {
-    match config_dir_env {
-        None => "Claude Code-credentials".into(),
-        Some(dir) => {
-            let d = Sha256::digest(dir.as_bytes());
-            format!("Claude Code-credentials-{}", &hex::encode(d)[..8])
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,15 +162,5 @@ mod tests {
                 .is_some()
         );
         assert!(parse_login(r#"{"mcpOAuth":{}}"#).unwrap().is_none());
-    }
-
-    #[test]
-    fn keychain_names() {
-        assert_eq!(keychain_service(None), "Claude Code-credentials");
-        let s = keychain_service(Some("/Users/a/.claude-work"));
-        assert!(
-            s.starts_with("Claude Code-credentials-")
-                && s.len() == "Claude Code-credentials-".len() + 8
-        );
     }
 }

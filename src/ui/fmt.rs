@@ -123,22 +123,6 @@ pub fn gauge(frac: f64, width: usize) -> String {
     format!("▕{b}{}▏", " ".repeat(width.saturating_sub(used)))
 }
 
-const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-
-pub fn sparkline(values: &[f64]) -> String {
-    let max = values.iter().copied().fold(0.0, f64::max);
-    values
-        .iter()
-        .map(|v| {
-            if max <= 0.0 || *v <= 0.0 {
-                ' '
-            } else {
-                SPARK[((v / max) * 7.0).round() as usize]
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,6 +152,5 @@ mod tests {
         assert_eq!(bar(1.0 / 32.0, 4), "▏");
         assert_eq!(bar(2.0, 2), "██");
         assert_eq!(gauge(0.25, 4), "▕█   ▏");
-        assert_eq!(sparkline(&[0.0, 1.0, 2.0]), " ▅█");
     }
 }

@@ -87,7 +87,8 @@ fn current_window(r: &Reading, now: chrono::DateTime<chrono::Utc>) -> Span {
 fn total_cached(idx: &Index, account: &str, span: Span) -> anyhow::Result<f64> {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static MEMO: OnceLock<Mutex<HashMap<(String, i64, i64), f64>>> = OnceLock::new();
+    type Memo = Mutex<HashMap<(String, i64, i64), f64>>;
+    static MEMO: OnceLock<Memo> = OnceLock::new();
     let key = (
         account.to_string(),
         span.start.timestamp_millis(),

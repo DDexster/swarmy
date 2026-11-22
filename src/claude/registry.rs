@@ -125,11 +125,28 @@ pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -
     out
 }
 
+/// A session blocked on the user.
+#[derive(Debug, Clone)]
+pub struct Waiting {
+    pub session_id: String,
+    pub name: Option<String>,
+    pub what: String,
+    pub tmux: Option<String>,
+    pub cwd: String,
+}
+
+impl Waiting {
+    /// Its title, else its directory's name.
+    pub fn label(&self) -> String {
+        self.name
+            .clone()
+            .unwrap_or_else(|| self.cwd.rsplit('/').next().unwrap_or("session").to_string())
+    }
+}
+
 /// Sessions of one config dir that wait for the user, read straight from the registry with a
 /// cheap liveness check (for the status line when the dashboard is not running).
-pub fn waiting_sessions(
-    sessions_dir: &Path,
-) -> Vec<(String, Option<String>, String, Option<String>, String)> {
+pub fn waiting_sessions(sessions_dir: &Path) -> Vec<Waiting> {
     let Ok(rd) = std::fs::read_dir(sessions_dir) else {
         return Vec::new();
     };
@@ -148,14 +165,13 @@ pub fn waiting_sessions(
         if r.status.as_deref() != Some("waiting") || r.pid == 0 || !pid_alive(r.pid) {
             continue;
         }
-        // (session id, name, what it waits for, tmux pane, cwd)
-        out.push((
-            r.session_id,
-            r.name,
-            r.waiting_for.unwrap_or_else(|| "input".into()),
-            r.tmux.filter(|t| !t.is_empty()),
-            r.cwd,
-        ));
+        out.push(Waiting {
+            session_id: r.session_id,
+            name: r.name,
+            what: r.waiting_for.unwrap_or_else(|| "input".into()),
+            tmux: r.tmux.filter(|t| !t.is_empty()),
+            cwd: r.cwd,
+        });
     }
     out
 }

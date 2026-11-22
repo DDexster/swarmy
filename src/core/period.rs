@@ -61,15 +61,7 @@ pub struct Span {
     pub end: DateTime<Utc>,
 }
 
-impl Span {
-    pub fn contains(&self, t: DateTime<Utc>) -> bool {
-        t >= self.start && t < self.end
-    }
-
-    pub fn hours(&self) -> f64 {
-        (self.end - self.start).num_seconds() as f64 / 3600.0
-    }
-}
+impl Span {}
 
 fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
     let naive = d.and_hms_opt(0, 0, 0).unwrap();

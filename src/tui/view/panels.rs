@@ -994,6 +994,15 @@ fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Lin
     lines
 }
 
+/// One account in the limit chart: colour, the curve, the readings, the projection
+/// (from x, from y, to x, to y).
+type CurveSeries = (
+    Color,
+    Vec<(f64, f64)>,
+    Vec<(f64, f64)>,
+    Option<(f64, f64, f64, f64)>,
+);
+
 /// Colours of accounts in the limit chart and its legend.
 pub fn account_color(th: &crate::tui::theme::Theme, i: usize) -> Color {
     [th.accent, Color::Rgb(255, 121, 198), th.good, th.fable][i % 4]
@@ -1059,12 +1068,7 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
         .min(400.0);
     let ymax = peak * 1.08;
     let (bad, faint_c, track) = (th.bad, th.faint, th.track);
-    let series: Vec<(
-        Color,
-        Vec<(f64, f64)>,
-        Vec<(f64, f64)>,
-        Option<(f64, f64, f64, f64)>,
-    )> = wins
+    let series: Vec<CurveSeries> = wins
         .iter()
         .zip(&proj)
         .map(|((i, w), p)| {

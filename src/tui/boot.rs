@@ -395,7 +395,7 @@ fn swarm_logo(f: &mut Frame, app: &App, area: Rect, t: f32) -> Option<u16> {
                         cy + a0.sin() * reach * 0.6 - ty,
                     );
                     // Spiral in: the offset turns and shrinks; bees buzz while flying.
-                    let spin = if h % 2 == 0 { 1.0 } else { -1.0 } * (1.6 + rnd(4) * 2.2);
+                    let spin = if h.is_multiple_of(2) { 1.0 } else { -1.0 } * (1.6 + rnd(4) * 2.2);
                     let ang = (1.0 - e) * spin;
                     let k = 1.0 - e;
                     let buzz = k * 3.0;

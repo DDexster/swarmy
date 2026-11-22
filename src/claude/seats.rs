@@ -33,10 +33,6 @@ impl Seat {
     pub fn credentials_file(&self) -> PathBuf {
         self.dir.join(".credentials.json")
     }
-
-    pub fn history_file(&self) -> PathBuf {
-        self.dir.join("history.jsonl")
-    }
 }
 
 /// A config dir is recognised by the files Claude Code creates in it.

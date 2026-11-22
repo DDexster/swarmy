@@ -291,13 +291,7 @@ fn jump(list: bool) -> anyhow::Result<()> {
             seat_dirs
                 .iter()
                 .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
-                .map(|(_, name, what, tmux, cwd)| {
-                    (
-                        name.unwrap_or_else(|| cwd.rsplit('/').next().unwrap_or("").to_string()),
-                        what,
-                        tmux,
-                    )
-                })
+                .map(|w| (w.label(), w.what.clone(), w.tmux.clone()))
                 .collect()
         }
     };

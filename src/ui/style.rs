@@ -129,6 +129,7 @@ impl Painter {
         Painter { depth }
     }
 
+    #[cfg(test)]
     pub fn plain() -> Painter {
         Painter { depth: Depth::None }
     }

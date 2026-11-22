@@ -21,14 +21,13 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 
-use crate::claude::config_json;
 use crate::claude::procs::ProcTable;
 use crate::claude::registry::{self, LiveSession};
 use crate::cli::context::Ctx;
 use crate::cli::limits::{self, AccountReport};
 use crate::core::period::{Period, Span};
 use crate::index::query::{Dim, Filter, Row};
-use crate::index::{Index, Progress, SeatInfo};
+use crate::index::{Index, Progress};
 use crate::live::{self, Snapshot, ToolLine};
 use crate::vault::{Login, Vault};
 
@@ -45,7 +44,6 @@ pub use boot::hash;
 #[derive(Debug, Clone, Default)]
 pub struct Analytics {
     pub period: Option<Period>,
-    pub span: Option<Span>,
     pub group: Option<Dim>,
     pub groups: Vec<Row>,
     pub by_model: Vec<Row>,
@@ -98,10 +96,12 @@ pub struct SeatRow {
     pub state: crate::vault::SeatState,
 }
 
+/// (seat, session name, pid, cpu %, bytes, top children (cmd, cpu, bytes))
+pub type Instance = (String, String, u32, f32, u64, Vec<(String, f32, u64)>);
+
 #[derive(Debug, Clone, Default)]
 pub struct SystemView {
-    /// (seat, session name, pid, cpu %, bytes, top children (cmd, cpu, bytes))
-    pub instances: Vec<(String, String, u32, f32, u64, Vec<(String, f32, u64)>)>,
+    pub instances: Vec<Instance>,
     pub mem_total: u64,
     pub mem_available: u64,
     pub disk_free: Option<u64>,
@@ -146,7 +146,6 @@ pub fn run(ctx: Ctx, no_boot: bool, force_eco: bool) -> anyhow::Result<()> {
     let theme = theme::Theme::named(ctx.config.theme.as_deref());
     let seats = ctx.seats.clone();
     let vault_dir = ctx.dirs.vault_dir();
-    let home = ctx.dirs.home.clone();
     let eco = Arc::new(std::sync::atomic::AtomicBool::new(
         force_eco || crate::power::on_battery(),
     ));
@@ -155,7 +154,7 @@ pub fn run(ctx: Ctx, no_boot: bool, force_eco: bool) -> anyhow::Result<()> {
 
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let mut app = App::new(theme, mask, no_boot, seats, vault_dir, home);
+    let mut app = App::new(theme, mask, no_boot, seats, vault_dir);
     let res = ui_loop(&mut terminal, &mut app, &rx, &wants, &eco);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -176,9 +175,7 @@ fn ui_loop(
         let frame_time = Duration::from_millis(if app.boot.is_some() {
             // The boot swarm: 30 frames a second for two seconds.
             33
-        } else if !app.animating() {
-            500
-        } else if app.eco {
+        } else if !app.animating() || app.eco {
             500
         } else {
             200
@@ -256,15 +253,11 @@ pub fn record(
     }));
     let w2 = wants.clone();
     let theme = theme::Theme::named(ctx.config.theme.as_deref());
-    let (seats, vault_dir, home) = (
-        ctx.seats.clone(),
-        ctx.dirs.vault_dir(),
-        ctx.dirs.home.clone(),
-    );
+    let (seats, vault_dir) = (ctx.seats.clone(), ctx.dirs.vault_dir());
     let eco = Arc::new(std::sync::atomic::AtomicBool::new(false));
     std::thread::spawn(move || worker(ctx, tx, w2, eco, false));
     let mut term = ratatui::Terminal::new(TestBackend::new(width, height))?;
-    let mut app = App::new(theme, false, false, seats, vault_dir, home);
+    let mut app = App::new(theme, false, false, seats, vault_dir);
     let col = |c: Color| match c {
         Color::Rgb(r, g, b) => Some(format!("#{r:02x}{g:02x}{b:02x}")),
         _ => None,
@@ -342,7 +335,7 @@ fn fleet_of(
     snap: &live::Snapshot,
     limits: &[limits::AccountReport],
 ) -> crate::fleet::Fleet {
-    use crate::fleet::{Fleet, NeedsYou, SeatLimit, SessionCounts};
+    use crate::fleet::{Fleet, NeedsYou, SeatLimit};
     let mut f = Fleet {
         v: crate::fleet::VERSION,
         writer_pid: std::process::id(),
@@ -524,13 +517,7 @@ fn worker(
     let mut last_fleet = Instant::now() - Duration::from_secs(10);
     let mut fleet_last: Option<crate::fleet::Fleet> = None;
     let mut last_procs = Instant::now() - Duration::from_secs(60);
-    #[allow(clippy::type_complexity)]
-    let mut slow: Option<(
-        Instant,
-        Vec<Row>,
-        Vec<(String, String, f64)>,
-        Vec<(String, String, f64)>,
-    )> = None;
+    let mut slow: Option<(Instant, SlowParts)> = None;
     loop {
         tick += 1;
         let tick_start = Instant::now();
@@ -718,7 +705,7 @@ fn worker(
             // Daily bars and the heatmap move slowly: every five minutes is enough.
             if slow
                 .as_ref()
-                .is_none_or(|(t, ..)| t.elapsed() > Duration::from_secs(300))
+                .is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(300))
             {
                 let f = Filter::default();
                 let days_span = Span {
@@ -734,7 +721,7 @@ fn worker(
                     idx.matrix(Dim::Weekday, Dim::Hour, heat_span, &f),
                     idx.days_by_model(days_span),
                 ) {
-                    slow = Some((Instant::now(), d, h, dm));
+                    slow = Some((Instant::now(), (d, h, dm)));
                 }
             }
             // Period aggregates change slowly: recompute them every minute or when asked.
@@ -750,8 +737,7 @@ fn worker(
                 &idx,
                 &w,
                 &disk_cache,
-                slow.as_ref()
-                    .map(|(_, d, h, dm)| (d.clone(), h.clone(), dm.clone())),
+                slow.as_ref().map(|(_, parts)| parts.clone()),
                 reuse,
                 if limits_due {
                     None
@@ -821,16 +807,23 @@ fn worker(
     }
 }
 
+/// Day bars, the weekday × hour heat map and day × model spend, recomputed every 5 minutes.
+type SlowParts = (
+    Vec<Row>,
+    Vec<(String, String, f64)>,
+    Vec<(String, String, f64)>,
+);
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the worker's cache inputs; becomes a struct when the worker is split"
+)]
 fn analytics(
     ctx: &Ctx,
     idx: &Index,
     w: &Wants,
     disk: &[(String, u64)],
-    slow: Option<(
-        Vec<Row>,
-        Vec<(String, String, f64)>,
-        Vec<(String, String, f64)>,
-    )>,
+    slow: Option<SlowParts>,
     prev: Option<&Analytics>,
     prev_limits: Option<&Vec<limits::AccountReport>>,
     // The last analytics whatever the cadence: slow parts are reused from it while fresh.
@@ -1006,7 +999,6 @@ fn analytics(
     Ok(Analytics {
         projects,
         period: Some(period),
-        span: Some(span),
         group: Some(group),
         groups,
         by_model: match reuse {

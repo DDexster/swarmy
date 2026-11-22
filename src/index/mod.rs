@@ -35,14 +35,14 @@ pub struct Index {
     pub conn: Connection,
     /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
     /// again only when a file was added to it.
-    session_dirs: HashMap<
-        (String, String),
-        (
-            Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
-            Vec<TranscriptFile>,
-        ),
-    >,
+    session_dirs: HashMap<(String, String), ListedDirs>,
 }
+
+/// The dirs a session's files were listed from (with their mtimes), and the files.
+type ListedDirs = (
+    Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
+    Vec<TranscriptFile>,
+);
 
 /// What `.claude.json` of a seat says right now.
 #[derive(Debug, Clone, Default)]
@@ -110,10 +110,6 @@ impl Index {
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
         Self::init(conn)
-    }
-
-    pub fn open_in_memory() -> anyhow::Result<Index> {
-        Self::init(Connection::open_in_memory()?)
     }
 
     fn init(conn: Connection) -> anyhow::Result<Index> {
@@ -333,7 +329,7 @@ impl Index {
         progress(done);
 
         // Big files first so the parallel batches stay balanced.
-        work.sort_by(|a, b| (b.size - b.start).cmp(&(a.size - a.start)));
+        work.sort_by_key(|w| std::cmp::Reverse(w.size - w.start));
         let before: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
@@ -505,10 +501,9 @@ impl Index {
         } else {
             tx.execute("DELETE FROM projects", [])?;
             let mut st = tx.prepare("SELECT DISTINCT cwd FROM requests WHERE cwd IS NOT NULL")?;
-            let v = st
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            v
+
+            st.query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
         };
         let mut orphans: Vec<String> = Vec::new();
         for cwd in &cwds {

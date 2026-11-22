@@ -41,7 +41,7 @@ pub struct Resolver {
 impl Resolver {
     pub fn new(mut aliases: Vec<Alias>) -> Self {
         // Longest prefix first.
-        aliases.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
+        aliases.sort_by_key(|a| std::cmp::Reverse(a.prefix.len()));
         Resolver {
             aliases,
             cache: HashMap::new(),

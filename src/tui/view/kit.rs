@@ -101,7 +101,7 @@ pub fn gauge(frac: f64, width: usize, color: Color, th: &Theme) -> Vec<Span<'sta
     let full = (eighths / 8).min(width);
     let mut s = "█".repeat(full);
     let mut used = full;
-    if eighths % 8 > 0 && used < width {
+    if !eighths.is_multiple_of(8) && used < width {
         s.push(EIGHTHS[eighths % 8 - 1]);
         used += 1;
     }
@@ -135,7 +135,7 @@ pub fn pulse(app: &App, c: Color, hz: f64) -> Color {
 }
 
 pub fn blink(app: &App) -> bool {
-    !app.animating() || (app.t() * 2.0) as u64 % 2 == 0
+    !app.animating() || ((app.t() * 2.0) as u64).is_multiple_of(2)
 }
 
 pub fn effort_abbr(e: Option<&str>) -> &'static str {
@@ -213,16 +213,6 @@ pub fn mask_name(app: &App, s: &str) -> String {
 /// Renders lines into `area`, clipped.
 pub fn put(f: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
     f.render_widget(Paragraph::new(lines), area);
-}
-
-/// A single row `y` of `area` (or `None` beyond its bottom).
-pub fn row(area: Rect, y: u16) -> Option<Rect> {
-    (y < area.height).then_some(Rect {
-        x: area.x,
-        y: area.y + y,
-        width: area.width,
-        height: 1,
-    })
 }
 
 /// Splits `total` into parts proportional to `weights`, the last taking the remainder.

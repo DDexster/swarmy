@@ -1,0 +1,5 @@
+# Counts in production code (tests excluded) that may only go down (tests/architecture.rs).
+fallbacks_index_vault_cli = 66
+unwraps = 79
+wildcard_arms = 58
+files_over_900_lines = 5

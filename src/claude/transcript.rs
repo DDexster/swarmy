@@ -54,6 +54,10 @@ pub enum TitleKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "short-lived parse output; boxing every request costs more than it saves"
+)]
 pub enum Event {
     Request(Request),
     ToolResult {

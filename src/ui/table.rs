@@ -95,10 +95,6 @@ impl Table {
         self.footer.push(cells);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     pub fn render(&self, p: &Painter) -> String {
         let n = self.cols.len();
         let mut w: Vec<usize> = self.cols.iter().map(|(h, _)| width(h)).collect();
@@ -116,12 +112,12 @@ impl Table {
         }
         let fmt_row = |cells: &[Cell], header: bool| -> String {
             let mut line = String::new();
-            for i in 0..n {
+            for (i, wi) in w.iter().copied().enumerate().take(n) {
                 let (text, tone) = match cells.get(i) {
-                    Some(c) => (truncate(&c.text, w[i]), c.tone),
+                    Some(c) => (truncate(&c.text, wi), c.tone),
                     None => (String::new(), Tone::Plain),
                 };
-                let pad = " ".repeat(w[i].saturating_sub(width(&text)));
+                let pad = " ".repeat(wi.saturating_sub(width(&text)));
                 let tone = if header { Tone::Header } else { tone };
                 let painted = p.paint(&text, tone);
                 if i > 0 {

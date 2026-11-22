@@ -702,10 +702,13 @@ pub fn run(
         dirs_
             .iter()
             .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
-            .map(|(id, name, what, tmux, cwd)| {
-                let name =
-                    name.unwrap_or_else(|| cwd.rsplit('/').next().unwrap_or("session").to_string());
-                (id, name, what, tmux)
+            .map(|w| {
+                (
+                    w.session_id.clone(),
+                    w.label(),
+                    w.what.clone(),
+                    w.tmux.clone(),
+                )
             })
             .collect()
     };

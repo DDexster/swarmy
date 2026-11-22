@@ -1,0 +1,36 @@
+# Allowed `crate::<module>::` references between top-level modules (production code).
+# New lines need a reason; lines only ever get removed.
+claude -> config
+claude -> core
+claude -> fleet
+cli -> claude
+cli -> config
+cli -> core
+cli -> demo
+cli -> fleet
+cli -> index
+cli -> tui
+cli -> ui
+cli -> vault
+config -> claude
+config -> core
+demo -> claude
+demo -> tui
+index -> claude
+index -> core
+live -> claude
+live -> core
+live -> index
+live -> ui
+tui -> claude
+# The dashboard depends on the CLI (Ctx, limits): a cycle with cli -> tui (review H4).
+tui -> cli
+tui -> core
+tui -> fleet
+tui -> index
+tui -> live
+tui -> power
+tui -> ui
+tui -> vault
+ui -> core
+vault -> claude

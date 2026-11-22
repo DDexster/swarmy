@@ -34,19 +34,6 @@ pub enum State {
 }
 
 impl State {
-    pub fn rank(&self) -> u8 {
-        match self {
-            State::NeedsYou(_) => 0,
-            State::Stalled => 1,
-            State::Tool { .. } => 2,
-            State::Thinking => 3,
-            State::WaitingAgents(_) => 4,
-            State::Idle => 5,
-            State::Done => 6,
-            State::Gone => 7,
-        }
-    }
-
     pub fn is_active(&self) -> bool {
         matches!(
             self,
@@ -754,7 +741,7 @@ pub fn past_events(
             text: format!("you{to} · {chars} chars"),
         });
     }
-    out.sort_by(|a, b| b.at.cmp(&a.at));
+    out.sort_by_key(|e| std::cmp::Reverse(e.at));
     out.truncate(limit);
     Ok(out)
 }

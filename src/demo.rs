@@ -398,7 +398,7 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
             let _ = std::fs::create_dir_all(&sub);
             let meta = sub.join(format!("agent-{id}.meta.json"));
             let desc = AGENT_NAMES[(spawned as usize * 3) % AGENT_NAMES.len()];
-            let _ = std::fs::write(&meta, json!({"agentType": if spawned % 4 == 0 { "Explore" } else { "general-purpose" }, "description": desc, "model": model, "effort": effort, "spawnDepth": 1, "finished": false}).to_string());
+            let _ = std::fs::write(&meta, json!({"agentType": if spawned.is_multiple_of(4) { "Explore" } else { "general-purpose" }, "description": desc, "model": model, "effort": effort, "spawnDepth": 1, "finished": false}).to_string());
             agents.push(LiveAgent {
                 path: sub.join(format!("agent-{id}.jsonl")),
                 meta,

@@ -153,10 +153,6 @@ impl Theme {
         Theme::named(Some(NAMES[(i + 1) % NAMES.len()]))
     }
 
-    pub fn s(&self, c: Color) -> Style {
-        Style::new().fg(c)
-    }
-
     pub fn base(&self) -> Style {
         Style::new().fg(self.fg).bg(self.bg)
     }

@@ -140,13 +140,6 @@ fn from_for(parts: &[&str]) -> String {
     s
 }
 
-#[allow(dead_code)]
-const _FROM_ALL: &str = "FROM requests r
-  LEFT JOIN projects p ON p.cwd = r.cwd
-  LEFT JOIN agents a ON a.seat = r.seat AND a.session_id = r.session_id AND a.agent_id = r.agent_id
-  LEFT JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id
-  LEFT JOIN accounts c ON c.account_uuid = r.account_uuid";
-
 fn where_clause(span: Span, f: &Filter, args: &mut Vec<rusqlite::types::Value>) -> String {
     use rusqlite::types::Value as V;
     let mut w = vec![
@@ -206,6 +199,9 @@ fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<(u64, Usage, f64,
     ))
 }
 
+/// One UTC hour: (hour number, requests, usage, cost, unpriced requests).
+type HourRow = (i64, u64, Usage, f64, u64);
+
 impl Index {
     pub fn spend_by(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
         if dim.is_time() {
@@ -234,7 +230,7 @@ impl Index {
 
     /// Sums per UTC hour; local-time grouping happens in Rust, which is far cheaper than
     /// SQLite's `localtime` on every row.
-    fn hourly(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<(i64, u64, Usage, f64, u64)>> {
+    fn hourly(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<HourRow>> {
         let mut args = Vec::new();
         let wh = where_clause(span, f, &mut args);
         let from = from_for(&[&wh]);
@@ -396,23 +392,6 @@ impl Index {
             }
         }
         Ok(out.into_iter().collect())
-    }
-
-    pub fn account_labels(
-        &self,
-    ) -> anyhow::Result<BTreeMap<String, (Option<String>, Option<String>)>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT account_uuid, email, seat FROM accounts")?;
-        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, (r.get(1)?, r.get(2)?))))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Accounts that have requests, newest activity first.
-    pub fn active_accounts(&self) -> anyhow::Result<Vec<String>> {
-        let mut st = self.conn.prepare("SELECT account_uuid FROM requests WHERE account_uuid IS NOT NULL GROUP BY 1 ORDER BY MAX(ts) DESC")?;
-        let rows = st.query_map([], |r| r.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Claude Code's own totals vs. the transcript sums, over sessions that have both:

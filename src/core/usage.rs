@@ -29,19 +29,6 @@ impl Usage {
         self.web_search += o.web_search;
     }
 
-    /// Claude Code writes one record per content block of a response, all carrying the usage of
-    /// the same response. Older versions streamed growing partial counts, so duplicates are merged
-    /// field by field with `max`, never summed.
-    pub fn merge_max(&mut self, o: &Usage) {
-        self.input = self.input.max(o.input);
-        self.cache_write_5m = self.cache_write_5m.max(o.cache_write_5m);
-        self.cache_write_1h = self.cache_write_1h.max(o.cache_write_1h);
-        self.cache_read = self.cache_read.max(o.cache_read);
-        self.output = self.output.max(o.output);
-        self.thinking = self.thinking.max(o.thinking);
-        self.web_search = self.web_search.max(o.web_search);
-    }
-
     pub fn cache_write(&self) -> u64 {
         self.cache_write_5m + self.cache_write_1h
     }
@@ -69,33 +56,6 @@ impl Usage {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn duplicates_merge_with_max_not_sum() {
-        let a = Usage {
-            input: 2,
-            cache_read: 100,
-            output: 10,
-            ..Default::default()
-        };
-        let b = Usage {
-            input: 2,
-            cache_read: 100,
-            output: 393,
-            ..Default::default()
-        };
-        let mut m = a;
-        m.merge_max(&b);
-        assert_eq!(
-            m,
-            Usage {
-                input: 2,
-                cache_read: 100,
-                output: 393,
-                ..Default::default()
-            }
-        );
-    }
 
     #[test]
     fn prompt_and_hit_ratio() {

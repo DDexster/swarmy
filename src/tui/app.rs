@@ -240,7 +240,6 @@ pub struct App {
     pub(super) seats: Vec<Seat>,
     pub(super) vault_dir: PathBuf,
     pub vault: super::vault_ui::VaultUi,
-    pub home: PathBuf,
 }
 
 const PERIODS: [&str; 4] = ["today", "7d", "30d", "all"];
@@ -260,7 +259,6 @@ impl App {
         no_boot: bool,
         seats: Vec<Seat>,
         vault_dir: PathBuf,
-        home: PathBuf,
     ) -> App {
         let skip = no_boot || !theme.animate;
         App {
@@ -308,7 +306,6 @@ impl App {
             seats,
             vault_dir,
             vault: Default::default(),
-            home,
         }
     }
 
@@ -751,7 +748,7 @@ impl App {
                 }
                 self.events
                     .make_contiguous()
-                    .sort_by(|a, b| b.at.cmp(&a.at));
+                    .sort_by_key(|e| std::cmp::Reverse(e.at));
                 self.events.truncate(300);
             }
             Msg::Error(e) => self.error = Some(e),
@@ -1080,7 +1077,7 @@ impl App {
                 }
             }
             KeyCode::F(n) if n <= 10 => {
-                let p = Panel::from_number((n % 10) as u8);
+                let p = Panel::from_number(n % 10);
                 self.focus_panel(p);
             }
             KeyCode::Char('z') => {

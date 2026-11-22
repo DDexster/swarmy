@@ -10,6 +10,18 @@ keywords = ["claude", "agents", "tui", "monitoring", "usage"]
 categories = ["command-line-utilities", "development-tools"]
 publish = false
 
+# Enforced by `tools/check.sh` (clippy runs with -D warnings). Rules too costly to switch on at
+# once are held by the ratchets in tests/architecture.rs instead: their counts may only fall.
+[lints.rust]
+unsafe_code = "forbid"
+dead_code = "deny"
+unused_imports = "deny"
+
+[lints.clippy]
+allow_attributes_without_reason = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
 [features]
 default = ["bundled-sqlite"]
 # Distributions that ship a system libsqlite3 can build with --no-default-features.
