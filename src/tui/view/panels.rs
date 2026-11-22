@@ -45,12 +45,34 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let agents = app.visible_agents();
     if agents.is_empty() {
-        let msg = if app.snapshot.taken_at.is_none() {
-            "linking…"
+        let lines: Vec<Line> = if app.snapshot.taken_at.is_none() {
+            vec![Line::from(Span::styled(
+                "reading Claude Code's files…",
+                dim(app),
+            ))]
+        } else if app.filter.as_deref().is_some_and(|f| !f.is_empty()) {
+            vec![Line::from(Span::styled(
+                "no agent matches the filter · Esc clears it",
+                dim(app),
+            ))]
         } else {
-            "no agents active in the last 30 minutes"
+            vec![
+                Line::from(Span::styled(
+                    "no agents active in the last 30 minutes",
+                    dim(app),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "start `claude` in any seat and it shows up here within a second",
+                    faint(app),
+                )),
+                Line::from(Span::styled(
+                    "`agentmana doctor` lists the seats and accounts that were found · ? explains the screen",
+                    faint(app),
+                )),
+            ]
         };
-        put(f, inner, vec![Line::from(Span::styled(msg, dim(app)))]);
+        put(f, inner, lines);
         return;
     }
     let width = inner.width as usize;
@@ -98,7 +120,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         fit("AGENT", name_w),
         fit("MODEL", model_w),
         fit("ACTIVITY", act_w),
-        fit_right("TIME", t_w)
+        fit_right("IN STATE", t_w)
     );
     if ctx_w > 0 {
         header.push_str(&format!(" {}", fit("CONTEXT", ctx_w - 1)));
@@ -175,13 +197,21 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         let elapsed = now - a.since;
         let timer = if matches!(a.state, State::Done | State::Gone) {
             fmt::duration(now - a.last_activity)
-        } else if elapsed.num_hours() >= 1 {
+        } else if elapsed.num_minutes() >= 10 {
             fmt::duration(elapsed)
         } else {
-            fmt::clock(elapsed)
+            // Short spans to the second: `2m38s`, never `2:38` (which reads as hours).
+            let sec = elapsed.num_seconds().max(0);
+            if sec >= 60 {
+                format!("{}m{:02}s", sec / 60, sec % 60)
+            } else {
+                format!("{sec}s")
+            }
         };
         let mut act = activity(&a.state);
-        if a.is_main() && act_w >= 48 {
+        if a.state == State::Gone {
+            act = format!("exited {} ago", fmt::duration(now - a.last_activity));
+        } else if a.is_main() && act_w >= 48 {
             let mut extra_s = format!("{}/h", fmt::usd(a.session_burn));
             if a.cpu > 0.0 || a.memory > 0 {
                 extra_s.push_str(&format!(
@@ -508,10 +538,10 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
     {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(" LAST MESSAGE ", th.heading())));
-        // Leave room for the life chart under it.
+        // The message gets what the life chart (at most 12 lines) leaves.
         let room = (card.height as usize)
-            .saturating_sub(lines.len() + 10)
-            .clamp(2, 8);
+            .saturating_sub(lines.len() + 13)
+            .clamp(3, 14);
         for l in wrap(
             if app.mask { "•••" } else { msg },
             card.width as usize,
@@ -524,7 +554,7 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
     put(f, card, lines);
     let life_area = Rect {
         y: card.y + used + 1,
-        height: card.height.saturating_sub(used + 1),
+        height: card.height.saturating_sub(used + 1).min(12),
         ..card
     };
     if life_area.height >= 6 && app.life.0 == a.key() {
@@ -645,8 +675,8 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             } else {
                 String::new()
             },
-            fit("WEEK", g + 5),
-            fit("RESETS", reset_w),
+            fit("WEEK USED", g + 5),
+            fit("RESETS IN", reset_w),
             "STATUS"
         ),
         faint(app),
@@ -703,15 +733,20 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             ManaRow::Login(label) => {
                 if first_login {
                     first_login = false;
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(" SAVED LOGINS ", th.heading()),
+                        Span::styled(
+                            " · in the vault, not in a seat · Enter puts one into a seat",
+                            faint(app),
+                        ),
+                    ]));
                 }
                 let l = app.vault.logins.iter().find(|x| &x.label == label);
+                sp.push(Span::styled(fit("", name_w), faint(app)));
                 sp.push(Span::styled(
-                    fit(&format!("⚿ {label}"), name_w),
+                    format!(" {}", fit(&format!("⚿ {label}"), login_w)),
                     Style::new().fg(th.fg),
-                ));
-                sp.push(Span::styled(
-                    format!(" {}", fit("parked", login_w)),
-                    dim(app),
                 ));
                 let acct = l.and_then(|x| x.account_uuid.clone());
                 let name = acct
@@ -780,9 +815,19 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                     .find(|x| &x.label == label)
                     .map(|x| x.live)
                     .unwrap_or(0);
-                let eta = weekly
-                    .and_then(|w| w.eta)
-                    .map(|d| format!("empty in {}", fmt::duration(d)));
+                let eta = weekly.and_then(|w| {
+                    if w.estimate_now >= 100.0 {
+                        Some("limit reached".to_string())
+                    } else {
+                        w.eta.map(|d| {
+                            format!(
+                                "runs out in {} ({})",
+                                fmt::duration(d),
+                                (now + d).with_timezone(&Local).format("%a %H:%M")
+                            )
+                        })
+                    }
+                });
                 let burn = weekly
                     .map(|w| format!("{}/h", fmt::usd(w.burn_usd_per_hour)))
                     .unwrap_or_default();
@@ -791,10 +836,14 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 } else {
                     String::new()
                 };
-                let parts: Vec<String> = [eta.clone().unwrap_or_default(), burn, live_s]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                // Whole parts only: drop the rate before cutting a number in half.
+                let mut parts: Vec<String> = Vec::new();
+                for p in [eta.clone().unwrap_or_default(), live_s, burn] {
+                    let used: usize = parts.iter().map(|x| w(x) + 3).sum();
+                    if !p.is_empty() && used + w(&p) < info_w {
+                        parts.push(p);
+                    }
+                }
                 (
                     parts.join(" · "),
                     if eta.is_some() { th.warn } else { th.dim },
@@ -803,7 +852,12 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             ManaRow::Login(label) => {
                 let l = app.vault.logins.iter().find(|x| &x.label == label);
                 let read = weekly
-                    .map(|w| format!("read {} ago", fmt::duration(now - w.reading.fetched_at)))
+                    .map(|w| {
+                        format!(
+                            "limit read {} ago",
+                            fmt::duration(now - w.reading.fetched_at)
+                        )
+                    })
                     .unwrap_or_default();
                 match l.and_then(|x| x.meta.refresh_expires_at) {
                     Some(t) if (t - now).num_days() < 7 => (
@@ -811,7 +865,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         th.warn,
                     ),
                     Some(t) => (
-                        format!("login ok {} · {read}", fmt::duration(t - now)),
+                        format!("login valid {} · {read}", fmt::duration(t - now)),
                         th.dim,
                     ),
                     None => (read, th.dim),
@@ -830,7 +884,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     }
     if focused && (lines.len() as u16) < inner.height {
         lines.push(Line::from(Span::styled(
-            "  ↑↓ select · Enter switch (seat: pick a login · login: pick a seat) · S best login here · c save seat's login · a add · r rename · d forget · R re-read",
+            "  ↑↓ select · Enter switch · S best login here · c save · a add · r rename · d forget · R re-read",
             faint(app),
         )));
     }
@@ -888,7 +942,7 @@ fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Lin
             Span::styled(mask_name(app, &rep.name), th.bold(th.fg)),
             Span::styled(
                 format!(
-                    " · week {} · ≈{}/pt",
+                    " · week used {} · 1% ≈ {}",
                     fmt::pct(win.estimate_now),
                     win.usd_per_point
                         .map(fmt::money)
@@ -908,7 +962,7 @@ fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Lin
         }
         if let Some(o) = win.outside_points.filter(|o| *o >= 2.0) {
             head.push(Span::styled(
-                format!(" · ≈{o:.0}pt elsewhere"),
+                format!(" · ≈{o:.0}% used elsewhere (claude.ai, other machines)"),
                 Style::new().fg(th.warn),
             ));
         }
@@ -931,12 +985,7 @@ fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Lin
                 &th,
             ));
             sp.push(Span::styled(
-                format!(
-                    " {:>8} {:>5} ≈{:.1}pt",
-                    fmt::usd(s.cost),
-                    fmt::pct(s.share * 100.0),
-                    s.limit_points
-                ),
+                format!(" {:>8} ≈{:.1}% of week", fmt::usd(s.cost), s.limit_points),
                 dim(app),
             ));
             lines.push(Line::from(sp));
@@ -1005,7 +1054,7 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
     let peak = wins
         .iter()
         .map(|(_, w)| w.estimate_now)
-        .chain(proj.iter().flatten().map(|p| p.1))
+        .chain(proj.iter().flatten().map(|p| p.1.min(100.0)))
         .fold(100.0f64, f64::max)
         .min(400.0);
     let ymax = peak * 1.08;
@@ -1050,6 +1099,11 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
                     break;
                 }
                 ctx.draw(&CLine::new(x, 0.0, x, ymax * 0.04, track));
+                ctx.print(
+                    x,
+                    0.0,
+                    Line::styled(d.format(" %a").to_string(), Style::new().fg(faint_c)),
+                );
                 d = d.succ_opt().unwrap_or(d);
             }
             let mut x = 0.0;
@@ -1064,27 +1118,43 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
                 x += span / 60.0;
             }
             ctx.draw(&CLine::new(xn, 0.0, xn, ymax, faint_c));
-            for (c, pts, marks, pr) in &series {
+            for (k, (c, pts, marks, pr)) in series.iter().enumerate() {
+                let k = &k;
                 for w in pts.windows(2) {
                     ctx.draw(&CLine::new(w[0].0, w[0].1, w[1].0, w[1].1, *c));
                 }
-                if let Some((xa, ya, xe, ye)) = pr {
-                    // Dotted: short dashes along the projection.
+                if let Some((xa, ya, xe, ye)) = pr.filter(|p| p.1 < 100.0) {
+                    // Dotted, and only up to the 100% line: where it crosses is the news.
+                    let stop = if ye > 100.0 {
+                        (100.0 - ya) / (ye - ya)
+                    } else {
+                        1.0
+                    };
                     let n = 40;
                     for k in (0..n).step_by(2) {
-                        let (t0, t1) = (k as f64 / n as f64, (k + 1) as f64 / n as f64);
-                        let y0 = ya + (ye - ya) * t0;
-                        let y1 = ya + (ye - ya) * t1;
-                        if y0 > ymax {
+                        let (t0, t1) = (k as f64 / n as f64, ((k + 1) as f64 / n as f64).min(stop));
+                        if t0 >= stop {
                             break;
                         }
                         ctx.draw(&CLine::new(
                             xa + (xe - xa) * t0,
-                            y0,
+                            ya + (ye - ya) * t0,
                             xa + (xe - xa) * t1,
-                            y1.min(ymax),
+                            ya + (ye - ya) * t1,
                             *c,
                         ));
+                    }
+                    if stop < 1.0 {
+                        let xc = xa + (xe - xa) * stop;
+                        let t = x0 + Duration::seconds((xc * 3600.0) as i64);
+                        ctx.print(
+                            xc,
+                            100.0 - ymax * 0.09 * (*k as f64 + 1.0),
+                            Line::styled(
+                                format!("⊘{}", t.with_timezone(&Local).format("%a %H:%M")),
+                                Style::new().fg(*c),
+                            ),
+                        );
                     }
                 }
                 ctx.draw(&Points {
@@ -1280,7 +1350,7 @@ pub fn attention(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let s = &app.snapshot;
     let count = |p: &dyn Fn(&State) -> bool| s.count(p);
-    let wide = inner.width >= 90;
+    let wide = inner.width >= 58;
     let lbl = |t: &'static str| if wide { t } else { " " };
     let fleet = vec![
         Span::styled(
@@ -1302,7 +1372,7 @@ pub fn attention(f: &mut Frame, app: &mut App, area: Rect) {
             format!("▲{} ", count(&|x| matches!(x, State::NeedsYou(_)))),
             Style::new().fg(th.warn),
         ),
-        Span::styled(lbl("needs you  "), faint(app)),
+        Span::styled(lbl("you  "), faint(app)),
         Span::styled(
             format!("✖{} ", count(&|x| matches!(x, State::Stalled))),
             Style::new().fg(th.bad),
@@ -1415,14 +1485,21 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
         app,
         Panel::Projects,
         area,
-        &format!("{period} · Enter shows its agents"),
+        &if period == "all time" {
+            format!("{period} · Enter shows its agents")
+        } else {
+            format!(
+                "{period} · ▲▼ vs {} · Enter shows its agents",
+                prev_label(&period)
+            )
+        },
         false,
     );
     let app: &App = app;
     let th = app.theme;
     let width = inner.width as usize;
     let (live_w, hour_w, today_w, per_w, share_w, pts_w) =
-        (5usize, 9usize, 10usize, 10usize, 6usize, 8usize);
+        (5usize, 9usize, 10usize, 10usize, 6usize, 10usize);
     let name_w = 18usize.min(width / 4).max(10);
     let fixed = name_w + live_w + hour_w + today_w + per_w + 6 + share_w + pts_w + 7;
     let bar_w = width.saturating_sub(fixed).min(40);
@@ -1450,7 +1527,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             fit_right(&format!("{}      ", period.to_uppercase()), per_w + 6),
             fit("", bar_w),
             fit_right("SHARE", share_w),
-            fit_right("≈WEEK", pts_w)
+            fit_right("% OF WEEK", pts_w)
         ),
         faint(app),
     ))];
@@ -1553,7 +1630,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
                 " {}",
                 fit_right(
                     &if pts > 0.05 {
-                        format!("≈{pts:.1}pt")
+                        format!("≈{pts:.1}%")
                     } else {
                         String::new()
                     },
@@ -1586,7 +1663,12 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|p| p.label())
         .unwrap_or_default();
-    let inner = frame(f, app, Panel::Models, area, &period, false);
+    let sub = if period == "all time" {
+        period.clone()
+    } else {
+        format!("{period} · ▲▼ vs {}", prev_label(&period))
+    };
+    let inner = frame(f, app, Panel::Models, area, &sub, false);
     let app: &App = app;
     let th = app.theme;
     let an = &app.analytics;
@@ -1808,7 +1890,7 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
             (k, c)
         })
         .collect();
-    let heat_h: u16 = 9;
+    let heat_h: u16 = 10;
     // Bars, labels and the selected day's line.
     let bars_h = inner.height.saturating_sub(heat_h + 1).max(5);
     let col = ((inner.width as usize) / 14).max(2);
@@ -1913,6 +1995,7 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
     ];
     if sel > 0 {
         sp.push(trend(app, *c, days[sel - 1].1));
+        sp.push(Span::styled(" vs day before", faint(app)));
     }
     for (fam, v) in stacks.get(k.as_str()).map(|v| v.as_slice()).unwrap_or(&[]) {
         if *v / c.max(1e-9) >= 0.005 {
@@ -1988,6 +2071,16 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
         hours.push_str(&fit(&l, cw));
     }
     lines.push(Line::from(Span::styled(hours, faint(app))));
+    // Colour key of the heat map.
+    let mut key = vec![Span::styled("    less ", faint(app))];
+    for k in [0.85f32, 0.6, 0.35, 0.0] {
+        key.push(Span::styled("█", Style::new().fg(th.fade(th.accent, k))));
+    }
+    key.push(Span::styled(
+        " more · spend per hour, last 4 weeks, local time",
+        faint(app),
+    ));
+    lines.push(Line::from(key));
     put(f, heat, lines);
 }
 
@@ -2202,6 +2295,17 @@ fn hrs(h: f64) -> String {
     }
 }
 
+/// The period a trend compares with: "last 7d" → "previous 7d", "today" → "yesterday".
+pub fn prev_label(period: &str) -> String {
+    match period {
+        "today" => "yesterday".into(),
+        p => match p.strip_prefix("last ") {
+            Some(rest) => format!("previous {rest}"),
+            None => format!("before {p}"),
+        },
+    }
+}
+
 /// `▲12%` / `▼8%` against the previous period; nothing when there is no base.
 pub fn trend(app: &App, cur: f64, prev: f64) -> Span<'static> {
     let th = app.theme;
@@ -2304,7 +2408,7 @@ fn time_rows(
                     if err >= 0.05 {
                         fmt::pct(err)
                     } else {
-                        String::new()
+                        "0".to_string()
                     }
                 ),
                 Style::new().fg(if err >= 5.0 { th.bad } else { th.faint }),
@@ -2368,14 +2472,11 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
             Span::styled(fit("your prompts", 15), Style::new().fg(th.fg)),
             Span::styled(format!("{:>5}", fmt::count(e.prompts)), th.bold(th.fg)),
             Span::styled(
-                format!(" · {} each", fmt::usd(e.cost / e.prompts as f64)),
+                format!(" → {} +", fmt::usd(e.cost / e.prompts as f64)),
                 dim(app),
             ),
             Span::styled(
-                format!(
-                    " · {} agent time each",
-                    hrs(e.agent_hours / e.prompts as f64)
-                ),
+                format!(" {} agent work each", hrs(e.agent_hours / e.prompts as f64)),
                 dim(app),
             ),
         ]));
@@ -2395,7 +2496,7 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
         app,
         "CACHE & TOKENS",
         format!(
-            "hit {} · saved ≈{}",
+            "hit {} · saved ≈{} (vs none)",
             fmt::pct(e.cache_hit * 100.0),
             fmt::usd(e.cache_saved)
         ),
@@ -2620,25 +2721,32 @@ pub fn efficiency(f: &mut Frame, app: &mut App, area: Rect) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(2),
     };
-    let ncols = ((probe.width as usize + 2) / 48).max(1);
+    let ncols = ((probe.width as usize + 2) / 42).max(1);
     let cw = (probe.width as usize / ncols).saturating_sub(2).max(20);
     let height = probe.height as usize;
     let sections = efficiency_sections(app, cw);
-    let mut pages: Vec<Vec<Vec<Line<'static>>>> = vec![vec![Vec::new()]];
+    let ncols = ncols.min(sections.len()).max(1);
+    // Each section goes to the shortest column it fits in; a new page when none has room.
+    let mut pages: Vec<Vec<Vec<Line<'static>>>> = vec![vec![Vec::new(); ncols]];
     for mut sec in sections {
         sec.truncate(height);
         let page = pages.last_mut().unwrap();
-        let col = page.last_mut().unwrap();
-        let need = sec.len() + usize::from(!col.is_empty());
-        if col.len() + need <= height {
-            if !col.is_empty() {
-                col.push(Line::from(""));
+        let fits = |c: &Vec<Line>| c.len() + sec.len() + usize::from(!c.is_empty()) <= height;
+        match (0..ncols)
+            .filter(|i| fits(&page[*i]))
+            .min_by_key(|i| page[*i].len())
+        {
+            Some(i) => {
+                if !page[i].is_empty() {
+                    page[i].push(Line::from(""));
+                }
+                page[i].extend(sec);
             }
-            col.extend(sec);
-        } else if page.len() < ncols {
-            page.push(sec);
-        } else {
-            pages.push(vec![sec]);
+            None => {
+                let mut p = vec![Vec::new(); ncols];
+                p[0] = sec;
+                pages.push(p);
+            }
         }
     }
     let n = pages.len();

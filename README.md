@@ -35,7 +35,7 @@ On a big terminal everything is on one wall; nothing hides behind tabs.
 The panels:
 
 - **1 SWARM** — live agents grouped by session (sessions are separated, project names stand out), each with a 30-minute activity lane (thinking · tool · waiting for agents · waiting for you; `v` switches to spend), then what finished recently
-- **2 MANA · SEATS** — limits per account, seats and the login vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
+- **2 MANA · SEATS** — how much of each account's weekly limit is used ("week used", "runs out in …"), seats, and the saved logins of the vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
 - **3 BURN** — dollars per hour and per minute by model
 - **4 ATTENTION** — needs you, stalled, limits about to run out, two agents editing one file, unsaved or expiring logins; the event log under it (filled from the last 3 hours on launch)
 - **5 AGENT** — card, last message, the agent's life (cost of each request, context growth, compactions), tool timeline
@@ -100,6 +100,7 @@ below that (`L` cycles them).
 | `v` | SWARM: activity lanes of 30 min ↔ spend of 15 min |
 | `←→` in HISTORY | pick a day: its spend by model and the change against the day before |
 | `t` · `g` | period (today, 7d, 30d, all) · spend grouping |
+| `?` | keys and a legend of every glyph, number, colour and word (on small screens `Tab` flips between them) |
 | MANA: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
 | `m` · `p` · `T` · `?` · `q` | mask · pause animations · theme · help · quit |
 

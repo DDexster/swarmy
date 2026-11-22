@@ -174,7 +174,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         }) => {
             let dirs = crate::config::Dirs::resolve()?;
             let demo = crate::demo::start(&dirs.data.join("demo"))?;
-            let ctx = context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
+            let mut ctx = context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
             // Saved logins, so the VAULT screen has something to show.
             {
                 let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
@@ -192,6 +192,8 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 };
                 v.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None)?;
             }
+            // Account names come from the saved logins just made.
+            ctx.drop_unconfirmed();
             match record {
                 Some(out) => {
                     let (w, h) = size

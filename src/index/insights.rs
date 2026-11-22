@@ -76,6 +76,7 @@ pub struct Efficiency {
 /// `cd x && FOO=1 cargo test -p y | tail` → `cargo test`; `tools/agents/gate.sh` → `gate.sh`.
 pub fn command_key(cmd: &str) -> String {
     const SKIP: &[&str] = &[
+        "until", "while", "for", "if", "case", "test", "[", "[[", "wait", "read", "exit", "return",
         "cd", "export", "set", "source", ".", "mkdir", "echo", "sleep", "true", "unset", "trap",
         "local", "rm",
     ];
@@ -92,7 +93,21 @@ pub fn command_key(cmd: &str) -> String {
                     "env" | "time" | "do" | "then" | "else" | "{" | "(" | "!" | "exec" | "nice"
                 )
         });
-        let Some(first) = words.next() else { continue };
+        let Some(mut first) = words.next() else {
+            continue;
+        };
+        // Wrappers: `timeout 600 cargo test`, `xargs -0 grep`, `stdbuf -oL make`.
+        while matches!(
+            first.rsplit('/').next().unwrap_or(first),
+            "timeout" | "xargs" | "stdbuf" | "nohup" | "sudo" | "command"
+        ) {
+            match words.find(|w| {
+                !w.starts_with('-') && !w.chars().next().is_some_and(|c| c.is_ascii_digit())
+            }) {
+                Some(next) => first = next,
+                None => break,
+            }
+        }
         let prog = first
             .rsplit('/')
             .next()
@@ -372,6 +387,11 @@ mod tests {
         assert_eq!(command_key("git -C repo status --short"), "git repo");
         assert_eq!(command_key("python3 - <<'EOF'"), "python3");
         assert_eq!(command_key("sleep 30"), "sleep");
+        assert_eq!(command_key("timeout 600 cargo test -p x"), "cargo test");
+        assert_eq!(
+            command_key("until [ -s f ]; do sleep 5; done; cat f"),
+            "cat"
+        );
         assert_eq!(command_key("for i in 1 2; do grep -n x f; done"), "grep");
     }
 }

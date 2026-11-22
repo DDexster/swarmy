@@ -44,10 +44,16 @@ pub fn frame(f: &mut Frame, app: &mut App, p: Panel, area: Rect, suffix: &str, h
     } else {
         th.border
     };
+    // In tabs the digits switch tabs, so panel numbers would mislead.
+    let tabs = app.shape == crate::tui::app::Shape::Tabs;
     let mut title = vec![
         Span::raw(" "),
         Span::styled(
-            format!(" {} ", p.number()),
+            if tabs {
+                String::new()
+            } else {
+                format!(" {} ", p.number())
+            },
             Style::new()
                 .fg(if focused { th.bg } else { th.dim })
                 .bg(if focused { th.accent } else { th.track })

@@ -62,6 +62,47 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         help(f, app, area);
     }
     toast(f, app, area);
+    if app.mask {
+        mask_user(f, area);
+    }
+}
+
+/// The OS user name (from the home dir), the one personal word that can sit anywhere on screen:
+/// login labels, project dirs, paths. Masking blanks it out of the finished frame.
+fn user_word() -> Option<&'static str> {
+    static U: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    U.get_or_init(|| {
+        let home = directories::BaseDirs::new()?.home_dir().to_path_buf();
+        let name = home.file_name()?.to_string_lossy().into_owned();
+        (name.chars().count() >= 3 && name.is_ascii()).then_some(name)
+    })
+    .as_deref()
+}
+
+fn mask_user(f: &mut Frame, area: Rect) {
+    let Some(word) = user_word() else { return };
+    let chars: Vec<char> = word.chars().collect();
+    let n = chars.len() as u16;
+    let buf = f.buffer_mut();
+    for y in area.y..area.y + area.height {
+        let mut x = area.x;
+        while x + n <= area.x + area.width {
+            let hit = chars.iter().enumerate().all(|(i, c)| {
+                buf[(x + i as u16, y)]
+                    .symbol()
+                    .chars()
+                    .eq(std::iter::once(*c))
+            });
+            if hit {
+                for i in 0..n {
+                    buf[(x + i, y)].set_symbol("•");
+                }
+                x += n;
+            } else {
+                x += 1;
+            }
+        }
+    }
 }
 
 fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
@@ -111,7 +152,7 @@ fn wall(f: &mut Frame, app: &mut App, body: Rect) {
     let b = hsplit(rows[1], &[64, 36]);
     draw_panel(f, app, Panel::Swarm, b[0], false);
     draw_panel(f, app, Panel::Agent, b[1], false);
-    let c = hsplit(rows[2], &[27, 24, 21, 28]);
+    let c = hsplit(rows[2], &[25, 23, 19, 33]);
     draw_panel(f, app, Panel::Projects, c[0], false);
     draw_panel(f, app, Panel::Models, c[1], false);
     draw_panel(f, app, Panel::History, c[2], false);
@@ -212,13 +253,24 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
         format!("   {} agents ", s.agents.len()),
         Style::new().fg(th.dim),
     ));
-    spans.push(Span::styled(
-        format!(
-            "●{} ",
-            n(&|x| matches!(x, State::Tool { .. })) + n(&|x| matches!(x, State::Thinking))
+    // The same glyphs and words as ATTENTION and the legend.
+    for (glyph, count, label, c) in [
+        (
+            "●",
+            n(&|x| matches!(x, State::Tool { .. })),
+            "working",
+            th.good,
         ),
-        Style::new().fg(th.good),
-    ));
+        (
+            "◌",
+            n(&|x| matches!(x, State::Thinking)),
+            "thinking",
+            th.thinking,
+        ),
+    ] {
+        spans.push(Span::styled(format!("{glyph}{count} "), Style::new().fg(c)));
+        spans.push(Span::styled(format!("{label} "), Style::new().fg(th.faint)));
+    }
     if needs > 0 {
         spans.push(Span::styled(
             format!("▲{needs} needs you "),
@@ -228,32 +280,54 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
     let stalled = n(&|x| matches!(x, State::Stalled));
     if stalled > 0 {
         spans.push(Span::styled(
-            format!("✖{stalled} "),
+            format!("✖{stalled} stalled "),
             Style::new().fg(th.bad),
         ));
     }
-    // The tightest account.
-    if let Some((name, pct)) = app
+    // The tightest account that sits in a seat (a parked login cannot be used anyway).
+    let seated: Vec<&str> = app
+        .analytics
+        .seats
+        .iter()
+        .filter_map(|s| s.account.as_deref())
+        .collect();
+    if let Some((name, pct, resets)) = app
         .analytics
         .limits
         .iter()
+        .filter(|r| seated.is_empty() || seated.contains(&r.account_uuid.as_str()))
         .filter_map(|r| {
             r.windows
                 .iter()
                 .filter(|w| !w.reset_passed)
-                .map(|w| (r.name.clone(), w.estimate_now))
+                .map(|w| (r.name.clone(), w.estimate_now, w.reading.resets_at))
                 .max_by(|a, b| a.1.total_cmp(&b.1))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
     {
-        spans.push(Span::styled("  mana ", Style::new().fg(th.faint)));
+        spans.push(Span::styled("  week used ", Style::new().fg(th.faint)));
+        let value = if pct >= 100.0 {
+            "limit reached".to_string()
+        } else {
+            fmt::pct(pct)
+        };
         spans.push(Span::styled(
-            format!("{} {}", mask_name(app, &name), fmt::pct(pct)),
+            format!("{} {value}", mask_name(app, &name)),
             th.bold(th.utilization(pct)),
+        ));
+        spans.push(Span::styled(
+            format!(
+                " · resets in {}",
+                fmt::duration(resets - chrono::Utc::now())
+            ),
+            Style::new().fg(th.faint),
         ));
     }
     if app.eco {
-        spans.push(Span::styled("  ECO", Style::new().fg(th.good)));
+        spans.push(Span::styled(
+            "  ECO (battery: slower refresh)",
+            Style::new().fg(th.good),
+        ));
     }
     let right = if area.width >= 170 {
         format!("layout {:?} · {} ", app.shape, app.clock()).to_lowercase()
@@ -338,17 +412,46 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         format!("{} ", app.focus.title()),
         th.bold(th.accent),
     ));
-    spans.push(Span::styled(panel_keys(app.focus), Style::new().fg(th.dim)));
-    let global = if app.zoom.is_some() {
-        "  │  Esc back · z unzoom · ? help · q quit "
+    // Global keys on the right: help and quit always, the rest while there is room; the focused
+    // panel's keys take what is left and are cut first.
+    let width = area.width as usize;
+    let lead: usize = spans.iter().map(|s| w(&s.content)).sum();
+    let optional: Vec<&str> = if app.zoom.is_some() {
+        vec!["Esc back", "z unzoom"]
+    } else if app.shape == Shape::Tabs {
+        vec![
+            "Tab next panel",
+            "1-5 tabs",
+            "n next alert",
+            "t period",
+            ": cmd",
+        ]
     } else {
-        "  │  Tab next panel · 1-9 focus (again: zoom) · n next alert · t period · : cmd · ? help · q quit "
+        vec![
+            "Tab next panel",
+            "1-9 focus (again: zoom)",
+            "n next alert",
+            "t period",
+            ": cmd",
+        ]
     };
+    let mut right: Vec<&str> = vec!["? help & legend", "q quit"];
+    let budget = width.saturating_sub(lead + 34);
+    for o in optional {
+        let cur = right.iter().map(|x| w(x) + 3).sum::<usize>() + 5;
+        if cur + w(o) + 3 <= budget {
+            right.insert(right.len() - 2, o);
+        }
+    }
+    let global = format!("  │  {} ", right.join(" · "));
+    let keys = crate::ui::table::truncate(
+        panel_keys(app.focus),
+        width.saturating_sub(lead + w(&global)),
+    );
+    spans.push(Span::styled(keys, Style::new().fg(th.dim)));
     let used: usize = spans.iter().map(|s| w(&s.content)).sum();
-    let g = crate::ui::table::truncate(global, (area.width as usize).saturating_sub(used));
-    spans.push(Span::raw(
-        " ".repeat((area.width as usize).saturating_sub(used + w(&g))),
-    ));
+    let g = crate::ui::table::truncate(&global, width.saturating_sub(used));
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used + w(&g)))));
     spans.push(Span::styled(g, Style::new().fg(th.faint)));
     f.render_widget(Paragraph::new(Line::from(spans)).style(th.base()), area);
 }
@@ -380,7 +483,7 @@ fn picker(f: &mut Frame, app: &App, area: Rect) {
     let Some(p) = &app.vault.picker else { return };
     let th = &app.theme;
     let title = match &p.what {
-        PickFor::Seat(s) => format!("put a login into seat '{s}' · most limit left first"),
+        PickFor::Seat(s) => format!("put a saved login into seat '{s}' · most limit left first"),
         PickFor::Login(l) => format!("put login '{l}' into a seat"),
     };
     let r = centered(area, 96, p.items.len() as u16 + 6);
@@ -451,8 +554,16 @@ fn picker(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(format!(" {}", fit(&acct, 22)), Style::new().fg(th.dim)),
             Span::raw(" "),
         ];
-        sp.extend(pc(five));
-        sp.extend(pc(week));
+        if five.is_none() && week.is_none() {
+            // Nothing known yet: say why instead of two "unknown" columns.
+            sp.push(Span::styled(
+                fit("limit unknown until this login is used", 26),
+                Style::new().fg(th.faint),
+            ));
+        } else {
+            sp.extend(pc(five));
+            sp.extend(pc(week));
+        }
         sp.push(Span::styled(
             format!(
                 "{}{expires}",
@@ -513,6 +624,7 @@ fn modal(f: &mut Frame, app: &App, area: Rect) {
 
 fn help(f: &mut Frame, app: &App, area: Rect) {
     let th = &app.theme;
+    let tabs = app.shape == super::app::Shape::Tabs;
     let mut rows: Vec<(String, String)> =
         vec![(format!("— {} —", app.focus.title()), String::new())];
     for part in panel_keys(app.focus).split(" · ") {
@@ -521,15 +633,23 @@ fn help(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     rows.push(("— everywhere —".into(), String::new()));
+    let focus_keys = if tabs {
+        (
+            "1-5",
+            "switch tab (OPS · AGENT · MANA · SPEND · SYSTEM); Tab moves between its panels",
+        )
+    } else {
+        (
+            "1-9, 0",
+            "focus the panel with that number (in its title); again = zoom; 0 = SYSTEM",
+        )
+    };
     for (k, d) in [
         (
             "Tab · Shift-Tab",
             "next / previous panel (the focused one has a bright border)",
         ),
-        (
-            "1-9, 0",
-            "focus panel N (numbers are in the titles); press again to zoom; 0 = SYSTEM",
-        ),
+        focus_keys,
         (
             "z · Esc",
             "zoom the focused panel · back (closes dialogs, zoom, filter)",
@@ -548,39 +668,239 @@ fn help(f: &mut Frame, app: &App, area: Rect) {
         ),
         ("t · g", "period (today · 7d · 30d · all) · spend grouping"),
         ("J", "jump to the selected agent's Claude Code in tmux"),
-        (
-            "v",
-            "SWARM column: activity lanes of 30 min · spend of 15 min",
-        ),
+        ("v", "SWARM: activity lanes of 30 min ↔ spend of 15 min"),
         ("L", "layout: auto · wall · column · tabs"),
         ("m · p · T", "mask names · pause animations · theme"),
         (
             "mouse",
-            "click focuses a panel / selects an agent; wheel scrolls the panel under it",
+            "click focuses a panel / selects an agent; wheel scrolls",
         ),
-        ("? · q", "close help · quit"),
+        (
+            "? · q",
+            if tabs {
+                "legend, then close · quit"
+            } else {
+                "close help · quit"
+            },
+        ),
     ] {
         rows.push((k.into(), d.into()));
     }
-    let r = centered(area, 100, rows.len() as u16 + 2);
-    f.render_widget(Clear, r);
-    let block = dialog(app, "KEYS");
-    let inner = block.inner(r);
-    f.render_widget(block, r);
-    let lines: Vec<Line> = rows
+    rows.push(("— vault (panel 2) —".into(), String::new()));
+    for (k, d) in [
+        (
+            "Enter",
+            "on a seat: pick a saved login to put in · on a saved login: pick a seat",
+        ),
+        (
+            "S",
+            "put the saved login with the most limit left into the seat",
+        ),
+        (
+            "c · a",
+            "save the seat's current login · add a new login (runs claude /login)",
+        ),
+        (
+            "r · d · R",
+            "rename · forget a saved login · re-read logins from disk",
+        ),
+        (
+            "",
+            "a switch saves the seat's current login first and backs up both files;",
+        ),
+        ("", "running sessions keep their old login until restarted"),
+    ] {
+        rows.push((k.into(), d.into()));
+    }
+    let keys: Vec<Line> = rows
         .into_iter()
         .map(|(k, d)| {
             if d.is_empty() {
                 Line::from(Span::styled(k, th.bold(th.dim)))
             } else {
                 Line::from(vec![
-                    Span::styled(fit(&k, 20), th.bold(th.accent)),
+                    Span::styled(fit(&k, 16), th.bold(th.accent)),
                     Span::styled(d, Style::new().fg(th.fg)),
                 ])
             }
         })
         .collect();
-    f.render_widget(Paragraph::new(lines), inner);
+    let legend = legend_lines(app);
+    let wide = area.width >= 170;
+    let height = if wide {
+        keys.len().max(legend.len())
+    } else if app.help_page == 0 {
+        keys.len()
+    } else {
+        legend.len()
+    };
+    let width = if wide {
+        area.width.saturating_sub(6).min(186)
+    } else {
+        104
+    };
+    let r = centered(area, width, height as u16 + 2);
+    f.render_widget(Clear, r);
+    let title = if wide {
+        "KEYS · LEGEND"
+    } else if app.help_page == 0 {
+        "KEYS · Tab: legend"
+    } else {
+        "LEGEND · Tab: keys"
+    };
+    let block = dialog(app, title);
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+    if wide {
+        let c = hsplit(inner, &[50, 50]);
+        f.render_widget(Paragraph::new(keys), c[0]);
+        f.render_widget(
+            Paragraph::new(legend),
+            Rect {
+                x: c[1].x + 2,
+                width: c[1].width.saturating_sub(2),
+                ..c[1]
+            },
+        );
+    } else if app.help_page == 0 {
+        f.render_widget(Paragraph::new(keys), inner);
+    } else {
+        f.render_widget(Paragraph::new(legend), inner);
+    }
+}
+
+/// What the glyphs, numbers, colours and words on the screen mean.
+fn legend_lines(app: &App) -> Vec<Line<'static>> {
+    let th = &app.theme;
+    let head = |t: &str| Line::from(Span::styled(format!("— {t} —"), th.bold(th.dim)));
+    let row = |g: &str, c: ratatui::style::Color, d: &str| {
+        Line::from(vec![
+            Span::styled(fit(g, 16), th.bold(c)),
+            Span::styled(d.to_string(), Style::new().fg(th.fg)),
+        ])
+    };
+    vec![
+        head("agent states"),
+        row("●", th.good, "working: running a tool"),
+        row(
+            "⠋ ◌",
+            th.thinking,
+            "thinking: waiting for the model's answer",
+        ),
+        row("◐", th.accent, "waiting for its own agents"),
+        row(
+            "▲",
+            th.warn,
+            "needs you: a question, a permission, a plan to approve",
+        ),
+        row("✖", th.bad, "stalled: no activity for a while"),
+        row("○ ✓ ·", th.dim, "idle · done · exited"),
+        row(
+            "▃ ▅ ▆ █",
+            th.accent,
+            "SWARM lanes, a minute each: thinking · tool · agents · you",
+        ),
+        head("alerts and events"),
+        row("⊘", th.warn, "a weekly or 5-hour limit is close or reached"),
+        row(
+            "⚠",
+            th.warn,
+            "two agents edited the same file within the hour",
+        ),
+        row(
+            "⚿",
+            th.accent,
+            "logins: unsaved, unknown, expiring (the vault)",
+        ),
+        row(
+            "+ ✓ ✎ ◆ !",
+            th.dim,
+            "spawned · finished · your prompt · online · API error",
+        ),
+        head("numbers"),
+        row(
+            "$",
+            th.fg,
+            "API-equivalent cost at list prices (not what a plan bills)",
+        ),
+        row(
+            "Σ",
+            th.fg,
+            "the whole session: main thread and all its agents",
+        ),
+        row(
+            "week used",
+            th.fg,
+            "share of the account's weekly limit; 1% ≈ $X: API dollars per 1%",
+        ),
+        row(
+            "≈",
+            th.fg,
+            "an estimate between Claude Code's limit readings",
+        ),
+        row(
+            "▲ ▼",
+            th.warn,
+            "change against the previous period (HISTORY: the day before)",
+        ),
+        row(
+            "lo md hi xh mx",
+            th.fg,
+            "effort: low · medium · high · xhigh · max",
+        ),
+        row(
+            "CONTEXT",
+            th.fg,
+            "share of the model's context window in use",
+        ),
+        row(
+            "IN STATE",
+            th.fg,
+            "how long the agent has been in its current state",
+        ),
+        head("colours"),
+        Line::from(vec![
+            Span::styled(fit("limit", 16), th.bold(th.fg)),
+            Span::styled("below 60% ", Style::new().fg(th.good)),
+            Span::styled("60–85% ", Style::new().fg(th.warn)),
+            Span::styled("above 85%", Style::new().fg(th.bad)),
+        ]),
+        Line::from(vec![
+            Span::styled(fit("models", 16), th.bold(th.fg)),
+            Span::styled("fable ", Style::new().fg(th.fable)),
+            Span::styled("opus ", Style::new().fg(th.opus)),
+            Span::styled("sonnet ", Style::new().fg(th.sonnet)),
+            Span::styled("haiku", Style::new().fg(th.haiku)),
+            Span::styled(" (the same in every panel)", Style::new().fg(th.dim)),
+        ]),
+        row("project", th.dir, "project and directory names"),
+        row(
+            "● ○ ECO",
+            th.good,
+            "header: data fresh / stale · on battery, refreshes less often",
+        ),
+        row(
+            "│ now",
+            th.faint,
+            "the limit chart: the vertical line is now, ⊘ where the projection hits 100%",
+        ),
+        head("words"),
+        row(
+            "seat",
+            th.fg,
+            "a Claude Code config dir (~/.claude, ~/.claude-work…)",
+        ),
+        row(
+            "login",
+            th.fg,
+            "an OAuth sign-in; saved ones live in the vault",
+        ),
+        row(
+            "account",
+            th.fg,
+            "the Anthropic account behind a login; limits are per account",
+        ),
+    ]
 }
 
 fn toast(f: &mut Frame, app: &App, area: Rect) {

@@ -91,6 +91,15 @@ terminal; every panel fills its rect; positions are stable (the selection is kep
 tree is in start order, panel sizes do not depend on the agent count); colour only where it means
 something; everything works from the keyboard.
 
+Words on screen (keep them, and the legend in `view/mod.rs::legend_lines`, in sync):
+- **seat** = a Claude Code config dir; **login** = an OAuth sign-in (saved ones live in the vault);
+  **account** = the Anthropic account behind a login, named after its saved login.
+- Limits: "week used N%", "runs out in 7h (Mon 03:34)", "limit reached"; shares as "% of week",
+  "1% ≈ $X". Never "mana N%" or "pt" on screen (mana is only the product's name).
+- Trends say what they compare with ("▲▼ vs previous 7d", "vs day before").
+- Every new glyph, unit or colour gets a legend line; the footer keeps "? help & legend" visible.
+- `--mask` blanks emails and the OS user name in the finished frame (`mask_user`).
+
 Style rules the owner asked for:
 - Panel titles and in-panel section headings sit on a plate (`Theme::heading()`, the
   `title`/`title_bg` colours of each theme); the focused panel's plate is the accent colour. New

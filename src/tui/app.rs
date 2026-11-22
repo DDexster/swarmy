@@ -207,6 +207,8 @@ pub struct App {
     pub focus: Panel,
     pub zoom: Option<Panel>,
     pub help: bool,
+    /// Help page on small screens: 0 keys, 1 legend (both side by side on wide ones).
+    pub help_page: u8,
     pub boot: Option<Boot>,
     pub started: Instant,
     pub snapshot: Snapshot,
@@ -272,6 +274,7 @@ impl App {
             focus: Panel::Swarm,
             zoom: None,
             help: false,
+            help_page: 0,
             boot: Some(Boot {
                 started: Instant::now(),
                 progress: Progress::default(),
@@ -508,17 +511,30 @@ impl App {
                 target: AttnTarget::None,
             });
         }
+        let seated: Vec<&str> = self
+            .analytics
+            .seats
+            .iter()
+            .filter_map(|s| s.account.as_deref())
+            .collect();
         for rep in &self.analytics.limits {
+            // A login parked in the vault is not urgent: nothing runs on it.
+            let parked = !seated.is_empty() && !seated.contains(&rep.account_uuid.as_str());
             for w in &rep.windows {
                 let label = format!("{} {}", rep.name, w.reading.kind.label());
                 if w.estimate_now >= 100.0 && !w.reset_passed {
                     out.push(Attn {
-                        severity: 1,
-                        glyph: "◆",
-                        tone: Tone::Bad,
+                        severity: if parked { 8 } else { 1 },
+                        glyph: "⊘",
+                        tone: if parked { Tone::Info } else { Tone::Bad },
                         text: format!(
-                            "{label}: limit reached · resets in {}",
-                            fmt::duration(w.window.end - now)
+                            "{label}: limit reached · resets in {}{}",
+                            fmt::duration(w.window.end - now),
+                            if parked {
+                                " (saved login, not in a seat)"
+                            } else {
+                                " · S puts the best login in"
+                            }
                         ),
                         since: None,
                         target: AttnTarget::Mana,
@@ -526,12 +542,13 @@ impl App {
                 } else if let Some(eta) = w.eta.filter(|d| d.num_hours() < 6) {
                     out.push(Attn {
                         severity: 1,
-                        glyph: "◆",
+                        glyph: "⊘",
                         tone: Tone::Warn,
                         text: format!(
-                            "{label}: {} · empty in {}",
+                            "{label}: {} used · runs out in {} ({})",
                             fmt::pct(w.estimate_now),
-                            fmt::duration(eta)
+                            fmt::duration(eta),
+                            (now + eta).with_timezone(&chrono::Local).format("%a %H:%M")
                         ),
                         since: None,
                         target: AttnTarget::Mana,
@@ -539,7 +556,7 @@ impl App {
                 } else if w.estimate_now >= 85.0 {
                     out.push(Attn {
                         severity: 6,
-                        glyph: "◆",
+                        glyph: "⊘",
                         tone: Tone::Warn,
                         text: format!("{label}: {} used", fmt::pct(w.estimate_now)),
                         since: None,
@@ -554,7 +571,10 @@ impl App {
                     severity: 5,
                     glyph: "⚿",
                     tone: Tone::Warn,
-                    text: format!("seat {}: new login, account not confirmed", s.label),
+                    text: format!(
+                        "seat {}: new login, account not known yet (start Claude Code there once)",
+                        s.label
+                    ),
                     since: s.state.unverified_since,
                     target: AttnTarget::Mana,
                 });
@@ -563,7 +583,10 @@ impl App {
                     severity: 7,
                     glyph: "⚿",
                     tone: Tone::Info,
-                    text: format!("seat {}: login not saved (c to save)", s.label),
+                    text: format!(
+                        "seat {}: save this login to switch back to it later (c)",
+                        s.label
+                    ),
                     since: None,
                     target: AttnTarget::Mana,
                 });
@@ -998,11 +1021,17 @@ impl App {
             return false;
         }
         if self.help {
-            if matches!(
-                k.code,
-                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')
-            ) {
-                self.help = false;
+            match k.code {
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => self.help_page ^= 1,
+                // `?` again: the legend on small screens, then close.
+                KeyCode::Char('?') if self.help_page == 0 && self.shape == Shape::Tabs => {
+                    self.help_page = 1
+                }
+                KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                    self.help = false;
+                    self.help_page = 0;
+                }
+                _ => {}
             }
             return false;
         }

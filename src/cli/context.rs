@@ -206,6 +206,10 @@ impl Ctx {
         if let Some(l) = self.config.accounts.get(uuid) {
             return l.clone();
         }
+        // A saved login's label names its account best: seat names would mix the two ideas.
+        if let Some(l) = self.login_labels.get(uuid) {
+            return l.clone();
+        }
         let seats: Vec<&str> = self
             .seat_info
             .iter()
@@ -213,10 +217,7 @@ impl Ctx {
             .map(|s| s.label.as_str())
             .collect();
         if !seats.is_empty() {
-            return seats.join("+");
-        }
-        if let Some(l) = self.login_labels.get(uuid) {
-            return l.clone();
+            return format!("account in {}", seats.join("+"));
         }
         if !self.mask
             && let Some(e) = self
