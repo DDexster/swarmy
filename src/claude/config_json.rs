@@ -176,8 +176,13 @@ mod tests {
         assert_eq!(u.readings[0].kind, WindowKind::SevenDay);
         assert_eq!(u.readings[0].utilization, 65.0);
         assert_eq!(
+            u.readings[0].resets_at.to_rfc3339(),
+            "2026-11-25T14:59:59.983904+00:00"
+        );
+        // The window is named by its reset to the minute (sources differ by jitter).
+        assert_eq!(
             u.readings[0].window().start.to_rfc3339(),
-            "2026-11-18T14:59:59.983904+00:00"
+            "2026-11-18T15:00:00+00:00"
         );
         assert!(c.model_costs.is_some());
     }

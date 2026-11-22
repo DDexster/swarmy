@@ -8,8 +8,23 @@ use serde::Serialize;
 
 use super::{Index, from_ms, ms};
 use crate::core::limits::{Reading, WindowKind};
-use crate::core::period::Span;
+use crate::core::period::{BUCKET_MS, Span, bucket_start};
 use crate::core::usage::Usage;
+
+/// The label of an agent's type over `agents a`, the same in `report --by agent-type` and the
+/// EFFICIENCY panel: "main thread", "workflow:<type>", or the subagent's type.
+macro_rules! agent_type_label {
+    () => {
+        "CASE WHEN a.kind = 'main' THEN 'main thread' WHEN a.kind = 'workflow' THEN 'workflow:' || COALESCE(a.agent_type, '?') ELSE COALESCE(a.agent_type, 'subagent') END"
+    };
+}
+pub(super) const AGENT_TYPE: &str = agent_type_label!();
+/// [`AGENT_TYPE`] of a request (`requests r` joined with `agents a`, which may have no row).
+const AGENT_TYPE_OF_REQUEST: &str = concat!(
+    "CASE WHEN r.agent_id = '' THEN 'main thread' ELSE ",
+    agent_type_label!(),
+    " END"
+);
 
 /// A grouping dimension for spend reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
@@ -43,10 +58,7 @@ impl Dim {
             Dim::Seat => ("r.seat", "r.seat"),
             Dim::Model => ("r.model", "r.model"),
             Dim::Effort => ("COALESCE(r.effort, '-')", "COALESCE(r.effort, '-')"),
-            Dim::AgentType => (
-                "CASE WHEN r.agent_id = '' THEN 'main thread' WHEN a.kind = 'workflow' THEN 'workflow:' || COALESCE(a.agent_type, '?') ELSE COALESCE(a.agent_type, 'subagent') END",
-                "CASE WHEN r.agent_id = '' THEN 'main thread' WHEN a.kind = 'workflow' THEN 'workflow:' || COALESCE(a.agent_type, '?') ELSE COALESCE(a.agent_type, 'subagent') END",
-            ),
+            Dim::AgentType => (AGENT_TYPE_OF_REQUEST, AGENT_TYPE_OF_REQUEST),
             Dim::Session => (
                 "r.seat || '/' || r.session_id",
                 "MAX(COALESCE(s.title, s.ai_title, substr(r.session_id, 1, 8)))",
@@ -208,8 +220,9 @@ fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Sums> {
     ))
 }
 
-/// One UTC hour: (hour number, requests, usage, cost, unpriced, pending).
-type HourRow = (i64, u64, Usage, f64, u64, u64);
+/// One UTC quarter hour (`period::BUCKET_MS`): (bucket number, requests, usage, cost, unpriced,
+/// pending).
+type BucketRow = (i64, u64, Usage, f64, u64, u64);
 
 impl Index {
     pub fn spend_by(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
@@ -238,13 +251,13 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Sums per UTC hour; local-time grouping happens in Rust, which is far cheaper than
-    /// SQLite's `localtime` on every row.
-    fn hourly(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<HourRow>> {
+    /// Sums per UTC quarter hour; local-time grouping happens in Rust (`time_key`), which is far
+    /// cheaper than SQLite's `localtime` on every row and exact in every zone.
+    fn buckets(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
         let mut args = Vec::new();
         let wh = where_clause(span, f, &mut args);
         let from = from_for(&[&wh]);
-        let sql = format!("SELECT r.ts / 3600000, {SUMS} {from} {wh} GROUP BY 1");
+        let sql = format!("SELECT r.ts / {BUCKET_MS}, {SUMS} {from} {wh} GROUP BY 1");
         let mut st = self.conn.prepare(&sql)?;
         let rows = st.query_map(params_from_iter(args), |r| {
             let (n, u, c, up, pe) = row_usage(r, 1)?;
@@ -253,18 +266,12 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    fn time_key(dim: Dim, hour: i64) -> String {
-        let t = from_ms(hour * 3_600_000).with_timezone(&chrono::Local);
-        match dim {
-            Dim::Day => t.format("%Y-%m-%d").to_string(),
-            Dim::Hour => t.format("%H").to_string(),
-            _ => t.format("%w").to_string(),
-        }
+    fn time_key(dim: Dim, bucket: i64) -> String {
+        time_key_in(dim, bucket, &chrono::Local)
     }
-
     fn spend_by_time(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
         let mut acc: BTreeMap<String, Row> = BTreeMap::new();
-        for (h, n, u, c, up, pe) in self.hourly(span, f)? {
+        for (h, n, u, c, up, pe) in self.buckets(span, f)? {
             let k = Self::time_key(dim, h);
             let e = acc.entry(k.clone()).or_insert_with(|| Row {
                 key: k.clone(),
@@ -294,7 +301,7 @@ impl Index {
     ) -> anyhow::Result<Vec<(String, String, f64)>> {
         if a.is_time() && b.is_time() {
             let mut acc: BTreeMap<(String, String), f64> = BTreeMap::new();
-            for (h, _, _, c, _, _) in self.hourly(span, f)? {
+            for (h, _, _, c, _, _) in self.buckets(span, f)? {
                 *acc.entry((Self::time_key(a, h), Self::time_key(b, h)))
                     .or_default() += c;
             }
@@ -334,6 +341,55 @@ impl Index {
         let row = total_on(&tx, span, f)?;
         tx.commit()?;
         Ok((row, fp))
+    }
+
+    /// The spend of an account over a span. A span that ended before the settled horizon
+    /// ([`super::SETTLED_AFTER_MS`]) is summed once and remembered (the dashboard asks every
+    /// minute), keyed by the settled generation and the price fingerprint read together with the
+    /// total: a reprice, a re-attribution or a late request (here or in another process) is never
+    /// cached away. A total with requests still waiting for a price is not remembered.
+    pub fn settled_total(
+        &self,
+        account: &str,
+        span: Span,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<f64> {
+        let filter = Filter {
+            account: Some(account.to_string()),
+            ..Default::default()
+        };
+        if ms(span.end) >= ms(now) - super::SETTLED_AFTER_MS {
+            return Ok(self.total(span, &filter)?.cost);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let generation = super::schema::meta(&tx, "settled_gen")?;
+        let fp = super::schema::meta(&tx, "price_fp")?;
+        let key = |fp: &str| {
+            (
+                generation.clone(),
+                fp.to_string(),
+                account.to_string(),
+                ms(span.start),
+                ms(span.end),
+            )
+        };
+        if let Some(fp) = &fp
+            && let Some(v) = self.settled.borrow().get(&key(fp))
+        {
+            return Ok(*v);
+        }
+        let row = total_on(&tx, span, &filter)?;
+        tx.commit()?;
+        if row.pending == 0
+            && let Some(fp) = fp
+        {
+            let mut m = self.settled.borrow_mut();
+            if m.len() > 4096 {
+                m.clear();
+            }
+            m.insert(key(&fp), row.cost);
+        }
+        Ok(row.cost)
     }
 
     /// Requests whose model differs from the one asked for.
@@ -438,7 +494,7 @@ impl Index {
     pub fn record_types(&self) -> anyhow::Result<Vec<(String, u64)>> {
         let mut st = self
             .conn
-            .prepare("SELECT type, count FROM record_types ORDER BY count DESC")?;
+            .prepare("SELECT type, SUM(count) FROM record_types GROUP BY 1 ORDER BY 2 DESC")?;
         let rows = st.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
@@ -493,6 +549,19 @@ impl Index {
     }
 }
 
+/// The label of a time dimension for a bucket, in the zone `tz` (`Local` outside tests).
+fn time_key_in<Tz: chrono::TimeZone>(dim: Dim, bucket: i64, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let t = bucket_start(bucket, tz);
+    match dim {
+        Dim::Day => t.format("%Y-%m-%d").to_string(),
+        Dim::Hour => t.format("%H").to_string(),
+        _ => t.format("%w").to_string(),
+    }
+}
+
 fn total_on(conn: &rusqlite::Connection, span: Span, f: &Filter) -> anyhow::Result<Row> {
     let mut args = Vec::new();
     let wh = where_clause(span, f, &mut args);
@@ -510,4 +579,28 @@ fn total_on(conn: &rusqlite::Connection, span: Span, f: &Filter) -> anyhow::Resu
             pending,
         })
     })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::FixedOffset;
+
+    #[test]
+    fn time_keys_follow_the_local_offset() {
+        // 00:10 local on Sunday 11-22 in +05:30 is 18:40 UTC on Saturday: day, hour and weekday
+        // are the local ones.
+        let tz = FixedOffset::east_opt(330 * 60).unwrap();
+        let t = DateTime::parse_from_rfc3339("2026-11-22T00:10:00+05:30").unwrap();
+        let b = t.timestamp_millis() / BUCKET_MS;
+        assert_eq!(time_key_in(Dim::Day, b, &tz), "2026-11-22");
+        assert_eq!(time_key_in(Dim::Hour, b, &tz), "00");
+        assert_eq!(time_key_in(Dim::Weekday, b, &tz), "0");
+        // 23:55 local on 11-21 in −03:30 is 03:25 UTC on 11-22.
+        let tz = FixedOffset::west_opt(210 * 60).unwrap();
+        let t = DateTime::parse_from_rfc3339("2026-11-21T23:55:00-03:30").unwrap();
+        let b = t.timestamp_millis() / BUCKET_MS;
+        assert_eq!(time_key_in(Dim::Day, b, &tz), "2026-11-21");
+        assert_eq!(time_key_in(Dim::Hour, b, &tz), "23");
+    }
 }

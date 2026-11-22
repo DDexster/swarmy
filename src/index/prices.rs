@@ -36,7 +36,9 @@ impl Index {
                 None => current.push((e.model.as_str(), vec![(e, seat)])),
             }
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         for (model, versions) in &current {
             let latest: Option<String> = tx
                 .query_row(
@@ -110,15 +112,28 @@ impl Index {
         if self.meta("price_fp")?.as_deref() == Some(fp.as_str()) && !pending(&self.conn)? {
             return Ok(());
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let stale = schema::meta(&tx, "price_fp")?.as_deref() != Some(fp.as_str());
         if stale {
-            tx.execute("UPDATE requests SET cost = NULL, priced = NULL", [])?;
+            super::bump_settled(&tx)?;
+            tx.execute(
+                &format!("UPDATE requests SET {}", schema::unpriced_sql()),
+                [],
+            )?;
         }
         {
             let mut sel = tx.prepare("SELECT msg_id, model, ts, fast, input, cw5, cw1h, cread, output, thinking, web FROM requests WHERE priced IS NULL")?;
-            let mut upd =
-                tx.prepare("UPDATE requests SET cost = ?1, priced = ?2 WHERE msg_id = ?3")?;
+            let mut upd = tx.prepare(&format!(
+                "UPDATE requests SET cost = ?1, priced = ?2, {} WHERE msg_id = ?3",
+                schema::COST_PARTS
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{c} = ?{}", i + 4))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))?;
             let rows: Vec<(String, String, i64, bool, Usage)> = sel
                 .query_map([], |r| {
                     Ok((
@@ -140,9 +155,30 @@ impl Index {
                 .collect::<Result<_, _>>()?;
             for (id, model, ts, fast, usage) in rows {
                 let day = from_ms(ts).with_timezone(&Local).date_naive();
-                let c = book.cost(&model, day, &usage, fast);
-                let usd = c.priced.then_some(c.usd);
-                upd.execute(params![usd, c.priced as i64, id])?;
+                let p = book.cost_parts(&model, day, &usage, fast);
+                // In the order of `schema::COST_PARTS`.
+                let parts = p.map(|p| {
+                    [
+                        p.input,
+                        p.cache_write,
+                        p.cache_read,
+                        p.output,
+                        p.web,
+                        p.cache_saved,
+                    ]
+                });
+                let part = |i: usize| parts.map(|v| v[i]);
+                upd.execute(params![
+                    p.map(|p| p.total()),
+                    p.is_some() as i64,
+                    id,
+                    part(0),
+                    part(1),
+                    part(2),
+                    part(3),
+                    part(4),
+                    part(5)
+                ])?;
             }
         }
         if stale {

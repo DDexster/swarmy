@@ -5,9 +5,10 @@ use std::collections::HashMap;
 
 use rusqlite::params;
 
+use super::query::AGENT_TYPE;
 use super::{Index, ms};
-use crate::core::period::Span;
-use crate::core::pricing::PriceBook;
+use crate::core::period::{BUCKET_MS, Span, bucket_start};
+use crate::core::tools::ToolClass;
 
 #[derive(Debug, Clone, Default)]
 pub struct ToolStat {
@@ -29,18 +30,20 @@ pub struct TypeStat {
     pub unfinished: u64,
 }
 
-/// Dollars by kind of token.
+/// Dollars by kind of token (`core::pricing::CostParts` summed); the total is the cost.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TokenSplit {
     pub input: f64,
     pub cache_write: f64,
     pub cache_read: f64,
     pub output: f64,
+    /// Web searches.
+    pub web: f64,
 }
 
 impl TokenSplit {
     pub fn total(&self) -> f64 {
-        self.input + self.cache_write + self.cache_read + self.output
+        self.input + self.cache_write + self.cache_read + self.output + self.web
     }
 }
 
@@ -71,6 +74,15 @@ pub struct Efficiency {
     pub edits: u64,
     /// Files edited by more than one agent within the same hour, last 24 hours.
     pub conflicts: Vec<(String, u32)>,
+}
+
+/// `'Edit', 'Write', …`: the names of a tool class, for an `IN (...)`.
+fn tool_names(class: ToolClass) -> String {
+    class
+        .names()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `cd x && FOO=1 cargo test -p y | tail` → `cargo test`; `tools/agents/gate.sh` → `gate.sh`.
@@ -136,7 +148,7 @@ pub fn command_key(cmd: &str) -> String {
 }
 
 impl Index {
-    pub fn efficiency(&self, span: Span, prices: &PriceBook) -> anyhow::Result<Efficiency> {
+    pub fn efficiency(&self, span: Span) -> anyhow::Result<Efficiency> {
         let c = &self.conn;
         let (a, b) = (ms(span.start), ms(span.end));
         let mut e = Efficiency::default();
@@ -162,12 +174,16 @@ impl Index {
             })
         })? {
             let t = row?;
-            match t.name.as_str() {
-                "AskUserQuestion" => {
+            match ToolClass::of(&t.name) {
+                ToolClass::AskUser => {
                     e.questions = (e.questions.0 + t.calls, e.questions.1 + t.hours)
                 }
-                "ExitPlanMode" => e.plans = (e.plans.0 + t.calls, e.plans.1 + t.hours),
-                _ => {}
+                ToolClass::Plan => e.plans = (e.plans.0 + t.calls, e.plans.1 + t.hours),
+                ToolClass::Edit
+                | ToolClass::Read
+                | ToolClass::Shell
+                | ToolClass::Agent
+                | ToolClass::Other => {}
             }
             e.tools.push(t);
         }
@@ -176,10 +192,11 @@ impl Index {
 
         mark("tools");
         let mut cmds: HashMap<String, ToolStat> = HashMap::new();
-        let mut st = c.prepare(
+        let mut st = c.prepare(&format!(
             "SELECT summary, done_ts - ts, is_error FROM tool_calls
-             WHERE name = 'Bash' AND ts >= ?1 AND ts < ?2 AND summary IS NOT NULL",
-        )?;
+             WHERE name IN ({}) AND ts >= ?1 AND ts < ?2 AND summary IS NOT NULL",
+            tool_names(ToolClass::Shell)
+        ))?;
         for row in st.query_map(params![a, b], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -208,35 +225,28 @@ impl Index {
             |r| r.get::<_, i64>(0),
         )? as u64;
 
-        // Tokens and dollars by kind, per model (prices differ).
-        let mut st = c.prepare(
-            "SELECT model, SUM(input), SUM(cw5), SUM(cw1h), SUM(cread), SUM(output), TOTAL(cost)
-             FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY model",
+        // Tokens and dollars by kind: the parts stored with each request's cost (the same
+        // formula, prices of each request's own day, fast mode and long context included), so
+        // the split adds up to the cost.
+        let (fresh, read) = c.query_row(
+            "SELECT TOTAL(input + cw5 + cw1h), TOTAL(cread), TOTAL(cost), TOTAL(cost_input),
+                    TOTAL(cost_cache_write), TOTAL(cost_cache_read), TOTAL(cost_output), TOTAL(cost_web),
+                    TOTAL(cache_saved)
+             FROM requests WHERE ts >= ?1 AND ts < ?2",
+            params![a, b],
+            |r| {
+                e.cost = r.get(2)?;
+                e.split = TokenSplit {
+                    input: r.get(3)?,
+                    cache_write: r.get(4)?,
+                    cache_read: r.get(5)?,
+                    output: r.get(6)?,
+                    web: r.get(7)?,
+                };
+                e.cache_saved = r.get(8)?;
+                Ok((r.get::<_, f64>(0)?, r.get::<_, f64>(1)?))
+            },
         )?;
-        let day = span.end.date_naive();
-        let (mut fresh, mut read) = (0f64, 0f64);
-        for row in st.query_map(params![a, b], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                [1, 2, 3, 4, 5]
-                    .map(|i| r.get::<_, Option<i64>>(i).ok().flatten().unwrap_or(0) as f64),
-                r.get::<_, Option<f64>>(6)?.unwrap_or(0.0),
-            ))
-        })? {
-            let (model, [input, cw5, cw1h, cread, output], cost) = row?;
-            e.cost += cost;
-            fresh += input + cw5 + cw1h;
-            read += cread;
-            if let Some(p) = prices.lookup(&model, day) {
-                let r = &p.rates;
-                let m = 1e-6;
-                e.split.input += input * r.input * m;
-                e.split.cache_write += (cw5 * r.cache_write_5m + cw1h * r.cache_write_1h) * m;
-                e.split.cache_read += cread * r.cache_read * m;
-                e.split.output += output * r.output * m;
-                e.cache_saved += cread * (r.input - r.cache_read).max(0.0) * m;
-            }
-        }
         e.cache_hit = if fresh + read > 0.0 {
             read / (fresh + read)
         } else {
@@ -246,12 +256,12 @@ impl Index {
         mark("tokens");
         // Agent types (main threads count as "main").
         let mut st = c.prepare(
-            "SELECT CASE WHEN a.kind = 'main' THEN 'main thread' ELSE COALESCE(a.agent_type, a.kind) END,
+            &format!("SELECT {AGENT_TYPE},
                     COUNT(*), SUM(CASE WHEN a.kind != 'main' AND a.finished = 0 THEN 1 ELSE 0 END),
                     AVG(a.last_ts - a.first_ts), SUM(a.last_ts - a.first_ts),
                     SUM((SELECT TOTAL(r.cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id
                          AND r.agent_id = a.agent_id AND r.ts >= ?1 AND r.ts < ?2))
-             FROM agents a WHERE a.last_ts >= ?1 AND a.first_ts < ?2 GROUP BY 1",
+             FROM agents a WHERE a.last_ts >= ?1 AND a.first_ts < ?2 GROUP BY 1"),
         )?;
         for row in st.query_map(params![a, b], |r| {
             Ok((
@@ -311,8 +321,11 @@ impl Index {
 
         mark("fleet+errors");
         let (files, edits): (i64, i64) = c.query_row(
-            "SELECT COUNT(DISTINCT target), COUNT(*) FROM tool_calls
-             WHERE name IN ('Edit', 'Write', 'MultiEdit', 'NotebookEdit') AND ts >= ?1 AND ts < ?2",
+            &format!(
+                "SELECT COUNT(DISTINCT target), COUNT(*) FROM tool_calls
+                 WHERE name IN ({}) AND ts >= ?1 AND ts < ?2",
+                tool_names(ToolClass::Edit)
+            ),
             params![a, b],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -328,12 +341,13 @@ impl Index {
         &self,
         since: chrono::DateTime<chrono::Utc>,
     ) -> anyhow::Result<Vec<(String, u32)>> {
-        let mut st = self.conn.prepare(
+        let mut st = self.conn.prepare(&format!(
             "SELECT target, MAX(n) FROM (
                SELECT target, ts / 3600000, COUNT(DISTINCT seat || session_id || agent_id) n FROM tool_calls
-               WHERE name IN ('Edit', 'Write', 'MultiEdit') AND ts >= ?1 AND target IS NOT NULL GROUP BY 1, 2)
+               WHERE name IN ({}) AND ts >= ?1 AND target IS NOT NULL GROUP BY 1, 2)
              WHERE n > 1 GROUP BY 1 ORDER BY 2 DESC LIMIT 20",
-        )?;
+            tool_names(ToolClass::Edit)
+        ))?;
         let rows = st.query_map(params![ms(since)], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
@@ -344,9 +358,9 @@ impl Index {
 impl Index {
     /// Spend per local day and model (for stacked daily bars).
     pub fn days_by_model(&self, span: Span) -> anyhow::Result<Vec<(String, String, f64)>> {
-        let mut st = self.conn.prepare(
-            "SELECT ts / 3600000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY 1, 2",
-        )?;
+        let mut st = self.conn.prepare(&format!(
+            "SELECT ts / {BUCKET_MS}, model, TOTAL(cost) FROM requests WHERE ts >= ?1 AND ts < ?2 GROUP BY 1, 2"
+        ))?;
         let mut acc: std::collections::BTreeMap<(String, String), f64> = Default::default();
         for row in st.query_map(params![ms(span.start), ms(span.end)], |r| {
             Ok((
@@ -355,9 +369,8 @@ impl Index {
                 r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
             ))
         })? {
-            let (h, model, c) = row?;
-            let day = super::from_ms(h * 3_600_000)
-                .with_timezone(&chrono::Local)
+            let (b, model, c) = row?;
+            let day = bucket_start(b, &chrono::Local)
                 .format("%Y-%m-%d")
                 .to_string();
             *acc.entry((day, model)).or_default() += c;

@@ -81,51 +81,6 @@ pub struct AccountReport {
     pub windows: Vec<WindowReport>,
 }
 
-/// Spend of an account over a span. Spans that ended more than five minutes ago do not change,
-/// so they are remembered for the life of the process (the dashboard asks every few seconds),
-/// keyed by the index file and the price fingerprint the costs were computed with: a reprice
-/// (here or in another process) is never cached away, and a total with requests still waiting
-/// for a price is not remembered at all.
-fn total_cached(idx: &Index, account: &str, span: Span) -> anyhow::Result<f64> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    type Key = (String, String, String, i64, i64);
-    static MEMO: OnceLock<Mutex<HashMap<Key, f64>>> = OnceLock::new();
-    let settled = span.end < chrono::Utc::now() - Duration::minutes(5);
-    let key = |fp: &str| {
-        (
-            idx.path().unwrap_or(":memory:").to_string(),
-            fp.to_string(),
-            account.to_string(),
-            span.start.timestamp_millis(),
-            span.end.timestamp_millis(),
-        )
-    };
-    let memo = MEMO.get_or_init(Default::default);
-    if settled
-        && let Some(fp) = idx.meta("price_fp")?
-        && let Some(v) = memo.lock().unwrap().get(&key(&fp))
-    {
-        return Ok(*v);
-    }
-    let filter = Filter {
-        account: Some(account.to_string()),
-        ..Default::default()
-    };
-    let (row, fp) = idx.total_priced(span, &filter)?;
-    if settled
-        && row.pending == 0
-        && let Some(fp) = fp
-    {
-        let mut m = memo.lock().unwrap();
-        if m.len() > 4096 {
-            m.clear();
-        }
-        m.insert(key(&fp), row.cost);
-    }
-    Ok(row.cost)
-}
-
 /// Utilization readings inside a window: what Claude Code really fetched, for the chart.
 type Marks = Vec<(DateTime<Utc>, f64)>;
 
@@ -151,7 +106,7 @@ fn load_window(
     let window = place.window;
     let mut points = Vec::new();
     for (span, utilization) in limits::calibration_points(history, r) {
-        points.push((utilization, total_cached(idx, account, span)?));
+        points.push((utilization, idx.settled_total(account, span, ctx.now)?));
     }
     let (_, since) = limits::counting_from(r, &place);
     let spent_since = idx.total(until_now(since), &filter)?.cost;
@@ -483,5 +438,118 @@ mod tests {
         assert!(close(win.shares[0].limit_points, 540.0 / 19.0));
         assert_eq!(win.shares[1].key, "docs");
         assert!(close(win.shares[1].limit_points, 3240.0 / 247.0));
+    }
+
+    #[test]
+    fn settled_spend_follows_late_requests_reprices_and_reattribution() {
+        // The weekly window of `a_weekly_window_by_hand`, calibrated on two readings: 10% at
+        // 11-18 ($4 before it) and 30% at 11-20 ($14 before it).
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        let req =
+            |id: &str, ts: &str, usd: u64| assistant(id, ts, m, "/w/shop", (usd * 500_000, 0), &[]);
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                req("q1", "2026-11-17T06:00:00Z", 4),
+                req("q2", "2026-11-19T06:00:00Z", 6),
+                req("q3", "2026-11-19T08:00:00Z", 4),
+            ],
+        );
+        let resets = "2026-11-24T00:00:00Z";
+        let seat = |used: f64, fetched: &str| SeatInfo {
+            label: "work".into(),
+            account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            utilization: Some(weekly("acc-a", fetched, used, resets)),
+        };
+        let mut idx = w.index("i.sqlite");
+        let book = PriceBook::builtin();
+        w.refresh(&mut idx, &[seat(10.0, "2026-11-18T00:00:00Z")], &book);
+        let now_seat = seat(30.0, "2026-11-20T00:00:00Z");
+        w.refresh(&mut idx, std::slice::from_ref(&now_seat), &book);
+        let ctx = ctx_of(&w, vec![now_seat.clone()], "2026-11-20T12:00:00Z");
+        let own = |idx: &Index| {
+            all_reports(&ctx, idx).unwrap()[0].windows[0]
+                .own_usd_per_point
+                .unwrap()
+        };
+        // median(4/10, 14/30) = 13/30.
+        assert!(close(own(&idx), 13.0 / 30.0));
+        // The same again comes from the memo (and agrees).
+        assert!(close(own(&idx), 13.0 / 30.0));
+
+        // A request of 11-17 indexed late (a file found by the full scan): +$2 before both
+        // readings → median(6/10, 16/30) = (18/30 + 16/30) / 2 = 17/30.
+        w.append(
+            "work",
+            "s2",
+            &[owner("acc-a"), req("late", "2026-11-17T09:00:00Z", 2)],
+        );
+        w.refresh(&mut idx, std::slice::from_ref(&now_seat), &book);
+        assert!(close(own(&idx), 17.0 / 30.0), "{}", own(&idx));
+
+        // Sonnet 5.5 repriced at $4 per MTok of input: every dollar doubles → 34/30.
+        let mut dear = PriceBook::builtin();
+        dear.push_override(
+            m,
+            None,
+            4.0,
+            20.0,
+            &crate::core::pricing::RateOverrides::default(),
+            at("2026-11-20T00:00:00Z").date_naive(),
+        )
+        .unwrap();
+        idx.price_all(&dear).unwrap();
+        assert!(close(own(&idx), 34.0 / 30.0), "{}", own(&idx));
+
+        // The seat turns out to have had acc-b logged in since 11-19 00:00: q2, q3 move to acc-b.
+        // acc-a keeps q1 + late = $6 × 2 = $12 before both readings → median(12/10, 12/30) =
+        // (36/30 + 12/30) / 2 = 24/30.
+        let swapped = SeatInfo {
+            account: Some(account("acc-b", "2026-11-19T00:00:00Z")),
+            utilization: None,
+            ..now_seat
+        };
+        w.refresh(&mut idx, &[swapped], &dear);
+        assert!(close(own(&idx), 24.0 / 30.0), "{}", own(&idx));
+    }
+
+    #[test]
+    fn report_week_limits_and_the_dashboard_share_the_window_in_force() {
+        // 70% at 11-19 00:00, reset by hand, 3% at 11-19 02:00: `swarmy limits` counts from the
+        // reset; `report --period week` (and the dashboard's period) must count from there too.
+        let w = World::new(&["work"]);
+        let resets = "2026-11-24T00:00:00Z";
+        let seat = |used: f64, fetched: &str| SeatInfo {
+            label: "work".into(),
+            account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            utilization: Some(weekly("acc-a", fetched, used, resets)),
+        };
+        let mut idx = w.index("i.sqlite");
+        let book = PriceBook::builtin();
+        for (used, fetched) in [
+            (40.0, "2026-11-18T00:00:00Z"),
+            (70.0, "2026-11-19T00:00:00Z"),
+            (3.0, "2026-11-19T02:00:00Z"),
+        ] {
+            w.refresh(&mut idx, &[seat(used, fetched)], &book);
+        }
+        let ctx = ctx_of(
+            &w,
+            vec![seat(3.0, "2026-11-19T02:00:00Z")],
+            "2026-11-20T12:00:00Z",
+        );
+        let limits_window = all_reports(&ctx, &idx).unwrap()[0].windows[0].window;
+        assert_eq!(limits_window.start, at("2026-11-19T00:00:00Z"));
+        for account in [Some("acc-a"), None] {
+            let week = ctx.limit_week(&idx, account).unwrap().unwrap();
+            assert_eq!(week.start, limits_window.start, "{account:?}");
+            assert_eq!(week.end, ctx.now + Duration::seconds(1));
+        }
+        let span = crate::core::period::Period::LimitWeek
+            .span(ctx.now, ctx.limit_week(&idx, None).unwrap());
+        assert_eq!(span.start, at("2026-11-19T00:00:00Z"));
     }
 }

@@ -477,15 +477,25 @@ impl PriceBook {
     }
 
     pub fn cost(&self, model: &str, day: NaiveDate, usage: &Usage, fast: bool) -> Cost {
+        let parts = self.cost_parts(model, day, usage, fast);
+        Cost {
+            usd: parts.map_or(0.0, |p| p.total()),
+            priced: parts.is_some(),
+        }
+    }
+
+    /// [`cost_parts`] at the prices in force for `model` on `day`; `None` when no price is known
+    /// (a request without tokens needs none: all parts zero).
+    pub fn cost_parts(
+        &self,
+        model: &str,
+        day: NaiveDate,
+        usage: &Usage,
+        fast: bool,
+    ) -> Option<CostParts> {
         match self.lookup(model, day) {
-            Some(e) => Cost {
-                usd: cost_with(&e.rates, usage, fast),
-                priced: true,
-            },
-            None => Cost {
-                usd: 0.0,
-                priced: usage.is_empty(),
-            },
+            Some(e) => Some(cost_parts(&e.rates, usage, fast)),
+            None => usage.is_empty().then(CostParts::default),
         }
     }
 
@@ -499,8 +509,29 @@ impl PriceBook {
     }
 }
 
-/// USD for one request at the given rates.
-pub fn cost_with(r: &Rates, u: &Usage, fast: bool) -> f64 {
+/// USD of one request by kind of token. The parts add up to the request's cost: the efficiency
+/// panel's split and the totals come from the same numbers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct CostParts {
+    pub input: f64,
+    /// 5-minute and 1-hour cache writes.
+    pub cache_write: f64,
+    pub cache_read: f64,
+    pub output: f64,
+    pub web: f64,
+    /// What the cache reads saved against paying the input rate for them (not part of the cost).
+    pub cache_saved: f64,
+}
+
+impl CostParts {
+    pub fn total(&self) -> f64 {
+        self.input + self.cache_write + self.cache_read + self.output + self.web
+    }
+}
+
+/// One request at the given rates, by part. The only place the multipliers apply: long context
+/// (above its threshold, on the prompt and the output), then fast mode (on everything).
+pub fn cost_parts(r: &Rates, u: &Usage, fast: bool) -> CostParts {
     let (mut pin, mut pout) = (1.0, 1.0);
     if let Some(lc) = r.long_context
         && u.prompt() > lc.threshold
@@ -513,13 +544,21 @@ pub fn cost_with(r: &Rates, u: &Usage, fast: bool) -> f64 {
     } else {
         1.0
     };
-    let tokens = (u.input as f64 * r.input
-        + u.cache_write_5m as f64 * r.cache_write_5m
-        + u.cache_write_1h as f64 * r.cache_write_1h
-        + u.cache_read as f64 * r.cache_read)
-        * pin
-        + u.output as f64 * r.output * pout;
-    (tokens / 1_000_000.0 + u.web_search as f64 * r.web_search) * speed
+    let tok = |n: u64, rate: f64, mult: f64| n as f64 * rate * mult / 1_000_000.0 * speed;
+    CostParts {
+        input: tok(u.input, r.input, pin),
+        cache_write: tok(u.cache_write_5m, r.cache_write_5m, pin)
+            + tok(u.cache_write_1h, r.cache_write_1h, pin),
+        cache_read: tok(u.cache_read, r.cache_read, pin),
+        output: tok(u.output, r.output, pout),
+        web: u.web_search as f64 * r.web_search * speed,
+        cache_saved: tok(u.cache_read, (r.input - r.cache_read).max(0.0), pin),
+    }
+}
+
+/// USD for one request at the given rates.
+pub fn cost_with(r: &Rates, u: &Usage, fast: bool) -> f64 {
+    cost_parts(r, u, fast).total()
 }
 
 fn match_score(pattern: &str, model: &str) -> Option<usize> {
@@ -794,6 +833,51 @@ mod tests {
             b.entries()
                 .iter()
                 .all(|e| e.from.is_some_and(|f| f >= d(2024, 1, 1)))
+        );
+    }
+
+    #[test]
+    fn the_parts_add_up_to_the_cost_with_fast_mode_and_long_context() {
+        let book = PriceBook::builtin();
+        let u = Usage {
+            input: 300_000,
+            cache_write_5m: 20_000,
+            cache_write_1h: 10_000,
+            cache_read: 100_000,
+            output: 4_000,
+            web_search: 3,
+            ..Default::default()
+        };
+        for (model, fast) in [
+            ("claude-opus-5-5", true),
+            ("claude-opus-5-5", false),
+            ("claude-haiku-5-5", false),
+            ("claude-sonnet-5-5", true),
+        ] {
+            let p = book.cost_parts(model, day(), &u, fast).unwrap();
+            let c = book.cost(model, day(), &u, fast);
+            assert!(c.priced);
+            assert!(close(p.total(), c.usd), "{model} fast={fast}");
+            assert!(p.cache_saved > 0.0);
+        }
+        // Fast-mode Opus 5.5 by hand ($4 input, $20 output per MTok, $0.01 per search, fast ×2):
+        // input 300k × 4 = $1.20 → $2.40; output 4k × 20 = $0.08 → $0.16; web 3 × 0.01 = $0.03
+        // → $0.06; cache reads 100k × 0.20 = $0.02 → $0.04, saving 100k × (4 − 0.2) → $0.76.
+        let p = book.cost_parts("claude-opus-5-5", day(), &u, true).unwrap();
+        assert!(close(p.input, 2.4) && close(p.output, 0.16) && close(p.web, 0.06));
+        assert!(close(p.cache_read, 0.04) && close(p.cache_saved, 0.76));
+        // Long context: the prompt (300k + 20k + 10k + 100k = 430k) is above Haiku 5.5's 100k
+        // threshold, so every part is ×5: input 300k × 0.10 × 5 = $0.15; output 4k × 0.50 × 5 =
+        // $0.01. The old split used the plain rates, five times too low.
+        let p = book
+            .cost_parts("claude-haiku-5-5", day(), &u, false)
+            .unwrap();
+        assert!(close(p.input, 0.15) && close(p.output, 0.01), "{p:?}");
+        // No price: no parts; no tokens: zero parts, priced.
+        assert_eq!(book.cost_parts("claude-unknown-9", day(), &u, false), None);
+        assert_eq!(
+            book.cost_parts("claude-unknown-9", day(), &Usage::default(), false),
+            Some(CostParts::default())
         );
     }
 }

@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 
 use super::{dim, faint};
 use crate::core::limits::WindowKind;
+use crate::core::tools::ToolClass;
 use crate::tui::app::{App, Panel};
 use crate::tui::view::kit::*;
 use crate::ui::fmt;
@@ -118,7 +119,7 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
     let tools: Vec<_> = e
         .tools
         .iter()
-        .filter(|t| !matches!(t.name.as_str(), "AskUserQuestion" | "ExitPlanMode"))
+        .filter(|t| !ToolClass::of(&t.name).waits_on_user())
         .cloned()
         .collect();
     let total_h: f64 = tools.iter().map(|t| t.hours).sum();
@@ -190,12 +191,15 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
             fmt::usd(e.cache_saved)
         ),
     )];
-    let parts = [
+    let mut parts = vec![
         ("input", sp.input, th.sonnet),
         ("cache write", sp.cache_write, th.warn),
         ("cache read", sp.cache_read, th.haiku),
         ("output", sp.output, th.fable),
     ];
+    if sp.web > 0.0 {
+        parts.push(("web search", sp.web, th.other));
+    }
     let bw = cw.saturating_sub(1).max(10);
     let mut bar = Vec::new();
     let mut used = 0usize;

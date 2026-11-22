@@ -74,15 +74,31 @@ pub struct Reading {
 
 impl Reading {
     pub fn window(&self) -> Span {
+        let end = self.window_end();
         Span {
-            start: self.resets_at - self.kind.length(),
-            end: self.resets_at,
+            start: end - self.kind.length(),
+            end,
         }
+    }
+
+    /// When the window resets, to the nearest minute: sources report the same reset with
+    /// sub-second jitter (`14:59:59.56` from `.claude.json`, `15:00:00` from the status line), and
+    /// two readings of one window must name the same window.
+    pub fn window_end(&self) -> DateTime<Utc> {
+        let ms = self.resets_at.timestamp_millis();
+        let minute = 60_000;
+        let rounded = (ms + minute / 2).div_euclid(minute) * minute;
+        DateTime::<Utc>::from_timestamp_millis(rounded).unwrap_or(self.resets_at)
+    }
+
+    /// The reading belongs to the same window as `other` (same kind, same reset).
+    pub fn same_window(&self, other: &Reading) -> bool {
+        self.kind == other.kind && self.window_end() == other.window_end()
     }
 
     /// The window has rolled over since the reading was taken.
     pub fn is_reset(&self, now: DateTime<Utc>) -> bool {
-        now >= self.resets_at
+        now >= self.window_end()
     }
 }
 
@@ -119,7 +135,8 @@ impl Level {
 }
 
 /// The window `r` belongs to, rolled forward to the one that contains `now` when the reading is
-/// from an earlier window (the window keeps its length and cadence).
+/// from an earlier window (the window keeps its length and cadence). The nominal window: the one
+/// in force, with resets by hand, is [`window_of`].
 pub fn current_window(r: &Reading, now: DateTime<Utc>) -> Span {
     let mut w = r.window();
     while w.end <= now {
@@ -138,32 +155,62 @@ pub fn was_reset(before: Span, after: Span) -> bool {
     after.start > before.start
 }
 
+/// A reading must fall by more than this many points below the one before it to mark a reset.
+pub const RESET_FALL: f64 = 2.0;
+
+/// How long sources of one account may disagree: two seats logged into the same account, the
+/// status line and `.claude.json`, each report what they last fetched, so a reading can lag a few
+/// minutes behind another one.
+pub const SOURCES_DISAGREE_FOR: Duration = Duration::minutes(15);
+
 /// The effective start of `cur`'s window, and the moment of a reset done by hand.
 ///
 /// Claude Code can reset a 5-hour (and, sometimes, the weekly) limit early. Utilization then falls
 /// to near zero inside the window, so spend before the reset must not count. A fall of more than
-/// two points between consecutive readings of the same window marks a reset; it happened between
-/// the two readings, and the earlier reading's time is taken as the start (a slight
-/// over-count when readings are far apart).
+/// [`RESET_FALL`] points between consecutive readings of the same window marks a reset; it
+/// happened between the last high and the first low reading, and the last high one's time is
+/// taken as the start (a slight over-count when readings are far apart).
+///
+/// Readings come from several sources that lag behind each other, so a fall is a reset only when
+/// it holds: the low reading is not a value the account already had just before the high one (a
+/// lagging source), and the readings soon after it are not mostly back up at the high level.
+/// Several readings of one moment count as the highest.
 pub fn effective_start(
     history: &[Reading],
     cur: &Reading,
 ) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
     let nominal = cur.window().start;
-    let mut hist: Vec<&Reading> = history
+    let mut hist: Vec<Reading> = history
         .iter()
-        .filter(|h| h.kind == cur.kind && h.fetched_at <= cur.fetched_at)
+        .filter(|h| h.same_window(cur) && h.fetched_at <= cur.fetched_at)
+        .copied()
         .collect();
-    if !hist.iter().any(|h| h.fetched_at == cur.fetched_at) {
-        hist.push(cur);
-    }
-    hist.sort_by_key(|h| h.fetched_at);
+    hist.push(*cur);
+    hist.sort_by(|a, b| {
+        a.fetched_at
+            .cmp(&b.fetched_at)
+            .then(b.utilization.total_cmp(&a.utilization))
+    });
+    // One reading per moment, the highest (sorted first).
+    hist.dedup_by_key(|h| h.fetched_at);
     let mut start = nominal;
     let mut reset = None;
-    for pair in hist.windows(2) {
-        let (a, b) = (pair[0], pair[1]);
-        let same_window = a.resets_at > b.fetched_at; // a's window had not rolled over yet
-        if same_window && b.utilization + 2.0 < a.utilization && a.fetched_at > start {
+    for j in 1..hist.len() {
+        let (a, b) = (hist[j - 1], hist[j]);
+        if b.utilization + RESET_FALL >= a.utilization || a.fetched_at <= start {
+            continue;
+        }
+        let lagging = hist[..j - 1]
+            .iter()
+            .rev()
+            .take_while(|c| c.fetched_at >= a.fetched_at - SOURCES_DISAGREE_FOR)
+            .any(|c| c.utilization <= b.utilization + RESET_FALL);
+        let (back_up, low): (Vec<&Reading>, Vec<&Reading>) = hist[j + 1..]
+            .iter()
+            .take_while(|c| c.fetched_at <= b.fetched_at + SOURCES_DISAGREE_FOR)
+            .partition(|c| c.utilization + RESET_FALL >= a.utilization);
+        let undone = back_up.len() > low.len();
+        if !lagging && !undone {
             start = a.fetched_at;
             reset = Some(a.fetched_at);
         }
@@ -299,8 +346,10 @@ pub struct WindowPlace {
     pub reset_passed: bool,
 }
 
-/// The window of `r` now: rolled forward when it reset since the reading, else its nominal window
-/// with the start moved to a reset by hand found in `history` (readings of the same kind).
+/// The window in force for `r` now — the one definition every surface uses (`swarmy limits`, the
+/// dashboard, `report --period week`): rolled forward when it reset since the reading, else its
+/// nominal window with the start moved to a reset by hand found in `history` (readings of the same
+/// kind).
 pub fn window_of(r: &Reading, history: &[Reading], now: DateTime<Utc>) -> WindowPlace {
     let reset_passed = r.is_reset(now);
     let mut window = current_window(r, now);
@@ -845,5 +894,144 @@ mod tests {
         assert_eq!((e.points_per_hour, e.eta, e.window_usd), (None, None, None));
         assert!(e.shares.is_empty() && e.curve.is_empty());
         assert!(near(e.burn_usd_per_hour, 0.0));
+    }
+
+    /// A weekly reading fetched at `fetched` (UTC, on 2026-11-22 unless the text has a date)
+    /// whose window resets at `resets`.
+    fn seen(fetched: &str, used: f64, resets: &str) -> Reading {
+        let full = |t: &str| {
+            if t.contains('T') {
+                ts(&format!("{t}Z"))
+            } else {
+                ts(&format!("2026-11-22T{t}Z"))
+            }
+        };
+        Reading {
+            kind: WindowKind::SevenDay,
+            utilization: used,
+            resets_at: full(resets),
+            fetched_at: full(fetched),
+        }
+    }
+
+    #[test]
+    fn readings_of_one_window_agree_despite_jitter_in_the_reset_time() {
+        // `.claude.json` and the status line report the same reset a fraction of a second apart.
+        let a = seen("10:00:00", 40.0, "2026-11-25T14:59:59.56");
+        let b = seen("10:05:00", 41.0, "2026-11-25T15:00:00.13");
+        assert!(a.same_window(&b));
+        assert_eq!(a.window(), b.window());
+        assert_eq!(a.window_end(), ts("2026-11-25T15:00:00Z"));
+        // So a later reading of the same window is no reset (the dashboard's notice).
+        assert!(!was_reset(a.window(), b.window()));
+        let now = ts("2026-11-22T12:00:00Z");
+        assert!(!was_reset(
+            window_of(&a, &[a], now).window,
+            window_of(&b, &[a, b], now).window
+        ));
+    }
+
+    #[test]
+    fn a_reset_by_hand_seen_through_lagging_sources() {
+        // Seen on real data (numbers kept, times in UTC): the weekly limit reached 95% at 20:44,
+        // was reset by hand, read 0% at 21:04, then climbed 1, 2, … 13% (status-line readings
+        // every few minutes). Meanwhile another source of the same account kept reporting the
+        // 2% it had fetched earlier, every ten seconds, between the status line's 4% and 5%;
+        // resets differ by sub-second jitter between sources. The fall from 5% to that stale 2%
+        // at 21:55 was taken as the reset ("reset by hand ≈ 21:55").
+        let r = |f: &str, u: f64| seen(f, u, "2026-11-25T17:00:00");
+        let mut hist = vec![
+            seen("2026-11-20T15:44:49", 63.0, "2026-11-25T17:00:00.314"),
+            seen("13:59:47", 65.0, "2026-11-25T16:59:59.983"),
+            seen("16:12:33", 65.0, "2026-11-25T17:00:00.491"),
+            seen("17:05:16", 66.0, "2026-11-25T16:59:59.596"),
+            seen("18:07:01", 75.0, "2026-11-25T17:00:00.304"),
+            seen("18:45:53", 82.0, "2026-11-25T16:59:59.936"),
+            seen("20:44:58", 95.0, "2026-11-25T17:00:00.137"),
+            seen("21:04:04", 0.0, "2026-11-25T16:59:59.562"),
+            seen("21:05:31", 0.0, "2026-11-25T17:00:00.485"),
+            r("21:11:14", 1.0),
+            r("21:15:49", 2.0),
+            r("21:27:43", 3.0),
+        ];
+        // 21:47–21:55: the lagging 2% every ten seconds, the status line's 4% now and then,
+        // two readings of one moment at 21:47:23, then 5% at 21:55:24 and the stale 2% after it.
+        for m in 47..=55 {
+            for sec in [3, 13, 23, 33, 43, 53] {
+                hist.push(r(&format!("21:{m}:{sec:02}"), 2.0));
+            }
+        }
+        for f in ["21:47:06", "21:47:23", "21:48:13", "21:49:46", "21:54:52"] {
+            hist.push(r(f, 4.0));
+        }
+        hist.push(r("21:55:24", 5.0));
+        for (f, u) in [
+            ("22:00:25", 5.0),
+            ("22:11:28", 6.0),
+            ("22:18:25", 7.0),
+            ("22:27:12", 8.0),
+            ("22:42:06", 10.0),
+            ("23:00:28", 12.0),
+            ("23:10:33", 13.0),
+        ] {
+            hist.push(r(f, u));
+        }
+        hist.sort_by_key(|h| h.fetched_at);
+        let last_high = ts("2026-11-22T20:44:58Z");
+        let first_low = ts("2026-11-22T21:04:04Z");
+        // With every reading so far, and at each moment since the reset: the reset lies between
+        // the last high and the first low reading (the high one's time is the start).
+        let cur = *hist.last().unwrap();
+        assert_eq!(effective_start(&hist, &cur), (last_high, Some(last_high)));
+        for h in hist.iter().filter(|h| h.fetched_at >= first_low) {
+            let (start, reset) = effective_start(&hist, h);
+            assert_eq!(
+                (start, reset),
+                (last_high, Some(last_high)),
+                "at {}",
+                h.fetched_at
+            );
+            assert!(start < first_low);
+        }
+        // Before the reset: the nominal window.
+        let before = hist.iter().find(|h| h.fetched_at == last_high).unwrap();
+        assert_eq!(effective_start(&hist, before).0, ts("2026-11-18T17:00:00Z"));
+    }
+
+    #[test]
+    fn a_fall_that_does_not_hold_is_no_reset_and_a_dense_one_is() {
+        let r = |f: &str, u: f64| seen(f, u, "2026-11-25T17:00:00");
+        // A real reset with readings a minute apart: 95% at 21:03, 0% at 21:04.
+        let hist = [
+            r("21:00:00", 94.0),
+            r("21:03:00", 95.0),
+            r("21:04:00", 0.0),
+            r("21:10:00", 1.0),
+        ];
+        let t = ts("2026-11-22T21:03:00Z");
+        assert_eq!(effective_start(&hist, &hist[3]), (t, Some(t)));
+        // After the reset, a lagging source repeats the old 95%: the reset stays where it was.
+        let mut late = hist.to_vec();
+        late.push(r("21:12:00", 95.0));
+        late.push(r("21:14:00", 2.0));
+        assert_eq!(effective_start(&late, &late[5]), (t, Some(t)));
+        // A source lagging behind a rising account (30% → 40%, then the stale 30%, then 41%):
+        // no reset, both when the stale reading is the newest and after the next one.
+        let rising = [
+            r("10:00:00", 30.0),
+            r("10:05:00", 40.0),
+            r("10:06:00", 30.0),
+            r("10:09:00", 41.0),
+        ];
+        let nominal = ts("2026-11-18T17:00:00Z");
+        assert_eq!(effective_start(&rising, &rising[2]), (nominal, None));
+        assert_eq!(effective_start(&rising, &rising[3]), (nominal, None));
+        // A fall undone right after (the low source first seen after the high one).
+        let undone = [
+            r("10:00:00", 50.0),
+            r("10:01:00", 10.0),
+            r("10:04:00", 50.0),
+        ];
+        assert_eq!(effective_start(&undone, &undone[2]), (nominal, None));
     }
 }

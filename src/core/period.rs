@@ -23,7 +23,8 @@ impl std::str::FromStr for Period {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim().to_ascii_lowercase();
-        let num = |t: &str| t.parse::<i64>().ok().filter(|n| *n > 0);
+        // At most a century back: anything longer is a typo, and would overflow the date maths.
+        let num = |t: &str, max: i64| t.parse::<i64>().ok().filter(|n| (1..=max).contains(n));
         Ok(match s.as_str() {
             "today" => Period::Today,
             "yesterday" => Period::Yesterday,
@@ -31,12 +32,16 @@ impl std::str::FromStr for Period {
             "month" => Period::Month,
             "all" => Period::All,
             _ => {
-                if let Some(n) = s.strip_suffix('d').and_then(num) {
+                if let Some(n) = s.strip_suffix('d').and_then(|t| num(t, MAX_DAYS)) {
                     Period::Days(n)
-                } else if let Some(n) = s.strip_suffix('h').and_then(num) {
+                } else if let Some(n) = s.strip_suffix('h').and_then(|t| num(t, MAX_DAYS * 24)) {
                     Period::Hours(n)
                 } else if let Some((a, b)) = s.split_once("..") {
-                    Period::Range(parse_day(a)?, parse_day(b)?)
+                    let (a, b) = (parse_day(a)?, parse_day(b)?);
+                    if a > b {
+                        return Err(format!("range '{s}' ends before it starts"));
+                    }
+                    Period::Range(a, b)
                 } else if let Ok(d) = parse_day(&s) {
                     Period::Range(d, d)
                 } else {
@@ -49,9 +54,31 @@ impl std::str::FromStr for Period {
     }
 }
 
+/// The longest period `Nd` / `Nh` accepted: a century.
+const MAX_DAYS: i64 = 36_500;
+
+/// A day `YYYY-MM-DD` within years 1..=9999 (chrono parses far wider years, whose next day or
+/// local midnight would overflow).
 fn parse_day(s: &str) -> Result<NaiveDate, String> {
     NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
-        .map_err(|_| format!("bad date '{s}', expected YYYY-MM-DD"))
+        .ok()
+        .filter(|d| (1..=9999).contains(&d.year()))
+        .ok_or_else(|| format!("bad date '{s}', expected YYYY-MM-DD"))
+}
+
+/// Spend is summed per UTC quarter hour and regrouped into local days and hours afterwards (far
+/// cheaper than SQLite's `localtime` on every row). Every UTC offset in use is a whole number of
+/// quarter hours (+05:30, +05:45, −03:30, +12:45), so a quarter hour never straddles a local
+/// midnight or hour, whatever the zone and across DST changes.
+pub const BUCKET_MS: i64 = 15 * 60 * 1000;
+
+/// The start of bucket `bucket` (a count of [`BUCKET_MS`] since the epoch) in the zone `tz`.
+pub fn bucket_start<Tz: TimeZone>(bucket: i64, tz: &Tz) -> DateTime<Tz> {
+    let t = Utc
+        .timestamp_millis_opt(bucket.saturating_mul(BUCKET_MS))
+        .single()
+        .unwrap_or(DateTime::<Utc>::MIN_UTC);
+    t.with_timezone(tz)
 }
 
 /// A half-open UTC interval `[start, end)`.
@@ -149,6 +176,62 @@ mod tests {
         );
         assert!("fortnight".parse::<Period>().is_err());
         assert!("0d".parse::<Period>().is_err());
+        assert!("-3d".parse::<Period>().is_err());
+    }
+
+    #[test]
+    fn reversed_ranges_and_absurd_values_are_refused_without_panicking() {
+        let err = "2026-11-22..2026-11-01".parse::<Period>().unwrap_err();
+        assert!(err.contains("ends before it starts"), "{err}");
+        // Values that used to panic in chrono's date maths.
+        for bad in [
+            "99999999999d",
+            "99999999999h",
+            "36501d",
+            "876001h",
+            "+262143-12-31",
+            "0000-01-01..2026-01-01",
+        ] {
+            assert!(bad.parse::<Period>().is_err(), "accepted: {bad}");
+        }
+        // The largest accepted values resolve to a span without panicking.
+        let now = Utc::now();
+        for ok in ["36500d", "876000h", "0001-01-01..9999-12-31"] {
+            let p: Period = ok.parse().unwrap();
+            let s = p.span(now, None);
+            assert!(s.start < s.end, "{ok}");
+        }
+    }
+
+    #[test]
+    fn quarter_hour_buckets_keep_local_days_in_odd_offset_zones() {
+        use chrono::FixedOffset;
+        // Local 00:10 on 11-22 and local 23:50 on 11-21 in zones with 30- and 45-minute offsets:
+        // the bucket of each lands on its own local day and hour.
+        for (offset_min, label) in [(330, "+05:30"), (345, "+05:45"), (-210, "-03:30")] {
+            let tz = FixedOffset::east_opt(offset_min * 60).unwrap();
+            for (local, day, hour) in [
+                ("2026-11-22T00:10:00", "2026-11-22", "00"),
+                ("2026-11-21T23:50:00", "2026-11-21", "23"),
+                ("2026-11-22T00:00:00", "2026-11-22", "00"),
+            ] {
+                let t = DateTime::parse_from_rfc3339(&format!("{local}{label}")).unwrap();
+                let bucket = t.timestamp_millis().div_euclid(BUCKET_MS);
+                let start = bucket_start(bucket, &tz);
+                assert_eq!(start.format("%Y-%m-%d").to_string(), day, "{local}{label}");
+                assert_eq!(start.format("%H").to_string(), hour, "{local}{label}");
+            }
+        }
+        // With UTC hours (the old buckets) the first half hour of a +05:30 day went to the day
+        // before: 00:10 local is 18:40 UTC, whose hour starts at 23:30 local the previous day.
+        let tz = FixedOffset::east_opt(330 * 60).unwrap();
+        let t = DateTime::parse_from_rfc3339("2026-11-22T00:10:00+05:30").unwrap();
+        let utc_hour = t.timestamp_millis() / 3_600_000;
+        let old = Utc
+            .timestamp_millis_opt(utc_hour * 3_600_000)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(old.format("%Y-%m-%d").to_string(), "2026-11-21");
     }
 
     #[test]

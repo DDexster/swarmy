@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use crate::claude::registry::LiveSession;
 use crate::core::models::Family;
+use crate::core::tools::ToolClass;
 use crate::index::live::{AgentKey, AgentRow, DoneAgent};
 use crate::index::{Index, from_ms, ms};
 
@@ -609,10 +610,10 @@ fn lane(idx: &Index, a: &Agent, now: DateTime<Utc>) -> anyhow::Result<Vec<Lane>>
         out[i] = out[i].max(Lane::Thinking);
     }
     for (t0, t1, name) in idx.agent_tool_spans(key_of(a), start, now)? {
-        let kind = match name.as_str() {
-            "AskUserQuestion" | "ExitPlanMode" => Lane::You,
-            "Agent" | "Task" => Lane::Agents,
-            _ => Lane::Tool,
+        let kind = match ToolClass::of(&name) {
+            ToolClass::AskUser | ToolClass::Plan => Lane::You,
+            ToolClass::Agent => Lane::Agents,
+            ToolClass::Edit | ToolClass::Read | ToolClass::Shell | ToolClass::Other => Lane::Tool,
         };
         for v in &mut out[slot(t0)..=slot(t1.max(t0))] {
             *v = (*v).max(kind);

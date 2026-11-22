@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 
+use crate::core::tools::ToolClass;
 use crate::core::usage::Usage;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -280,14 +281,11 @@ fn summarize_tool(name: &str, input: Option<&RawValue>) -> (String, Option<Strin
         .map(|k| s(k))
         .find(|p| !p.is_empty())
         .map(str::to_string);
-    let summary = match name {
-        "Bash" | "PowerShell" => truncate(s("command"), 120),
-        "Read" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
-            path.clone().unwrap_or_default()
-        }
-        "Grep" => format!("\"{}\"", truncate(s("pattern"), 80)),
-        "Glob" => truncate(s("pattern"), 100),
-        "Agent" | "Task" => {
+    let class = ToolClass::of(name);
+    let summary = match class {
+        ToolClass::Shell => truncate(s("command"), 120),
+        ToolClass::Edit | ToolClass::Read => path.clone().unwrap_or_default(),
+        ToolClass::Agent => {
             let t = s("subagent_type");
             let d = truncate(s("description"), 80);
             if t.is_empty() {
@@ -296,27 +294,26 @@ fn summarize_tool(name: &str, input: Option<&RawValue>) -> (String, Option<Strin
                 format!("{d} ({t})")
             }
         }
-        "WebFetch" => truncate(s("url"), 100),
-        "WebSearch" => truncate(s("query"), 100),
-        "Skill" => truncate(s("skill"), 80),
-        "Workflow" => truncate(s("name"), 80),
-        _ => {
-            // First short string field, if any.
-            v.as_object()
-                .and_then(|m| {
-                    m.values()
-                        .find_map(|x| x.as_str().filter(|t| !t.is_empty() && t.len() < 200))
-                })
-                .map(|t| truncate(t, 80))
-                .unwrap_or_default()
-        }
+        ToolClass::AskUser | ToolClass::Plan | ToolClass::Other => match name {
+            "Grep" => format!("\"{}\"", truncate(s("pattern"), 80)),
+            "Glob" => truncate(s("pattern"), 100),
+            "WebFetch" => truncate(s("url"), 100),
+            "WebSearch" => truncate(s("query"), 100),
+            "Skill" => truncate(s("skill"), 80),
+            "Workflow" => truncate(s("name"), 80),
+            _ => {
+                // First short string field, if any.
+                v.as_object()
+                    .and_then(|m| {
+                        m.values()
+                            .find_map(|x| x.as_str().filter(|t| !t.is_empty() && t.len() < 200))
+                    })
+                    .map(|t| truncate(t, 80))
+                    .unwrap_or_default()
+            }
+        },
     };
-    let target = matches!(
-        name,
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "Read"
-    )
-    .then_some(path)
-    .flatten();
+    let target = class.has_target().then_some(path).flatten();
     (summary, target)
 }
 

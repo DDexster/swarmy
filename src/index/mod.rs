@@ -12,6 +12,7 @@ pub mod query;
 #[cfg(test)]
 pub(crate) mod scenarios;
 pub mod schema;
+mod write;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,20 +21,20 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use chrono::{DateTime, TimeZone, Utc};
 use rayon::prelude::*;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::claude::config_json::{Account, Utilization};
 use crate::claude::files::{self, FileKind, TranscriptFile};
 use crate::claude::project::Resolver;
 use crate::claude::seats::Seat;
-use crate::claude::transcript::{self, Event, TitleKind};
+use crate::claude::transcript;
 use crate::core::pricing::PriceBook;
 
 /// The account of a request from its seat's login history (see `seat_accounts`).
 const SEAT_ACCOUNT_AT: &str = "COALESCE((SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1), requests.account_uuid)";
 
 /// Revision of the cwd → project rules; a change recomputes the `projects` table.
-const PROJECTS_REV: &str = "4";
+const PROJECTS_REV: &str = "5";
 
 pub struct Index {
     conn: Connection,
@@ -42,6 +43,30 @@ pub struct Index {
     session_dirs: HashMap<(String, String), ListedDirs>,
     /// The last price book dated by `dated_prices`, by the fingerprint of the undated one.
     dated: Option<(String, PriceBook)>,
+    /// Settled spend already summed (`query::settled_total`).
+    settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
+}
+
+/// A settled total: (settled generation, price fingerprint, account, span start, span end).
+type SettledKey = (Option<String>, String, String, i64, i64);
+
+/// Spend older than this no longer changes on its own: requests of the last minutes are still
+/// being written. Older spend changes only when the index says so, by bumping the settled
+/// generation (`bump_settled`): a reprice, a re-attribution to another account, a request indexed
+/// late (a file found by the full scan, a file read again).
+pub const SETTLED_AFTER_MS: i64 = 5 * 60 * 1000;
+
+/// A reading equal to a stored one (account, window, value) at most this far away is not stored.
+const READING_REPEAT_MS: i64 = 5 * 60 * 1000;
+
+/// Marks a change to settled spend (see [`SETTLED_AFTER_MS`]), inside the writing transaction.
+fn bump_settled(tx: &Connection) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO meta(key, value) VALUES ('settled_gen', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    )?;
+    Ok(())
 }
 
 /// The dirs a session's files were listed from (with their mtimes), and the files.
@@ -77,6 +102,10 @@ pub struct RefreshStats {
 
 struct Work {
     file: TranscriptFile,
+    /// The file's `(ino, offset)` in the index when the work was planned (`None`: not indexed).
+    /// It is checked again inside the write transaction: when another process advanced the file
+    /// meanwhile, this work is dropped instead of adding the same bytes twice.
+    expected: Option<(u64, u64)>,
     start: u64,
     ino: u64,
     size: u64,
@@ -132,6 +161,7 @@ impl Index {
             conn,
             session_dirs: HashMap::new(),
             dated: None,
+            settled: Default::default(),
         })
     }
 
@@ -141,11 +171,6 @@ impl Index {
 
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         Ok(schema::set_meta(&self.conn, key, value)?)
-    }
-
-    /// The database file (`None` in memory): tells two indexes apart in a process-wide memo.
-    pub fn path(&self) -> Option<&str> {
-        self.conn.path()
     }
 
     /// Brings the index up to date with every seat's transcripts.
@@ -254,6 +279,17 @@ impl Index {
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
         let started = Instant::now();
+        let files_total = all.len();
+        let work = self.plan(&all)?;
+        let mut stats = self.ingest(work, seat_info, resolver, prices, progress)?;
+        stats.files_total = files_total;
+        stats.elapsed = started.elapsed();
+        Ok(stats)
+    }
+
+    /// What to read of each file: from the stored offset when the file only grew, from the start
+    /// when it was replaced or shrank (`reset`), nothing when it is unchanged.
+    fn plan(&self, all: &[TranscriptFile]) -> anyhow::Result<Vec<Work>> {
         let mut known: HashMap<String, (u64, u64, u64, Option<String>, i64)> = HashMap::new();
         {
             let mut st = self
@@ -290,6 +326,7 @@ impl Index {
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
             let key = f.path.to_string_lossy().into_owned();
+            let expected = known.get(&key).map(|(kino, _, koff, ..)| (*kino, *koff));
             let (start, account, last_ts, reset) = match known.get(&key) {
                 Some((kino, ksize, ..)) if *kino == ino && *ksize == size => continue,
                 Some((kino, _, koff, kacc, kts)) if *kino == ino && size >= *koff => {
@@ -300,6 +337,7 @@ impl Index {
             };
             work.push(Work {
                 file: f.clone(),
+                expected,
                 start,
                 ino,
                 size,
@@ -309,11 +347,23 @@ impl Index {
                 reset,
             });
         }
+        Ok(work)
+    }
 
+    /// Reads the planned work and writes it, one immediate transaction per batch: the write lock
+    /// is taken before the offsets are checked again, so two processes (two dashboards, a CLI run)
+    /// never both add the same bytes.
+    fn ingest(
+        &mut self,
+        mut work: Vec<Work>,
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+        progress: &mut dyn FnMut(Progress),
+    ) -> anyhow::Result<RefreshStats> {
         let bytes_total: u64 = work.iter().map(|w| w.size - w.start).sum();
         let files_total = work.len();
         let mut stats = RefreshStats {
-            files_total: all.len(),
             files_read: files_total,
             ..Default::default()
         };
@@ -336,8 +386,8 @@ impl Index {
                 .query_row("SELECT COALESCE(MAX(rowid), 0) FROM requests", [], |r| {
                     r.get(0)
                 })?;
-        let mut type_counts: HashMap<String, u64> = HashMap::new();
         let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let settled_before = ms(Utc::now()) - SETTLED_AFTER_MS;
         for batch in work.chunks(48) {
             // A few small files parse faster on this thread than by waking the whole pool.
             let parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
@@ -351,14 +401,28 @@ impl Index {
                     .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
                     .collect()
             };
-            let tx = self.conn.transaction()?;
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut late = false;
             for (w, chunk) in parsed {
                 let Ok(chunk) = chunk else { continue };
-                done.bytes_done += chunk.end - w.start;
-                for (t, n) in &chunk.stats.by_type {
-                    *type_counts.entry(t.clone()).or_default() += n;
+                let now: Option<(u64, u64)> = tx
+                    .query_row(
+                        "SELECT ino, offset FROM files WHERE path = ?1",
+                        [w.file.path.to_string_lossy()],
+                        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+                    )
+                    .optional()?;
+                if now != w.expected {
+                    // Another process read this file meanwhile; what it wrote stands.
+                    continue;
                 }
-                write_file(&tx, w, chunk, &mut cwds)?;
+                done.bytes_done += chunk.end - w.start;
+                late |= write::write_file(&tx, w, chunk, &mut cwds, settled_before)?;
+            }
+            if late {
+                bump_settled(&tx)?;
             }
             tx.commit()?;
             done.files_done += batch.len();
@@ -370,7 +434,6 @@ impl Index {
             seat_info,
             resolver,
             prices,
-            &type_counts,
             &cwds,
             (files_total > 0).then_some(last_rowid),
         )?;
@@ -378,7 +441,6 @@ impl Index {
             .conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
         stats.requests_new = (after - before).max(0) as u64;
-        stats.elapsed = started.elapsed();
         self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
         Ok(stats)
     }
@@ -388,12 +450,13 @@ impl Index {
         seat_info: &[SeatInfo],
         resolver: &mut Resolver,
         prices: &PriceBook,
-        types: &HashMap<String, u64>,
         new_cwds: &std::collections::HashSet<String>,
         new_after_rowid: Option<i64>,
     ) -> anyhow::Result<()> {
         let now = ms(Utc::now());
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for si in seat_info {
             if let Some(a) = &si.account {
                 tx.execute(
@@ -406,10 +469,23 @@ impl Index {
             }
             if let Some(u) = &si.utilization {
                 for r in &u.readings {
+                    // A reading that says what one a few minutes away already said (same account,
+                    // window and value) adds nothing: sources report every few seconds.
                     tx.execute(
-                        "INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                        "INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at)
+                         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (
+                           SELECT 1 FROM readings WHERE account_uuid = ?1 AND kind = ?2
+                             AND fetched_at BETWEEN ?3 - ?6 AND ?3 + ?6
+                             AND utilization = ?4 AND ABS(resets_at - ?5) < 60000)
                          ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING",
-                        params![u.account_uuid, r.kind.key(), ms(r.fetched_at), r.utilization, ms(r.resets_at)],
+                        params![
+                            u.account_uuid,
+                            r.kind.key(),
+                            ms(r.fetched_at),
+                            r.utilization,
+                            ms(r.resets_at),
+                            READING_REPEAT_MS
+                        ],
                     )?;
                 }
             }
@@ -452,11 +528,15 @@ impl Index {
                 }
             }
         }
+        let mut moved = 0;
         for (seat, ts) in &reattribute {
-            tx.execute(
+            moved += tx.execute(
                 &format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"),
                 params![seat, ts],
             )?;
+        }
+        if moved > 0 {
+            bump_settled(&tx)?;
         }
         let rev_ok = schema::meta(&tx, "projects_rev")?.as_deref() == Some(PROJECTS_REV);
         let Some(new_after_rowid) = new_after_rowid.or((!rev_ok).then_some(i64::MAX)) else {
@@ -573,255 +653,10 @@ impl Index {
         if !rev_ok {
             schema::set_meta(&tx, "projects_rev", PROJECTS_REV)?;
         }
-        for (t, n) in types {
-            tx.execute("INSERT INTO record_types(type, count) VALUES (?1, ?2) ON CONFLICT(type) DO UPDATE SET count = count + excluded.count", params![t, *n as i64])?;
-        }
         tx.commit()?;
         self.price_all(prices)?;
         Ok(())
     }
-}
-
-#[derive(Default)]
-struct FileAgg {
-    first_ts: Option<i64>,
-    last_ts: Option<i64>,
-    cwd: Option<String>,
-    title: Option<String>,
-    ai_title: Option<String>,
-    compactions: i64,
-}
-
-fn write_file(
-    tx: &rusqlite::Transaction,
-    w: &Work,
-    chunk: transcript::Chunk,
-    cwds: &mut std::collections::HashSet<String>,
-) -> anyhow::Result<()> {
-    let f = &w.file;
-    let main = f.kind == FileKind::Main;
-    if w.reset {
-        // The file is read again from the start: forget what it added, so nothing counts twice.
-        // (Request rows merge by `MAX`; tool counts and compactions are sums.)
-        tx.execute(
-            "UPDATE requests SET tools = 0 WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-            params![f.seat, f.session_id, f.agent_id],
-        )?;
-        if main {
-            tx.execute(
-                "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2",
-                params![f.seat, f.session_id],
-            )?;
-            tx.execute(
-                "UPDATE sessions SET compactions = 0 WHERE seat = ?1 AND session_id = ?2",
-                params![f.seat, f.session_id],
-            )?;
-        }
-        tx.execute(
-            "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-            params![f.seat, f.session_id, f.agent_id],
-        )?;
-    }
-    let mut account = w.account.clone();
-    let mut last_ts = w.last_ts;
-    let mut agg = FileAgg::default();
-    let mut ins_req = tx.prepare_cached(
-        "INSERT INTO requests(msg_id, seat, session_id, agent_id, account_uuid, ts, model, requested_model, effort, fast, cwd,
-                              input, cw5, cw1h, cread, output, thinking, web, tools)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
-         ON CONFLICT(msg_id) DO UPDATE SET
-           input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
-           cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
-           web = MAX(web, excluded.web), tools = tools + excluded.tools,
-           account_uuid = COALESCE(account_uuid, excluded.account_uuid), cost = NULL, priced = NULL",
-    )?;
-    let mut ins_tool = tx.prepare_cached(
-        "INSERT INTO tool_calls(id, msg_id, seat, session_id, agent_id, ts, name, summary, target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(id) DO NOTHING",
-    )?;
-    let mut upd_tool =
-        tx.prepare_cached("UPDATE tool_calls SET done_ts = ?1, is_error = ?2 WHERE id = ?3")?;
-    for ev in chunk.events {
-        match ev {
-            Event::Owner { account_uuid } => {
-                tx.execute("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![f.seat, f.session_id, last_ts, account_uuid])?;
-                account = Some(account_uuid);
-            }
-            Event::Request(r) => {
-                let t = ms(r.ts);
-                last_ts = last_ts.max(t);
-                agg.first_ts = Some(agg.first_ts.map_or(t, |x| x.min(t)));
-                agg.last_ts = Some(agg.last_ts.map_or(t, |x| x.max(t)));
-                if r.cwd.is_some() {
-                    agg.cwd = r.cwd.clone();
-                    if let Some(c) = &r.cwd
-                        && !cwds.contains(c)
-                    {
-                        cwds.insert(c.clone());
-                    }
-                }
-                let u = r.usage;
-                ins_req.execute(params![
-                    r.msg_id,
-                    f.seat,
-                    f.session_id,
-                    f.agent_id,
-                    if main { account.clone() } else { None },
-                    t,
-                    r.model,
-                    r.requested_model,
-                    r.effort,
-                    r.fast as i64,
-                    r.cwd,
-                    u.input as i64,
-                    u.cache_write_5m as i64,
-                    u.cache_write_1h as i64,
-                    u.cache_read as i64,
-                    u.output as i64,
-                    u.thinking as i64,
-                    u.web_search as i64,
-                    r.tool_uses.len() as i64,
-                ])?;
-                for tu in &r.tool_uses {
-                    if !tu.id.is_empty() {
-                        ins_tool.execute(params![
-                            tu.id,
-                            r.msg_id,
-                            f.seat,
-                            f.session_id,
-                            f.agent_id,
-                            t,
-                            tu.name,
-                            tu.summary,
-                            tu.target
-                        ])?;
-                    }
-                }
-            }
-            Event::ToolResult {
-                tool_use_id,
-                ts,
-                is_error,
-            } => {
-                if let Some(t) = ts {
-                    last_ts = last_ts.max(ms(t));
-                }
-                upd_tool.execute(params![ts.map(ms), is_error as i64, tool_use_id])?;
-            }
-            Event::Prompt { ts, text } => {
-                if let Some(t) = ts {
-                    last_ts = last_ts.max(ms(t));
-                    if main {
-                        tx.execute("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4)", params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
-                    }
-                }
-            }
-            Event::Title { kind, text } => match kind {
-                TitleKind::Custom => agg.title = Some(text),
-                TitleKind::Ai => agg.ai_title = Some(text),
-                TitleKind::AgentName => {
-                    agg.title.get_or_insert(text);
-                }
-            },
-            Event::TurnEnd { ts, .. } => {
-                if let Some(t) = ts {
-                    last_ts = last_ts.max(ms(t));
-                }
-            }
-            Event::Compact { .. } => agg.compactions += 1,
-            Event::AgentLaunch { .. } => {}
-            Event::CostState { total_usd, models } => {
-                // Cumulative per process; a resumed session starts a new count, so keep the largest.
-                tx.execute(
-                    "INSERT INTO cost_states(seat, session_id, total_usd, models) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(seat, session_id) DO UPDATE SET total_usd = excluded.total_usd, models = excluded.models
-                     WHERE excluded.total_usd >= cost_states.total_usd",
-                    params![f.seat, f.session_id, total_usd, serde_json::to_string(&models).unwrap_or_default()],
-                )?;
-            }
-            Event::ApiError { ts, kind, text } => {
-                let t = ts.map(ms).unwrap_or(last_ts);
-                tx.execute(
-                    "INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![f.seat, f.session_id, f.agent_id, t, kind, text],
-                )?;
-            }
-        }
-    }
-
-    if main {
-        if let Some(dir) = f.path.parent().map(|p| p.join(&f.session_id))
-            && let Some(t) = files::read_custom_title(&dir)
-        {
-            agg.title = Some(t);
-        }
-        tx.execute(
-            "INSERT INTO sessions(seat, session_id, title, ai_title, cwd, first_ts, last_ts, compactions) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(seat, session_id) DO UPDATE SET
-               title = COALESCE(excluded.title, title), ai_title = COALESCE(excluded.ai_title, ai_title), cwd = COALESCE(excluded.cwd, cwd),
-               first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
-               last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
-               compactions = compactions + excluded.compactions",
-            params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts, agg.compactions],
-        )?;
-    }
-    let meta = f
-        .meta_path()
-        .and_then(|p| files::read_meta(&p))
-        .unwrap_or_default();
-    let workflow_run = match &f.kind {
-        FileKind::Workflow(r) => Some(r.clone()),
-        _ => None,
-    };
-    tx.execute(
-        "INSERT INTO agents(seat, session_id, agent_id, kind, workflow_run, agent_type, description, tool_use_id, parent_agent_id, depth,
-                            requested_model, effort, finished, first_ts, last_ts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-         ON CONFLICT(seat, session_id, agent_id) DO UPDATE SET
-           agent_type = COALESCE(excluded.agent_type, agent_type), description = COALESCE(excluded.description, description),
-           tool_use_id = COALESCE(excluded.tool_use_id, tool_use_id), parent_agent_id = COALESCE(excluded.parent_agent_id, parent_agent_id),
-           depth = COALESCE(excluded.depth, depth), requested_model = COALESCE(excluded.requested_model, requested_model),
-           effort = COALESCE(excluded.effort, effort), finished = excluded.finished,
-           first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
-           last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts))",
-        params![
-            f.seat,
-            f.session_id,
-            f.agent_id,
-            f.kind.tag(),
-            workflow_run,
-            meta.agent_type,
-            meta.description,
-            meta.tool_use_id,
-            meta.parent_agent_id,
-            meta.spawn_depth.map(|d| d as i64).or(if main { Some(0) } else { None }),
-            meta.model,
-            meta.effort,
-            (meta.finished || main) as i64,
-            agg.first_ts,
-            agg.last_ts,
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO files(path, seat, session_id, agent_id, kind, ino, size, mtime, offset, last_ts, account_uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-         ON CONFLICT(path) DO UPDATE SET ino = excluded.ino, size = excluded.size, mtime = excluded.mtime, offset = excluded.offset,
-           last_ts = excluded.last_ts, account_uuid = excluded.account_uuid",
-        params![
-            f.path.to_string_lossy(),
-            f.seat,
-            f.session_id,
-            f.agent_id,
-            f.kind.tag(),
-            w.ino as i64,
-            w.size as i64,
-            w.mtime,
-            chunk.end as i64,
-            last_ts,
-            account,
-        ],
-    )?;
-    Ok(())
 }
 
 #[cfg(test)]

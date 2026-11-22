@@ -54,6 +54,37 @@ mod tests {
         .to_string()
     }
 
+    /// One assistant record of a response that calls these tools: (id, name, input).
+    pub(crate) fn tool_calls(
+        msg_id: &str,
+        ts: &str,
+        cwd: &str,
+        tools: &[(&str, &str, serde_json::Value)],
+    ) -> String {
+        let content: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|(id, name, input)| serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+            .collect();
+        serde_json::json!({
+            "type": "assistant", "timestamp": ts, "cwd": cwd, "sessionId": "s",
+            "message": {"id": msg_id, "model": "claude-sonnet-5-5", "content": content,
+                "usage": {"input_tokens": 10, "output_tokens": 1,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0}}
+        })
+        .to_string()
+    }
+
+    fn prompt(ts: &str, text: &str) -> String {
+        serde_json::json!({"type": "user", "timestamp": ts, "message": {"role": "user", "content": text}})
+            .to_string()
+    }
+
+    fn api_error(ts: &str) -> String {
+        serde_json::json!({"type": "assistant", "isApiErrorMessage": true, "error": "rate_limit", "timestamp": ts,
+            "message": {"id": "x", "model": "<synthetic>", "content": [{"type": "text", "text": "API Error: Rate limit reached"}]}})
+        .to_string()
+    }
+
     pub(crate) fn owner(account: &str) -> String {
         serde_json::json!({"type": "session-owner", "accountUuid": account, "sessionId": "s"})
             .to_string()
@@ -122,6 +153,40 @@ mod tests {
             for l in lines {
                 writeln!(f, "{l}").unwrap();
             }
+        }
+
+        /// The transcript of a subagent of `session`.
+        fn subagent(&self, seat: &str, session: &str, agent: &str) -> PathBuf {
+            let s = self.seats.iter().find(|s| s.label == seat).unwrap();
+            let dir = s
+                .projects_dir()
+                .join("-w-proj")
+                .join(session)
+                .join("subagents");
+            std::fs::create_dir_all(&dir).unwrap();
+            dir.join(format!("agent-{agent}.jsonl"))
+        }
+
+        pub(crate) fn write_subagent(
+            &self,
+            seat: &str,
+            session: &str,
+            agent: &str,
+            lines: &[String],
+        ) {
+            let p = self.subagent(seat, session, agent);
+            let tmp = p.with_extension("tmp");
+            let text: String = lines.iter().map(|l| format!("{l}\n")).collect();
+            std::fs::write(&tmp, text).unwrap();
+            std::fs::rename(&tmp, &p).unwrap();
+        }
+
+        /// Every transcript file of every seat.
+        fn files(&self) -> Vec<crate::claude::files::TranscriptFile> {
+            self.seats
+                .iter()
+                .flat_map(crate::claude::files::list)
+                .collect()
         }
 
         /// Writes the transcript anew (another inode), as when a file is replaced.
@@ -534,5 +599,378 @@ mod tests {
         // 1M input at $7.
         assert!(close(t.cost, 7.0), "{}", t.cost);
         assert_eq!(t.unpriced, 0);
+    }
+
+    #[test]
+    fn files_edited_and_edit_conflicts_count_the_same_tools() {
+        // Two sessions edit the same notebook in the same hour (NotebookEdit), and the same
+        // source file (Edit, Write); one of them also reads a file, which is no edit.
+        let w = World::new(&["work"]);
+        let nb = serde_json::json!({"notebook_path": "/w/shop/a.ipynb"});
+        let src = serde_json::json!({"file_path": "/w/shop/main.rs"});
+        let other = serde_json::json!({"file_path": "/w/shop/lib.rs"});
+        w.append(
+            "work",
+            "s1",
+            &[
+                tool_calls(
+                    "e1",
+                    "2026-11-10T10:05:00Z",
+                    "/w/shop",
+                    &[
+                        ("t1", "NotebookEdit", nb.clone()),
+                        ("t2", "Edit", src.clone()),
+                    ],
+                ),
+                tool_calls(
+                    "e2",
+                    "2026-11-10T10:06:00Z",
+                    "/w/shop",
+                    &[("t3", "Read", other)],
+                ),
+            ],
+        );
+        w.append(
+            "work",
+            "s2",
+            &[tool_calls(
+                "e3",
+                "2026-11-10T10:20:00Z",
+                "/w/shop",
+                &[("t4", "NotebookEdit", nb), ("t5", "Write", src)],
+            )],
+        );
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let span = all("2026-11-11T00:00:00Z");
+        let e = idx.efficiency(span).unwrap();
+        // Two files, four edits; the read is not an edit.
+        assert_eq!((e.files_edited, e.edits), (2, 4));
+        let mut conflicts = idx.edit_conflicts(at("2026-11-10T00:00:00Z")).unwrap();
+        conflicts.sort();
+        assert_eq!(
+            conflicts,
+            vec![
+                ("/w/shop/a.ipynb".to_string(), 2),
+                ("/w/shop/main.rs".to_string(), 2)
+            ],
+            "every file counted as edited can be a conflict, notebooks too"
+        );
+    }
+
+    #[test]
+    fn the_efficiency_split_adds_up_to_the_cost() {
+        // A fast-mode Opus 5.5 request with web searches and a long-context Haiku 5.5 request:
+        // the multipliers the old split left out.
+        let w = World::new(&["work"]);
+        let rec = |id: &str, model: &str, speed: &str, input: u64, cread: u64, web: u64| {
+            serde_json::json!({
+                "type": "assistant", "timestamp": "2026-11-10T10:00:00Z", "cwd": "/w/shop", "sessionId": "s",
+                "message": {"id": id, "model": model, "content": [],
+                    "usage": {"input_tokens": input, "output_tokens": 4000,
+                              "cache_creation_input_tokens": 0, "cache_read_input_tokens": cread,
+                              "server_tool_use": {"web_search_requests": web}, "speed": speed}}
+            })
+            .to_string()
+        };
+        w.append(
+            "work",
+            "s1",
+            &[
+                rec("o", "claude-opus-5-5", "fast", 300_000, 100_000, 3),
+                rec("h", "claude-haiku-5-5", "standard", 300_000, 100_000, 0),
+            ],
+        );
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let e = idx.efficiency(all("2026-11-11T00:00:00Z")).unwrap();
+        // Opus fast (×2): input 300k × $4 = 1.20 → 2.40; reads 100k × $0.20 = 0.02 → 0.04;
+        // output 4k × $20 = 0.08 → 0.16; web 3 × $0.01 → 0.06. Total 2.66.
+        // Haiku long context (430k > 100k, ×5): input 300k × $0.10 × 5 = 0.15; reads 100k ×
+        // $0.01 × 5 = 0.005; output 4k × $0.50 × 5 = 0.01. Total 0.165.
+        assert!(close(e.cost, 2.66 + 0.165), "{}", e.cost);
+        assert!(
+            close(e.split.total(), e.cost),
+            "{:?} vs {}",
+            e.split,
+            e.cost
+        );
+        assert!(close(e.split.input, 2.4 + 0.15));
+        assert!(close(e.split.cache_read, 0.04 + 0.005));
+        assert!(close(e.split.output, 0.16 + 0.01));
+        assert!(close(e.split.web, 0.06));
+        // Saved by reading the cache instead of paying input: Opus 100k × (4 − 0.2) × 2 = 0.76,
+        // Haiku 100k × (0.10 − 0.01) × 5 = 0.045.
+        assert!(close(e.cache_saved, 0.76 + 0.045), "{}", e.cache_saved);
+        // A reprice moves the split with the cost.
+        let mut user = PriceBook::builtin();
+        user.push_override(
+            "claude-opus-5-5",
+            None,
+            1.0,
+            5.0,
+            &RateOverrides::default(),
+            at("2026-11-22T12:00:00Z").date_naive(),
+        )
+        .unwrap();
+        idx.price_all(&user).unwrap();
+        let e = idx.efficiency(all("2026-11-11T00:00:00Z")).unwrap();
+        assert!(
+            close(e.split.total(), e.cost),
+            "{:?} vs {}",
+            e.split,
+            e.cost
+        );
+    }
+
+    /// What the EFFICIENCY panel and `doctor` count, besides the requests.
+    const COUNTED: &[&str] = &[
+        "SELECT seat, session_id, ts, chars FROM prompts ORDER BY 1, 2, 3",
+        "SELECT seat, session_id, agent_id, ts, kind FROM api_errors ORDER BY 1, 2, 3, 4",
+        "SELECT seat, session_id, compactions FROM sessions ORDER BY 1, 2",
+        "SELECT type, SUM(count) FROM record_types GROUP BY 1 ORDER BY 1",
+        "SELECT msg_id, tools FROM requests ORDER BY 1",
+    ];
+
+    /// A main transcript with prompts, an API error, a compaction and tool calls, and one
+    /// subagent with its own error and tool call.
+    fn busy_session(w: &World) {
+        let m = "claude-sonnet-5-5";
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                prompt("2026-11-10T09:59:00Z", "Fix the report"),
+                assistant(
+                    "r1",
+                    "2026-11-10T10:00:00Z",
+                    m,
+                    "/w/shop",
+                    (1000, 10),
+                    &["t1", "t2"],
+                ),
+                api_error("2026-11-10T10:01:00Z"),
+                compact("2026-11-10T10:02:00Z"),
+                prompt("2026-11-10T10:03:00Z", "And the totals"),
+                assistant(
+                    "r2",
+                    "2026-11-10T10:04:00Z",
+                    m,
+                    "/w/shop",
+                    (500, 5),
+                    &["t3"],
+                ),
+            ],
+        );
+        w.write_subagent(
+            "work",
+            "s1",
+            "a1",
+            &[
+                assistant(
+                    "sa1",
+                    "2026-11-10T10:00:30Z",
+                    m,
+                    "/w/shop",
+                    (200, 2),
+                    &["t9"],
+                ),
+                api_error("2026-11-10T10:00:40Z"),
+            ],
+        );
+    }
+
+    fn counted(idx: &Index) -> Vec<Vec<String>> {
+        COUNTED.iter().map(|q| dump(idx, q)).collect()
+    }
+
+    #[test]
+    fn two_processes_refreshing_at_once_count_everything_once() {
+        let w = World::new(&["work"]);
+        busy_session(&w);
+        let prices = PriceBook::builtin();
+        let mut reference = w.index("ref.sqlite");
+        w.refresh(&mut reference, &[], &prices);
+        let want = counted(&reference);
+        // Sanity: the fixture counts what it should.
+        assert_eq!(want[0].len(), 2, "two prompts");
+        assert_eq!(want[1].len(), 2, "two API errors");
+        assert_eq!(want[2], vec!["work|s1|1".to_string()], "one compaction");
+        assert_eq!(
+            want[4],
+            ["r1|2", "r2|1", "sa1|1"].map(String::from).to_vec()
+        );
+
+        // Process A plans the work (reads the offsets), process B refreshes the same index
+        // completely, then A writes what it read: A's work is dropped, nothing counts twice.
+        let mut a = w.index("shared.sqlite");
+        let mut b = w.index("shared.sqlite");
+        let work = a.plan(&w.files()).unwrap();
+        assert_eq!(work.len(), 2);
+        w.refresh(&mut b, &[], &prices);
+        let mut resolver = Resolver::new(Vec::new());
+        a.ingest(work, &[], &mut resolver, &prices, &mut |_| {})
+            .unwrap();
+        assert_eq!(counted(&a), want);
+        assert_eq!(dump(&a, REQUESTS), dump(&reference, REQUESTS));
+
+        // More lines arrive; both refresh again, in turn and interleaved: still once.
+        w.append("work", "s1", &[prompt("2026-11-10T10:05:00Z", "Thanks")]);
+        w.append("work", "s1", &[compact("2026-11-10T10:06:00Z")]);
+        let work = a.plan(&w.files()).unwrap();
+        w.refresh(&mut b, &[], &prices);
+        a.ingest(work, &[], &mut resolver, &prices, &mut |_| {})
+            .unwrap();
+        w.refresh(&mut a, &[], &prices);
+        w.refresh(&mut reference, &[], &prices);
+        assert_eq!(counted(&a), counted(&reference));
+        assert_eq!(dump(&a, "SELECT compactions FROM sessions"), vec!["2"]);
+        assert_eq!(dump(&a, "SELECT COUNT(*) FROM prompts"), vec!["3"]);
+    }
+
+    #[test]
+    fn rereading_files_changes_no_count_and_a_subagent_reset_keeps_the_main_rows() {
+        let w = World::new(&["work"]);
+        busy_session(&w);
+        let prices = PriceBook::builtin();
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &prices);
+        let want = counted(&idx);
+        // A second connection over the same index finds nothing new.
+        let mut other = w.index("i.sqlite");
+        w.refresh(&mut other, &[], &prices);
+        assert_eq!(counted(&other), want);
+
+        // The subagent's file is replaced with the same content (read again from the start):
+        // the main session's prompts and compactions stay, nothing doubles.
+        let p = w.subagent("work", "s1", "a1");
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<String> = text.lines().map(String::from).collect();
+        w.write_subagent("work", "s1", "a1", &lines);
+        w.refresh(&mut idx, &[], &prices);
+        assert_eq!(counted(&idx), want, "after the subagent's re-read");
+
+        // The subagent's file shrinks to its first line: only its own error goes.
+        w.write_subagent("work", "s1", "a1", &lines[..1]);
+        w.refresh(&mut idx, &[], &prices);
+        let after = counted(&idx);
+        assert_eq!(after[0], want[0], "the main session's prompts are kept");
+        assert_eq!(after[2], want[2], "and its compaction");
+        assert_eq!(
+            after[1],
+            vec!["work|s1||1794304860000|rate_limit".to_string()],
+            "the main thread's error (10:01) stays, the subagent's is gone"
+        );
+
+        // The main file replaced with the same content: same counts as before.
+        let main = std::fs::read_to_string(w.transcript("work", "s1")).unwrap();
+        let lines: Vec<String> = main.lines().map(String::from).collect();
+        w.replace("work", "s1", &lines);
+        w.refresh(&mut idx, &[], &prices);
+        assert_eq!(counted(&idx), after);
+    }
+
+    #[test]
+    fn repeated_readings_are_stored_once_every_few_minutes() {
+        let w = World::new(&["work", "home"]);
+        let resets = |jitter: &str| format!("2026-11-25T{jitter}Z");
+        let seat = |label: &str, used: f64, fetched: &str, reset: &str| SeatInfo {
+            label: label.into(),
+            account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
+            utilization: Some(weekly("acc-a", fetched, used, reset)),
+        };
+        let mut idx = w.index("i.sqlite");
+        let book = PriceBook::builtin();
+        // The same 40% every 10 s for 12 minutes, from two seats of one account whose resets
+        // differ by jitter; then 41%.
+        for i in 0..72 {
+            let t = at("2026-11-22T10:00:00Z") + chrono::Duration::seconds(10 * i);
+            let f = t.to_rfc3339();
+            w.refresh(
+                &mut idx,
+                &[
+                    seat("work", 40.0, &f, &resets("14:59:59.56")),
+                    seat("home", 40.0, &f, &resets("15:00:00.13")),
+                ],
+                &book,
+            );
+        }
+        w.refresh(
+            &mut idx,
+            &[seat(
+                "work",
+                41.0,
+                "2026-11-22T10:12:05Z",
+                &resets("15:00:00"),
+            )],
+            &book,
+        );
+        let rows = dump(
+            &idx,
+            "SELECT fetched_at, utilization FROM readings ORDER BY fetched_at",
+        );
+        // 40% at 10:00, again at 10:05:10 and 10:10:20 (more than 5 minutes after the last one
+        // stored), and 41% at once.
+        let ms = |t: &str| at(t).timestamp_millis();
+        assert_eq!(
+            rows,
+            vec![
+                format!("{}|40.000000000", ms("2026-11-22T10:00:00Z")),
+                format!("{}|40.000000000", ms("2026-11-22T10:05:10Z")),
+                format!("{}|40.000000000", ms("2026-11-22T10:10:20Z")),
+                format!("{}|41.000000000", ms("2026-11-22T10:12:05Z")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_price_edit_applies_without_new_transcript_data_and_never_reads_as_zero() {
+        // Review H8: no −1 sentinel (the schema refuses it, see `schema::tests`), and a
+        // `[[price]]` edit reprices at the next refresh even when no file changed.
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        w.append(
+            "work",
+            "s1",
+            &[assistant(
+                "a",
+                "2026-11-10T12:00:00Z",
+                m,
+                "/w/shop",
+                (1_000_000, 0),
+                &[],
+            )],
+        );
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let total = |idx: &Index| {
+            idx.total(all("2026-12-01T00:00:00Z"), &Filter::default())
+                .unwrap()
+        };
+        // 1M input at the built-in $2.
+        assert!(close(total(&idx).cost, 2.0));
+        let mut user = PriceBook::builtin();
+        user.push_override(
+            m,
+            None,
+            5.0,
+            25.0,
+            &RateOverrides::default(),
+            at("2026-11-22T12:00:00Z").date_naive(),
+        )
+        .unwrap();
+        w.refresh(&mut idx, &[], &user);
+        let t = total(&idx);
+        // 1M input at the user's $5, priced: nothing pending, nothing negative.
+        assert!(close(t.cost, 5.0), "{}", t.cost);
+        assert_eq!((t.pending, t.unpriced), (0, 0));
+        assert_eq!(
+            dump(
+                &idx,
+                "SELECT COUNT(*) FROM requests WHERE cost < 0 OR priced IS NULL"
+            ),
+            vec!["0"]
+        );
     }
 }

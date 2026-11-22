@@ -312,8 +312,9 @@ impl Ctx {
         Ok(merged.into_iter().collect())
     }
 
-    /// The current weekly window of the given account, else of the most recently read one, for
-    /// `--period week`.
+    /// The weekly window in force (`core::limits::window_of`: a reset by hand moves its start) of
+    /// the given account, else of the most recently read one, for `--period week`: the same
+    /// window `swarmy limits` and the dashboard show.
     pub fn limit_week(&self, idx: &Index, account: Option<&str>) -> anyhow::Result<Option<Span>> {
         let readings = self.latest_readings(idx)?;
         let pick = match account {
@@ -322,10 +323,15 @@ impl Ctx {
                 .iter()
                 .max_by_key(|(_, r)| r.iter().map(|x| x.fetched_at).max()),
         };
-        let Some(r) = pick.and_then(|p| p.1.iter().find(|r| r.kind == WindowKind::SevenDay)) else {
+        let Some((acct, r)) = pick.and_then(|(acct, rs)| {
+            rs.iter()
+                .find(|r| r.kind == WindowKind::SevenDay)
+                .map(|r| (acct, r))
+        }) else {
             return Ok(None);
         };
-        let w = crate::core::limits::current_window(r, self.now);
+        let history = idx.readings(acct, WindowKind::SevenDay)?;
+        let w = crate::core::limits::window_of(r, &history, self.now).window;
         Ok(Some(Span {
             start: w.start,
             end: w.end.min(self.now + chrono::Duration::seconds(1)),

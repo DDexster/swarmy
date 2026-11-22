@@ -34,6 +34,7 @@ pub const CACHE_TABLES: &[&str] = &[
     "projects",
     "prompts",
     "api_errors",
+    "compact_events",
     "cost_states",
     "record_types",
 ];
@@ -66,8 +67,37 @@ pub fn file_kinds() -> String {
     in_list(&FileKind::TAGS)
 }
 
+/// The parts of a request's cost (`core::pricing::CostParts`), stored next to `cost` so the
+/// efficiency split is a `SUM` over the same rows as the total. Columns added after a cache
+/// version shipped are added in place by `migrate` (no rebuild: transcripts may be gone).
+pub const COST_PARTS: &[&str] = &[
+    "cost_input",
+    "cost_cache_write",
+    "cost_cache_read",
+    "cost_output",
+    "cost_web",
+    "cache_saved",
+];
+
+fn cost_part_column(c: &str) -> String {
+    format!("{c} REAL CHECK ({c} IS NULL OR {c} >= 0)")
+}
+
+/// `cost = NULL, priced = NULL, cost_input = NULL, …`: a request waiting for its price.
+pub fn unpriced_sql() -> String {
+    let mut s = String::from("cost = NULL, priced = NULL");
+    for c in COST_PARTS {
+        s.push_str(&format!(", {c} = NULL"));
+    }
+    s
+}
+
 pub fn cache_sql() -> String {
     let file_kinds = file_kinds();
+    let cost_parts: String = COST_PARTS
+        .iter()
+        .map(|c| format!("  {},\n", cost_part_column(c)))
+        .collect();
     format!(
         r#"
 CREATE TABLE IF NOT EXISTS files (
@@ -108,6 +138,8 @@ CREATE TABLE IF NOT EXISTS requests (
   cost REAL CHECK (cost IS NULL OR cost >= 0),
   -- NULL: not priced yet; 0: no price is known for the model; 1: priced.
   priced INTEGER CHECK (priced IN (0, 1)),
+  -- `cost` by kind of token (`core::pricing::cost_parts`), set and cleared together with it.
+{cost_parts}
   CHECK (CASE WHEN priced = 1 THEN cost IS NOT NULL ELSE cost IS NULL END)
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
@@ -177,11 +209,14 @@ CREATE TABLE IF NOT EXISTS projects (
   worktree TEXT
 );
 
+-- Rows with natural keys: reading the same bytes twice (a replaced file, two processes) adds
+-- nothing.
 CREATE TABLE IF NOT EXISTS prompts (
   seat TEXT NOT NULL,
   session_id TEXT NOT NULL,
   ts INTEGER NOT NULL,
-  chars INTEGER NOT NULL CHECK (chars >= 0)
+  chars INTEGER NOT NULL CHECK (chars >= 0),
+  PRIMARY KEY (seat, session_id, ts)
 );
 CREATE INDEX IF NOT EXISTS prompts_ts ON prompts(ts);
 
@@ -191,9 +226,19 @@ CREATE TABLE IF NOT EXISTS api_errors (
   agent_id TEXT NOT NULL,
   ts INTEGER NOT NULL,
   kind TEXT NOT NULL,
-  text TEXT
+  text TEXT,
+  PRIMARY KEY (seat, session_id, agent_id, ts, kind)
 );
 CREATE INDEX IF NOT EXISTS api_errors_ts ON api_errors(ts);
+
+-- Compactions of a session (main transcript); `sessions.compactions` is their count. Rows with
+-- a negative `ts` are counts kept from before the times were stored.
+CREATE TABLE IF NOT EXISTS compact_events (
+  seat TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  ts INTEGER NOT NULL,
+  PRIMARY KEY (seat, session_id, ts)
+);
 
 CREATE TABLE IF NOT EXISTS cost_states (
   seat TEXT NOT NULL,
@@ -203,9 +248,13 @@ CREATE TABLE IF NOT EXISTS cost_states (
   PRIMARY KEY (seat, session_id)
 );
 
+-- Record types per transcript file (for `doctor`): a file read again from the start forgets its
+-- counts first; an empty path holds counts kept from before files were told apart.
 CREATE TABLE IF NOT EXISTS record_types (
-  type TEXT PRIMARY KEY,
-  count INTEGER NOT NULL CHECK (count >= 0)
+  path TEXT NOT NULL,
+  type TEXT NOT NULL,
+  count INTEGER NOT NULL CHECK (count >= 0),
+  PRIMARY KEY (path, type)
 );
 "#
     )
@@ -266,6 +315,7 @@ pub const EXTRA_INDEXES: &str = r#"
 CREATE INDEX IF NOT EXISTS requests_account_ts ON requests(account_uuid, ts);
 CREATE INDEX IF NOT EXISTS requests_no_account ON requests(seat, session_id) WHERE account_uuid IS NULL;
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
+CREATE INDEX IF NOT EXISTS tool_calls_msg ON tool_calls(msg_id);
 "#;
 
 pub(super) fn meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
@@ -292,7 +342,8 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
     )?;
-    let tx = conn.unchecked_transaction()?;
+    // Immediate: two processes opening an old index migrate it one after the other.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     migrate_facts(&tx)?;
     let rebuild = meta(&tx, "schema_version")?.as_deref() != Some(CACHE_VERSION);
     if rebuild {
@@ -306,11 +357,105 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
         }
         set_meta(&tx, "schema_version", CACHE_VERSION)?;
     }
-    // Tables added without a version bump (all `IF NOT EXISTS`), then extra indexes.
+    // Tables added without a version bump (all `IF NOT EXISTS`), then the steps that reshape
+    // cache tables in place, then extra indexes.
     tx.execute_batch(&cache_sql())?;
+    let done: usize = if rebuild {
+        CACHE_STEPS.len()
+    } else {
+        meta(&tx, "cache_step")?.map_or(Ok(0), |v| v.parse())?
+    };
+    for step in CACHE_STEPS.iter().skip(done) {
+        step(&tx)?;
+        // Tables a step recreated get their indexes back.
+        tx.execute_batch(&cache_sql())?;
+    }
+    set_meta(&tx, "cache_step", &CACHE_STEPS.len().to_string())?;
     tx.execute_batch(EXTRA_INDEXES)?;
     tx.commit()?;
     Ok(rebuild)
+}
+
+/// Steps that bring the cache tables of an older database to the shape of `cache_sql` in place,
+/// keeping their rows: a rebuild would lose requests whose transcripts Claude Code already
+/// deleted. Each runs once (`meta.cache_step`), on databases older than the step; a rebuilt cache
+/// already has the latest shape. Steps only ever get appended.
+type CacheStep = fn(&Connection) -> anyhow::Result<()>;
+const CACHE_STEPS: &[CacheStep] = &[add_cost_parts, add_natural_keys];
+
+fn columns(conn: &Connection, table: &str) -> rusqlite::Result<Vec<String>> {
+    conn.prepare("SELECT name FROM pragma_table_info(?1)")?
+        .query_map([table], |r| r.get(0))?
+        .collect()
+}
+
+/// Recreates `table` from `cache_sql` and copies the rows `copy` selects from the old one
+/// (`{old}` in it names the old table); rows the new keys refuse as duplicates are left out.
+fn recreate(conn: &Connection, table: &str, copy: &str) -> anyhow::Result<()> {
+    let old = format!("{table}_old");
+    conn.execute_batch(&format!("ALTER TABLE {table} RENAME TO {old};"))?;
+    // The old table keeps its index names; drop them so `cache_sql` creates them anew.
+    let indexes: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND sql IS NOT NULL")?
+        .query_map([&old], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    for i in indexes {
+        conn.execute_batch(&format!("DROP INDEX {i};"))?;
+    }
+    conn.execute_batch(&cache_sql())?;
+    conn.execute_batch(&copy.replace("{old}", &old))?;
+    conn.execute_batch(&format!("DROP TABLE {old};"))?;
+    Ok(())
+}
+
+/// Step 1: the parts of each request's cost, next to `cost` (computed again with them).
+fn add_cost_parts(conn: &Connection) -> anyhow::Result<()> {
+    let have = columns(conn, "requests")?;
+    let missing: Vec<&&str> = COST_PARTS
+        .iter()
+        .filter(|c| !have.iter().any(|h| h == **c))
+        .collect();
+    for c in &missing {
+        conn.execute_batch(&format!(
+            "ALTER TABLE requests ADD COLUMN {};",
+            cost_part_column(c)
+        ))?;
+    }
+    if !missing.is_empty() {
+        conn.execute("DELETE FROM meta WHERE key = 'price_fp'", [])?;
+    }
+    Ok(())
+}
+
+/// Step 2: natural keys on prompts and API errors, compactions as events, record types per file.
+fn add_natural_keys(conn: &Connection) -> anyhow::Result<()> {
+    if !columns(conn, "record_types")?.iter().any(|c| c == "path") {
+        recreate(
+            conn,
+            "record_types",
+            "INSERT INTO record_types(path, type, count) SELECT '', type, count FROM {old};",
+        )?;
+    }
+    recreate(
+        conn,
+        "prompts",
+        "INSERT OR IGNORE INTO prompts(seat, session_id, ts, chars)
+         SELECT seat, session_id, ts, chars FROM {old};",
+    )?;
+    recreate(
+        conn,
+        "api_errors",
+        "INSERT OR IGNORE INTO api_errors(seat, session_id, agent_id, ts, kind, text)
+         SELECT seat, session_id, agent_id, ts, kind, text FROM {old};",
+    )?;
+    // The counts so far, as events without a time (ts −1, −2, …): a session whose transcript is
+    // read again from the start replaces them with the real ones.
+    conn.execute_batch(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < (SELECT MAX(compactions) FROM sessions))
+         INSERT OR IGNORE INTO compact_events(seat, session_id, ts)
+         SELECT s.seat, s.session_id, -n.i FROM sessions s JOIN n ON n.i <= s.compactions;",
+    )?;
+    Ok(())
 }
 
 fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
@@ -481,5 +626,105 @@ mod tests {
         migrate(&c).unwrap();
         set_meta(&c, "facts_version", "99").unwrap();
         assert!(migrate(&c).is_err());
+    }
+
+    #[test]
+    fn an_older_cache_is_reshaped_in_place() {
+        // A cache of the current version written before the cost parts, the natural keys and
+        // the compaction events existed: its rows stay (their transcripts may be gone).
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('schema_version', '6'), ('facts_version', '1'), ('price_fp', 'old');",
+        )
+        .unwrap();
+        c.execute_batch(&cache_sql()).unwrap();
+        c.execute_batch(
+            "DROP TABLE prompts; DROP TABLE api_errors; DROP TABLE record_types; DROP TABLE compact_events;
+             CREATE TABLE prompts (seat TEXT NOT NULL, session_id TEXT NOT NULL, ts INTEGER NOT NULL, chars INTEGER NOT NULL CHECK (chars >= 0));
+             CREATE INDEX prompts_ts ON prompts(ts);
+             CREATE TABLE api_errors (seat TEXT NOT NULL, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, ts INTEGER NOT NULL, kind TEXT NOT NULL, text TEXT);
+             CREATE TABLE record_types (type TEXT PRIMARY KEY, count INTEGER NOT NULL CHECK (count >= 0));
+             INSERT INTO prompts VALUES ('w', 's1', 5, 10), ('w', 's1', 5, 10), ('w', 's1', 6, 3);
+             INSERT INTO api_errors VALUES ('w', 's1', '', 7, 'rate_limit', 'x'), ('w', 's1', '', 7, 'rate_limit', 'x');
+             INSERT INTO record_types VALUES ('assistant', 40), ('user', 30);
+             INSERT INTO sessions(seat, session_id, compactions) VALUES ('w', 's1', 3), ('w', 's2', 0);",
+        )
+        .unwrap();
+        for col in COST_PARTS {
+            c.execute_batch(&format!("ALTER TABLE requests DROP COLUMN {col};"))
+                .unwrap();
+        }
+        c.execute_batch(
+            "INSERT INTO requests(msg_id, seat, session_id, agent_id, ts, model, cost, priced)
+               VALUES ('m', 's', 'x', '', 1, 'm', 0.5, 1);",
+        )
+        .unwrap();
+        assert!(!migrate(&c).unwrap(), "no rebuild");
+        let n = |sql: &str| c.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(n("SELECT COUNT(*) FROM requests"), 1);
+        assert_eq!(n("SELECT COUNT(*) FROM meta WHERE key = 'price_fp'"), 0);
+        assert_eq!(n("SELECT COUNT(cost_input) FROM requests"), 0);
+        assert!(
+            c.execute("UPDATE requests SET cost_output = -1", [])
+                .is_err()
+        );
+        // Duplicates collapse under the new keys, and the keys hold from now on.
+        assert_eq!(n("SELECT COUNT(*) FROM prompts"), 2);
+        assert_eq!(n("SELECT COUNT(*) FROM api_errors"), 1);
+        assert!(
+            c.execute("INSERT INTO prompts VALUES ('w', 's1', 6, 3)", [])
+                .is_err()
+        );
+        assert_eq!(
+            n("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'prompts_ts'"),
+            1
+        );
+        // Legacy counts are kept: record types under an empty path, compactions as events.
+        assert_eq!(n("SELECT SUM(count) FROM record_types WHERE path = ''"), 70);
+        assert_eq!(
+            n("SELECT COUNT(*) FROM compact_events WHERE session_id = 's1' AND ts < 0"),
+            3
+        );
+        assert_eq!(
+            n("SELECT COUNT(*) FROM compact_events WHERE session_id = 's2'"),
+            0
+        );
+        // A second open runs no step again.
+        assert!(!migrate(&c).unwrap());
+        assert_eq!(n("SELECT COUNT(*) FROM compact_events"), 3);
+        assert_eq!(n("SELECT COUNT(*) FROM prompts"), 2);
+    }
+
+    #[test]
+    fn a_cache_version_bump_keeps_every_fact_table() {
+        // Review H1: a schema bump must never drop what nothing else records. Every fact table
+        // gets a row, the cache version changes, the rows are all still there.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        c.execute_batch(
+            "INSERT INTO seat_accounts VALUES ('work', 100, 'acc-a');
+             INSERT INTO accounts(account_uuid, email) VALUES ('acc-a', 'a@example.com');
+             INSERT INTO readings VALUES ('acc-a', 'seven_day', 1, 40, 9);
+             INSERT INTO observed_prices VALUES ('m', 1, '2026-11-01', 'work', '{}');
+             INSERT INTO requests(msg_id, seat, session_id, agent_id, ts, model) VALUES ('m', 's', 'x', '', 1, 'm');
+             UPDATE meta SET value = '0' WHERE key = 'schema_version';",
+        )
+        .unwrap();
+        let n = |t: &str| {
+            c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        };
+        let before: Vec<i64> = FACT_TABLES.iter().map(|t| n(t)).collect();
+        assert!(migrate(&c).unwrap(), "the cache is rebuilt");
+        assert_eq!(n("requests"), 0);
+        for (t, b) in FACT_TABLES.iter().zip(before) {
+            if *t != "meta" {
+                assert_eq!(n(t), b, "{t} kept its rows");
+                assert!(b > 0, "{t} had a row");
+            }
+        }
     }
 }

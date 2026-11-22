@@ -239,7 +239,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         heat: heat_cached,
         efficiency: match eff_reuse {
             Some(p) => p.efficiency.clone(),
-            None => timed!("efficiency", idx.efficiency(span, &ctx.prices).ok()),
+            None => timed!("efficiency", idx.efficiency(span).ok()),
         },
         efficiency_at: match eff_reuse {
             Some(p) => p.efficiency_at,

@@ -41,7 +41,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
   what it leaves out from the entry it overrides (`Rates::derive`). Money numbers in tests are
   computed by hand in comments.
 - Limit rules live once, in `src/core/limits.rs`: `Level` (60/85/100 thresholds; front ends only
-  map a level to their colour), `current_window`, `runs_out`, `projection_at_reset`, `was_reset`.
+  map a level to their colour), `current_window`, `runs_out`, `projection_at_reset`, `was_reset`, and `window_of`, the window in force (a reset by hand moves its start; `limits`, the dashboard and `report --period week` all use it). Readings of one window are named by their reset to the minute; a fall counts as a reset only when it holds across sources (`effective_start`).
   Every surface reads an account's limit from `Ctx::latest_readings` (index + seats, newest wins)
   through `limits::all_reports`; the `limit_threshold_copies` ratchet keeps copies out.
 - The index schema (`src/index/schema.rs`) has cache tables (rebuilt from transcripts when
@@ -57,7 +57,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/lib.rs`, `src/main.rs` | the library holds everything; the binary only parses arguments and calls `cli::run` |
 | `src/core/` | pure domain: usage, pricing, periods, limits math (no I/O) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
-| `src/index/` | SQLite index (incremental by inode/offset), schema, queries; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
+| `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
 | `src/live/` | live agent states for the dashboard; `state.rs`: how an agent's state is decided (pure, table-tested) |
 | `src/vault/` | login vault and switching |
 | `src/app/` | composition root `Ctx` (dirs, config, seats, prices, index), used by commands and dashboard |

@@ -70,9 +70,15 @@ impl Resolver {
                 orphan: false,
             };
         }
-        if let Some((root, worktree)) =
-            git_root(Path::new(cwd)).or_else(|| worktree_sibling(Path::new(cwd)))
-        {
+        // A dir that is gone is named by the sibling rule first: walking up from it would find
+        // any repository that encloses `<repo>-wt/` (a dotfiles repo at home, a monorepo).
+        let p = Path::new(cwd);
+        let found = if p.exists() {
+            git_root(p)
+        } else {
+            worktree_sibling(p).or_else(|| git_root(p))
+        };
+        if let Some((root, worktree)) = found {
             let name = dir_name(&root);
             return Project {
                 key: root.to_string_lossy().into_owned(),
@@ -170,11 +176,16 @@ mod tests {
 
     #[test]
     fn repo_subdir_worktree_and_missing_paths() {
-        let t = tempfile::tempdir().unwrap();
-        let repo = t.path().join("shop");
+        // Hermetic: the temp root is itself inside a repository (as when TMPDIR lies in a git
+        // checkout, or home is a dotfiles repo), and the rules below still hold.
+        let outer = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outer.path().join(".git")).unwrap();
+        let t = outer.path().join("work");
+        std::fs::create_dir_all(&t).unwrap();
+        let repo = t.as_path().join("shop");
         std::fs::create_dir_all(repo.join(".git/worktrees/feat")).unwrap();
         std::fs::create_dir_all(repo.join("backend/src")).unwrap();
-        let wt = t.path().join("shop-wt-feat");
+        let wt = t.as_path().join("shop-wt-feat");
         std::fs::create_dir_all(wt.join("app")).unwrap();
         std::fs::write(
             wt.join(".git"),
@@ -202,6 +213,10 @@ mod tests {
         let a = r.resolve("/home/user/work/old-name/app");
         assert_eq!((a.key.as_str(), a.name.as_str()), ("alias:shop", "shop"));
 
+        // A dir that is gone inside a repository still belongs to it.
+        let gone_sub = r.resolve(&repo.join("target/tmp/x").to_string_lossy());
+        assert_eq!(gone_sub.key, repo.to_string_lossy());
+
         let m = r.resolve("/nowhere/at/all/thing");
         assert_eq!(
             (m.key.as_str(), m.name.as_str()),
@@ -210,12 +225,17 @@ mod tests {
         assert!(m.orphan);
         assert!(!p.orphan);
 
-        // A removed worktree under `<repo>-wt/` still belongs to the repository.
-        let gone = r.resolve(&t.path().join("shop-wt/fix-1/backend").to_string_lossy());
+        // A removed worktree under `<repo>-wt/` still belongs to the repository, not to the
+        // repository that encloses them all.
+        let gone = r.resolve(&t.as_path().join("shop-wt/fix-1/backend").to_string_lossy());
         assert_eq!((gone.name.as_str(), gone.orphan), ("shop", false));
         assert_eq!(
             gone.worktree.as_deref(),
-            Some(t.path().join("shop-wt/fix-1").to_string_lossy().as_ref())
+            Some(t.as_path().join("shop-wt/fix-1").to_string_lossy().as_ref())
         );
+        // An existing dir outside `shop` belongs to the enclosing repository.
+        std::fs::create_dir_all(t.as_path().join("notes")).unwrap();
+        let notes = r.resolve(&t.as_path().join("notes").to_string_lossy());
+        assert_eq!(notes.key, outer.path().to_string_lossy());
     }
 }
