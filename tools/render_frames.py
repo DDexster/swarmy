@@ -2,11 +2,13 @@
 """Render frames recorded by `swarmy demo --record` to PNG files and an animated GIF.
 
 Usage: tools/render_frames.py FRAMES.jsonl OUT_DIR [--gif NAME.gif] [--png INDEX:NAME ...]
-       [--every N] [--scale S]
+       [--every N] [--scale S] [--start N]
+       tools/render_frames.py --ansi TEXT OUT_DIR --png 0:NAME   (text with ANSI colours, one frame)
 """
 import argparse
 import json
 import os
+import re
 
 from fontTools.ttLib import TTFont
 from PIL import Image, ImageDraw, ImageFont
@@ -148,6 +150,37 @@ class Renderer:
             d.rectangle([x, top, x + w - 1, y + h - 1], fill=col)
 
 
+# The basic SGR colours as the dashboard's default theme draws them.
+SGR = {"31": (255, 95, 95), "32": (95, 255, 135), "33": (255, 191, 0), "34": (95, 135, 255),
+       "35": (215, 135, 255), "36": (0, 215, 255), "37": FG}
+DIM = (110, 120, 135)
+
+
+def ansi_frame(text):
+    """One frame (rows of runs, as `swarmy demo --record` writes them) from text with SGR codes."""
+    rows = []
+    for line in text.rstrip("\n").split("\n"):
+        runs, fg, bold, dim = [], None, False, False
+        for part in re.split(r"(\x1b\[[0-9;]*m)", line):
+            m = re.fullmatch(r"\x1b\[([0-9;]*)m", part)
+            if m:
+                for code in (m.group(1) or "0").split(";"):
+                    if code in ("", "0"):
+                        fg, bold, dim = None, False, False
+                    elif code == "1":
+                        bold = True
+                    elif code == "2":
+                        dim = True
+                    elif code in SGR:
+                        fg = SGR[code]
+                continue
+            if part:
+                col = DIM if dim and fg is None else fg
+                runs.append([part, "#%02x%02x%02x" % col if col else None, None, bold])
+        rows.append(runs)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("frames")
@@ -157,9 +190,14 @@ def main():
     ap.add_argument("--every", type=int, default=1)
     ap.add_argument("--size", type=int, default=15)
     ap.add_argument("--scale", type=float, default=1.0)
+    ap.add_argument("--start", type=int, default=0, help="first frame of the GIF")
+    ap.add_argument("--ansi", action="store_true", help="FRAMES is text with ANSI colours: one frame")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
-    frames = [json.loads(l) for l in open(a.frames)]
+    if a.ansi:
+        frames = [ansi_frame(open(a.frames, encoding="utf-8").read())]
+    else:
+        frames = [json.loads(l) for l in open(a.frames)]
     r = Renderer(a.size)
     for spec in a.png:
         idx, name = spec.split(":", 1)
@@ -168,7 +206,7 @@ def main():
         print("wrote", name, img.size)
     if a.gif:
         rgb = []
-        for i in range(0, len(frames), a.every):
+        for i in range(a.start, len(frames), a.every):
             img = r.render(frames[i])
             if a.scale != 1.0:
                 img = img.resize((int(img.width * a.scale), int(img.height * a.scale)), Image.LANCZOS)

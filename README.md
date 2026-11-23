@@ -1,320 +1,309 @@
 # swarmy
 
-Mission control for Claude Code agents, in your terminal.
+**Mission control for Claude Code agents, in your terminal.**
 
-![swarmy boot: the swarm assembles](docs/img/boot.gif)
+[![CI](https://github.com/koorchik/swarmy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/koorchik/swarmy/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/koorchik/swarmy?sort=semver)](https://github.com/koorchik/swarmy/releases/latest)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
+[![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Raspberry%20Pi-lightgrey)](#platforms)
 
-![swarmy dashboard](docs/img/demo.gif)
+You run several Claude Code sessions, each with a crowd of subagents. swarmy shows every one of
+them live on one screen, tells you the moment one needs you and takes you there, and shows where
+your weekly limit went and when it runs out.
 
-Run several Claude Code instances (with different `CLAUDE_CONFIG_DIR`s), each with dozens of
-subagents, and see in one place:
+<p align="center">
+  <img src="docs/img/boot.gif" width="812" alt="swarmy starting up: the swarm assembles into the dashboard">
+</p>
 
-- **dozens of agents across all your Claude Code sessions at once** — what each one is doing right
-  now (thinking, running `cargo test`, waiting for its children, stalled), as a live tree with
-  30-minute activity lanes, timers, context fill and cost;
-- **the moment an agent needs you** — a question, a permission, a plan to approve: it blinks in
-  the tree, rings the terminal bell, goes to the top of ATTENTION, and `n` selects it;
-- **one key to get there** — `J` switches your tmux client to the pane where that Claude Code
-  runs (Claude Code records its tmux pane; swarmy selects that window and pane and switches the
-  client to its session), so you answer and come back;
-- **what it would cost at API prices**, by project, account, model, agent type, session, day;
-- **where your weekly limit went**, in % per project, and **when it will run out** at the current
-  burn rate — also when you swap logins between config dirs or reset a limit by hand;
-- **how each model is used** (Opus, Fable, Sonnet, Haiku): cost share, cache hits, thinking, effort
-  mix, requested-vs-served substitutions;
-- **CPU, RAM and disk** taken by the agents and their child processes.
+## What you get
 
-It also keeps a **vault of OAuth logins**: save the login of a config dir, put another account's
-login into it when the limit runs out, and switch back later, without losing tokens.
+- **Every agent of every session, live.** One tree across all your Claude Code config dirs: what
+  each agent is doing right now (thinking, running `cargo test`, waiting for its own agents,
+  stalled), for how long, its model and effort, context fill, cost, and a 30-minute activity lane.
+- **The moment one needs you, and a key to get there.** A permission prompt, a question or a plan
+  to approve blinks in the tree, rings the terminal bell and goes to the top of ATTENTION. `J`
+  switches your tmux client to that Claude Code's pane; `swarmy jump` does the same from a tmux
+  key binding.
+- **Where the weekly limit went, and when it runs out.** Per account: the week used, the share
+  each project took, and the time it runs out at the current pace. Early limit resets and logins
+  moved between config dirs are followed.
+- **Spend at API prices.** By project, account, model, effort, agent type, session, agent and day,
+  with trends against the previous period, the model mix, cache hits and thinking.
+- **A status line inside Claude Code.** Who needs you in your other sessions, this session's
+  agents, the exact week used and when it runs out.
+- **A vault for several accounts.** Save each config dir's login, put another account's login in
+  when a limit runs out, and switch back. A switch never loses a token.
+- **Offline, read-only, light.** No network, no telemetry. It reads what Claude Code already
+  writes. About 2 CPU-seconds a minute with 20 live agents on a 4K terminal. One static binary
+  with SQLite built in.
 
-Everything is read from what Claude Code already writes to disk. Nothing leaves your machine.
+<p align="center">
+  <img src="docs/img/demo.gif" width="974" alt="the dashboard: an agent asks for permission, ATTENTION lists it first, the AGENT panel shows what it waits for">
+  <br><sub>A session asks for permission: it is marked in the tree, comes first in ATTENTION and fills the AGENT panel. (All media is from <code>swarmy demo</code>: made-up data.)</sub>
+</p>
+
+## Quick start
+
+Every [release](https://github.com/koorchik/swarmy/releases/latest) has one static binary per
+platform, with the man page and shell completions. `SHA256SUMS` covers every file.
+
+**Linux** (any distribution, x86_64 or ARM):
+
+```sh
+V=0.1.0 T=x86_64-unknown-linux-musl     # other targets in the table below
+curl -fLO https://github.com/koorchik/swarmy/releases/download/v$V/swarmy-$V-$T.tar.gz
+tar xzf swarmy-$V-$T.tar.gz && install -m 755 swarmy-$V-$T/swarmy ~/.local/bin/
+```
+
+| Machine | `T` | Packages |
+|---|---|---|
+| x86_64 PC or server | `x86_64-unknown-linux-musl` | `swarmy_<v>-1_amd64.deb`, `swarmy-<v>-1.x86_64.rpm` |
+| 64-bit ARM: Raspberry Pi 3/4/5 on a 64-bit OS, ARM servers | `aarch64-unknown-linux-musl` | `_arm64.deb`, `.aarch64.rpm` |
+| Raspberry Pi 2–5 on 32-bit Raspberry Pi OS | `armv7-unknown-linux-musleabihf` | `_armhf.deb`, `.armv7hl.rpm` |
+| Raspberry Pi Zero, Zero W, 1 (ARMv6) | `arm-unknown-linux-musleabihf` | `_armhf.deb` |
+
+The binaries are linked statically against musl, so one file runs on every distribution, old or
+new. The `.deb` and `.rpm` packages wrap the same binary and are installed by hand (the single
+`armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit Raspberry Pi):
+
+```sh
+sudo apt install ./swarmy_0.1.0-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
+sudo dnf install ./swarmy-0.1.0-1.x86_64.rpm      # Fedora, RHEL, openSUSE
+```
+
+**macOS** (one universal binary for Apple silicon and Intel), with Homebrew:
+
+```sh
+brew install koorchik/tap/swarmy
+```
+
+or from the archive `swarmy-<v>-universal-apple-darwin.tar.gz`. The binary is not signed yet: a
+download from the browser is quarantined, so clear that once with
+`xattr -d com.apple.quarantine swarmy`. Homebrew and `curl` downloads are not quarantined.
+
+**Windows**: unpack `swarmy-<v>-x86_64-pc-windows-msvc.zip` and put `swarmy.exe` on your `PATH`.
+
+**From source** (a recent stable Rust and a C compiler):
+
+```sh
+cargo install --locked --git https://github.com/koorchik/swarmy
+```
+
+Then:
+
+```sh
+swarmy demo      # try it on a made-up world first; nothing of yours is read
+swarmy           # the live dashboard
+swarmy doctor    # what it found: config dirs, transcripts, index, limits
+swarmy setup     # optional: the status line (exact limits) and saved logins
+```
+
+swarmy finds `~/.claude`, every `~/.claude-*` and the `CLAUDE_CONFIG_DIR` of running `claude`
+processes on its own; other config dirs go into the [configuration](#configuration).
 
 ## Screens
 
 On a big terminal everything is on one wall; nothing hides behind tabs.
 
-![the wall at 326×81](docs/img/wall.png)
+![the whole wall on a 4K terminal (326×81)](docs/img/wall.png)
+
+The layout follows the terminal: a **wall** from 180×45, a **column** from 110×40, **tabs** below
+that (`L` switches by hand). Every panel can be zoomed (`z`).
 
 | | |
 |---|---|
-| ![smaller wall](docs/img/wall-small.png) **A smaller screen (200×60)** — every panel still on screen, the bottom ones in two rows; zoom (`z`) any of them | ![column](docs/img/column.png) **Half a screen (160×81)** — the same panels stacked |
-| ![tabs](docs/img/tabs.png) **A laptop terminal (140×34)** — the panels grouped into five tabs | ![vault](docs/img/vault-picker.png) **Switching a login** — Enter on a seat lists the saved logins, the one with the most limit left first | |
+| ![a 200×60 terminal](docs/img/wall-small.png) **200×60** — the same wall, the bottom panels in two rows | ![half a 4K screen](docs/img/column.png) **160×81** — the panels stacked in a column |
+| ![a laptop terminal](docs/img/tabs.png) **140×34** — a laptop terminal: five tabs | ![LIMITS zoomed](docs/img/limits.png) **LIMITS · SEATS zoomed** — the week per account and where it went |
 
-The panels:
-
-- **1 SWARM** — live agents grouped by session (sessions are separated, project names stand out), each with a 30-minute activity lane (thinking · tool · waiting for agents · waiting for you; `v` switches to spend), then what finished recently
-- **2 LIMITS · SEATS** — how much of each account's weekly limit is used ("week used", "runs out in …"), seats, and the saved logins of the vault; under them the week as a curve per account with real readings, the projection to the reset and the 100% line, and where each account's week went
-- **3 BURN** — dollars per hour and per minute by model
-- **4 ATTENTION** — needs you, stalled, limits about to run out, two agents editing one file, unsaved or expiring logins; the event log under it (filled from the last 3 hours on launch)
-- **5 AGENT** — card, last message, the agent's life (cost of each request, context growth, compactions), tool timeline
-- **6 PROJECTS** — live agents, $/hour, today, the period with ▲▼ against the previous one, share of the week
-- **7 MODELS** — spend, trends, cache, thinking, effort, project × model
-- **8 HISTORY** — 14 days stacked by model (`←→` picks a day), weekday × hour heat map
-- **9 EFFICIENCY** — where agent time goes (tools, slowest commands), how long agents waited for you, what a prompt costs, cache savings and the token cost split, agent types, fleet size over 24 h, rate limits, compactions, file conflicts, subscription value (with `[subscription]` in the config)
-- **0 SYSTEM** — Claude Code processes, CPU, RAM, disk
-
-Try it without touching your own data:
-
-```sh
-swarmy demo
-```
-
-## Install
-
-Every release on the [releases page](https://github.com/koorchik/swarmy/releases) has a single
-static binary per platform (no runtime dependencies, SQLite built in), with the man page and
-shell completions. Check downloads against `SHA256SUMS`.
-
-| Platform | Download |
+| Panel | What it shows |
 |---|---|
-| Linux x86_64 | `swarmy-<version>-x86_64-unknown-linux-musl.tar.gz`, `swarmy_<version>-1_amd64.deb`, `swarmy-<version>-1.x86_64.rpm` |
-| Linux aarch64 (Raspberry Pi 3/4/5 on a 64-bit OS, ARM servers) | `swarmy-<version>-aarch64-unknown-linux-musl.tar.gz`, `swarmy_<version>-1_arm64.deb`, `swarmy-<version>-1.aarch64.rpm` |
-| Linux ARMv7 (Raspberry Pi 2/3/4/5 on 32-bit Raspberry Pi OS) | `swarmy-<version>-armv7-unknown-linux-musleabihf.tar.gz`, `swarmy_<version>-1_armhf.deb`, `swarmy-<version>-1.armv7hl.rpm` |
-| Linux ARMv6 (Raspberry Pi Zero / Zero W / 1) | `swarmy-<version>-arm-unknown-linux-musleabihf.tar.gz`, `swarmy_<version>-1_armhf.deb` |
-| macOS (Apple silicon and Intel) | `swarmy-<version>-universal-apple-darwin.tar.gz`, or Homebrew |
-| Windows x86_64 | `swarmy-<version>-x86_64-pc-windows-msvc.zip` |
+| **1 SWARM** | live agents grouped by session, each with its state, activity, context and cost and a 30-minute activity lane (`v`: spend per 15 minutes instead); what finished recently |
+| **2 LIMITS · SEATS** | each account's week used, 5-hour window, reset and "runs out in …"; seats and saved logins; the week as a curve per account with the projection to the reset; where each account's week went by project |
+| **3 BURN** | dollars per hour, and per minute by model over the last hour |
+| **4 ATTENTION** | needs you, stalled, a limit about to run out, two agents editing one file, logins not saved or about to expire; the event log |
+| **5 AGENT** | the selected agent: card, last message, cost of each request, context growth, compactions, tool timeline |
+| **6 PROJECTS** | live agents, $/hour, today, the period with ▲▼ against the previous one, share of the week |
+| **7 MODELS** | spend and trends per model, cache hits, thinking, effort, project × model |
+| **8 HISTORY** | 14 days stacked by model (`←→` picks a day), a weekday × hour heat map |
+| **9 EFFICIENCY** | where agent time goes (tools, slowest commands), how long agents waited for you, what a prompt costs, cache savings, agent types, fleet size, rate limits, file conflicts, what a subscription is worth |
+| **0 SYSTEM** | Claude Code processes with their CPU, RAM and disk; the size of swarmy's index |
 
-The Linux binaries are linked statically against musl, so one file runs on every distribution
-and release, old or new. The `armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit
-Raspberry Pi.
+## Keys
+
+| Key | Action |
+|---|---|
+| `Tab` `Shift-Tab` · `1`–`9` `0` | next / previous panel · focus a panel by number (again: zoom); in tabs, `1`–`5` switch tabs |
+| `↑↓` `PgUp` `PgDn` · `Enter` | move in the focused panel · open: agent → details, alert → go to it, project → its agents, seat → pick a login |
+| `n` `N` | next / previous thing that needs attention |
+| `J` | jump to the selected agent's Claude Code in tmux |
+| `/` | filter: words, `p:project`, `m:model`, `s:seat`, `state:needs` |
+| `:` | commands: `switch <seat> <login>`, `capture <seat>`, `period 7d`, `layout wall` |
+| `t` · `g` · `v` | period (today, 7d, 30d, all) · spend grouping · SWARM lanes ↔ spend |
+| `z` · `Esc` | zoom the focused panel · back (closes dialogs, zoom, filter) |
+| `m` · `p` · `T` · `L` | mask names · pause animations · theme · layout |
+| `?` · `q` | keys and a legend of every glyph, number, colour and word · quit |
+
+The mouse works too: a click focuses a panel or selects an agent, the wheel scrolls.
+
+### On the command line
 
 ```sh
-# Debian, Ubuntu, Raspberry Pi OS: install / uninstall
-sudo apt install ./swarmy_<version>-1_amd64.deb        # sudo apt remove swarmy
-# Fedora, RHEL, openSUSE
-sudo dnf install ./swarmy-<version>-1.x86_64.rpm       # sudo dnf remove swarmy
-# Homebrew (macOS, Linux)
-brew install koorchik/tap/swarmy
-# any Linux or macOS: unpack and put the binary on your PATH
-tar xzf swarmy-<version>-<target>.tar.gz && install -m 755 swarmy-<version>-<target>/swarmy ~/.local/bin/
-
-swarmy setup        # optional, see below
+swarmy limits                         # weekly / 5-hour limits: shares per project, when they run out
+swarmy report --by project            # spend; --by account|seat|model|effort|agent-type|session|agent|day|hour|weekday
+swarmy report -p 30d --by day --format csv
+swarmy models -p 7d                   # per model: cost, cache hits, thinking, effort mix, substitutions
+swarmy accounts                       # seats, saved logins and the limit left on each
+swarmy prices                         # the price in force for every model and where it comes from
+swarmy jump                           # switch tmux to the Claude Code that has waited for you longest
 ```
 
-The macOS binary is not signed yet: a download from the browser is quarantined, so run
-`xattr -d com.apple.quarantine swarmy` once, or install with Homebrew, which does not quarantine
-formulae. From an archive, the man page is `man/swarmy.1` and the completions are in
-`completions/` (or generate them: `swarmy man`, `swarmy completions <shell>`).
+Periods: `today`, `yesterday`, `week` (the current limit window, the default), `month`, `all`,
+`24h`, `7d`, `YYYY-MM-DD`, `FROM..TO`. Reports take `--account`, `--seat`, `--project` and
+`--model` filters and `--format table|json|csv`. Every command takes `--mask`. `swarmy man` and
+`swarmy completions <shell>` print the man page and shell completions.
 
-### Build from source
+## The status line
 
-```sh
-cargo install --locked --git https://github.com/koorchik/swarmy   # or, in a clone: cargo install --locked --path .
-```
+![the swarmy status line under a Claude Code prompt](docs/img/statusline.png)
 
-Rust 2024 edition (a recent stable toolchain) and a C compiler for the bundled SQLite.
-Distributions that ship a system `libsqlite3` can build with `--no-default-features` (drops the
-`bundled-sqlite` feature). Release builds and packages: `tools/release-local.sh` and
-[`packaging/README.md`](packaging/README.md).
+`swarmy setup` adds swarmy's status line to Claude Code. It is optional: the dashboard works
+without it. Claude Code then shows under its prompt:
 
-### Optional: `swarmy setup` and the status line
+- **▲ who needs you** in your *other* sessions, with the way there (`swarmy`, then `n` and `J`,
+  or `swarmy jump`; bind it to a tmux key: `bind-key y run-shell "swarmy jump"`);
+- **◐ this session's agents** and their states;
+- **this account's week**, exact, and when it runs out at the current pace;
+- the 5-hour window, context fill, the session's cost and its dollars per hour.
 
-swarmy works as it is: it reads what Claude Code writes. `swarmy setup` is an optional wizard that
-makes two things better:
+On a narrow terminal the less important pieces go first; "needs you" and the week stay. With the
+dashboard running, the status line reads the small summary it writes; without it, it finds the
+waiting sessions in Claude Code's session registry. Either way it only reads files and takes a
+few milliseconds.
 
-1. **Exact limits, after every response.** Without it, the limit percentage comes from the reading
-   Claude Code caches now and then, and swarmy estimates in between (`≈`); a limit reset shows up
-   only with the next reading. Claude Code's *status line* receives the real numbers with every
-   response, so setup adds the swarmy status line to each seat's `settings.json`:
-
-   ```json
-   "statusLine": { "type": "command", "command": "/path/to/swarmy statusline" }
-   ```
-
-   Claude Code then shows under its prompt (here with the dashboard running):
-
-   ```
-   ▲ 2 need you: shop-api, docs · swarmy n J │ ◐ 3 agents ●2 ◌1 │ week used 38% · runs out in 7h (Mon 03:34) │ 5h 12% │ ctx 42% │ $4.20 │ $3.1/h
-   ```
-
-   - **▲ who needs you** in your *other* sessions, in every Claude Code window, with the way
-     there: `swarmy` then `n` and `J`, or `swarmy jump` (bind it to a tmux key:
-     `bind-key y run-shell "swarmy jump"`). Without the dashboard running, the status line still
-     finds them in Claude Code's session registry.
-   - **◐ this session's agents** and their states, **this account's week** (exact, from Claude
-     Code) and when it runs out at the current pace, the 5-hour window, context fill, the
-     session's cost and its dollars per hour.
-   - On a narrow terminal pieces go in this order: $/h, cost, 5h (unless past 60%), times, agent
-     details, names; context stays past 70%; "needs you" and the week never go.
-   - The dashboard writes a small summary for it (`statusline/fleet.json`, mode 0600, every few
-     seconds when something changed); the status line itself only reads files and takes a few
-     milliseconds.
-
-   swarmy also keeps each limit reading (in its own data dir; no network, nothing else changes),
-   so the dashboard's limits are exact too. A status line you already have is kept and shown first
-   (`swarmy statusline --then '<your command>'`). Setup also sets `refreshInterval` (10 s), so a
-   session that sits idle still learns that another one needs you. Every changed `settings.json`
-   is backed up next to it (`settings.json.swarmy-<time>.bak`).
-
-   Tune it in `~/.config/swarmy/config.toml`:
-
-   ```toml
-   [statusline]
-   segments = ["attention", "agents", "week", "five_hour", "context", "cost", "burn"]
-   lines = 2              # a second line: model and effort, git branch, session name, cold cache
-   refresh_seconds = 10   # written into Claude Code's refreshInterval by `swarmy setup`
-   reserve = 0            # columns kept free for Claude Code's own notifications
-   mask = false           # hide session names (also SWARMY_MASK=1), e.g. for screen sharing
-   ```
-
-2. **Saved logins**, so a seat can take another account's login when a limit runs out and switch
-   back later.
+The status line also makes the dashboard's limits exact: Claude Code passes it the real numbers
+after every response, and swarmy keeps each reading. A status line you already have is kept and
+shown first (`swarmy statusline --then '<your command>'`). Every changed `settings.json` is backed
+up next to it first.
 
 ```sh
 swarmy setup              # asks before each change
 swarmy setup --yes        # no questions
 swarmy setup --no-vault   # only the status line
-swarmy setup --remove     # take the status line out again (restores the one it wrapped)
+swarmy setup --remove     # take it out again (restores the one it wrapped)
 ```
 
-To do it by hand, add the `statusLine` above to `~/.claude/settings.json` (and to the
-`settings.json` of every other config dir). `swarmy doctor` says which seats have it.
+By hand, add this to each config dir's `settings.json`; `swarmy doctor` says which have it:
 
-
-## Use
-
-```sh
-swarmy                       # the live dashboard
-swarmy limits                # weekly / 5-hour limits: shares per project, ETA
-swarmy report --by project   # spend; --by account|seat|model|effort|agent-type|session|agent|day|hour|weekday
-swarmy report -p 30d --by day --format csv
-swarmy models -p 7d          # per-model statistics
-swarmy accounts              # seats, saved logins, limit left on each
-swarmy doctor                # what was found and whether it is readable
-swarmy prices                # the price in force for every model and its source
-swarmy compact               # roll old per-request detail up (--dry-run, --verify, --vacuum)
-swarmy setup                 # optional: status line with exact limits, saved logins
-swarmy jump                  # switch tmux to the session that has waited for you longest
+```json
+"statusLine": { "type": "command", "command": "/path/to/swarmy statusline" }
 ```
 
-Periods: `today`, `yesterday`, `week` (the current limit window), `month`, `all`, `24h`, `7d`,
-`YYYY-MM-DD`, `FROM..TO`. Rolling periods (`24h`, `7d`, …) start on the quarter hour: `7d` at
-10:37 counts from 10:30 seven days ago, so the figure moves in 15-minute steps. Spend is kept
-per quarter hour once it is old, and a period that starts on one gives the same number however
-old its data is. Every report takes `--account`, `--seat`, `--project`, `--model` filters
-and `--format table|json|csv`. `--mask` hides emails, names and full paths (for screenshots).
+## Limits and accounts
 
-### The dashboard
+A **seat** is a Claude Code config dir; a **login** is an OAuth sign-in; an **account** is the
+Anthropic account behind a login. Seats logged into the same account share one limit, and swarmy
+counts it once.
 
-The layout follows the terminal: a **wall** from about 250×55, a **column** from 150×48, **tabs**
-below that (`L` cycles them).
+- **Readings.** With the status line, the limit is exact after every response. Without it,
+  swarmy reads the utilization Claude Code caches now and then (as `/usage` shows it) and
+  estimates in between from your spend; estimates are marked `≈`.
+- **Where it went.** Spend inside the window is split by project, and a project's share of the
+  week is its share of that spend. Utilization also counts claude.ai, the desktop app and other
+  computers, which leave no trace here: when two accounts share a plan, the gap is shown as
+  *used elsewhere*.
+- **When it runs out** is the current burn rate projected to the reset, drawn as a curve against
+  the 100% line.
+- **Early resets.** When a limit is reset before its time, utilization falls while the window is
+  still open; swarmy sees the fall and counts the window from there.
+- **Which account.** Each request is attributed to the account that made it (Claude Code's
+  `session-owner` records, else the seat's login history), so moving logins between seats never
+  mixes accounts up.
 
-| Key | Action |
-|---|---|
-| `Tab` / `Shift-Tab` | next / previous panel; the focused one has a bright border and its keys in the footer |
-| `1`–`9`, `0` | focus the panel with that number (again: zoom it); in tabs, `1`–`5` switch tabs |
-| `z` · `Esc` | zoom the focused panel · back (closes dialogs, zoom, filter) |
-| `↑↓` `PgUp` `PgDn` | move inside the focused panel (agents, alerts, projects, tools, events) |
-| `Enter` | agent → its details · alert → go to it · project → its agents · seat → pick a login |
-| `n` / `N` | next / previous thing that needs attention |
-| `/` | filter: words, `p:project`, `m:model`, `s:seat`, `state:needs` |
-| `:` | `switch <seat> <login>`, `capture <seat> [label]`, `period 7d`, `layout wall` |
-| `J` | jump to the selected agent's Claude Code in tmux |
-| `v` | SWARM: activity lanes of 30 min ↔ spend of 15 min |
-| `←→` in HISTORY | pick a day: its spend by model and the change against the day before |
-| `t` · `g` | period (today, 7d, 30d, all) · spend grouping |
-| `?` | keys and a legend of every glyph, number, colour and word (on small screens `Tab` flips between them) |
-| LIMITS: `Enter` `S` `c` `a` `r` `d` `R` | switch (picker) · best login into this seat · save the seat's login · add · rename · forget · re-read |
-| `m` · `p` · `T` · `?` · `q` | mask · pause animations · theme · help · quit |
-
-### Light on the battery
-
-Only the running sessions' transcripts are read every second, and only the files that changed;
-totals of idle agents are reused; activity lanes and session totals every 10 seconds; period
-aggregates every two minutes, limits every minute, efficiency figures every five, the previous
-period every ten; the process table and disks are read only while SYSTEM is open. On a 4K wall
-with 15–20 live agents it uses about 2 CPU-seconds per minute (≈3.4% of one core). On battery (Linux, macOS) or
-with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
-
-## How the numbers are made
-
-- **Cost** is API-equivalent: every response's tokens (input, 5-minute and 1-hour cache writes,
-  cache reads, output, web searches) times the list price of its model. Claude Code writes one
-  transcript record per content block, all with the same usage, so responses are de-duplicated by
-  message id. Prices are versioned data: built-in, overridden by the table Claude Code itself
-  caches, overridden by your `config.toml`. Models without a price are flagged, never silently $0.
-  Background calls Claude Code makes without a transcript record (titles, summaries) are missing;
-  `doctor` compares the totals with Claude Code's own counter (typically within 1%).
-- **Limits** come from the status line when it is set up (exact, after every response), otherwise
-  from the utilization Claude Code caches (`/usage`), per account. Spend inside the
-  window is split by project; the limit points of a project are its share of the utilization.
-  Utilization also counts claude.ai, the desktop app and other computers, which leave no trace
-  here: when two accounts share a plan, the one with the most dollars per point is the reference,
-  and the gap on the others is shown as *elsewhere*. All of this is an estimate (≈): how Anthropic
-  meters limits is not public.
-- **Limit resets.** When a limit is reset early (Claude Code's limit reset), utilization falls
-  while the window is still open; swarmy notices the fall between two readings and counts the
-  window from there (with the status line, within one response of the reset).
-- **Accounts** are tracked per request: Claude Code's `session-owner` records decide; for sessions
-  without one, the seat's login history fills in (a change counts from when swarmy sees it). Seats
-  logged into the same account share one limit.
-- **Projects** are git repositories; worktrees count towards the repository they belong to.
-  The project of a directory is recorded while it exists, so spend of a removed worktree keeps
-  its project.
-- **Old spend.** Per-request detail is kept for `keep_raw_days` (14 by default); older requests
-  are summed per quarter hour with everything a report groups by (seat, session, agent,
-  account, directory, model, effort, fast mode, the long-context band) and kept for good. Every
-  report, panel and period gives the same number before and after (`swarmy compact --verify`
-  proves it on your own index). Prices that change later reprice old quarter hours from their
-  token sums; a login switch found late never moves them.
-
-## Storage
-
-Claude Code deletes transcripts after 30 days (`cleanupPeriodDays` in a seat's
-`settings.json`); after that swarmy's index is the only record of them. The index keeps two weeks
-of per-request detail and quarter-hour rollups for everything older: a heavy user (25k requests
-a day) stays under 0.5 GB after a year instead of ≈ 9 GB. The dashboard rolls up whatever aged
-out every six hours (a day costs about a CPU-second); `swarmy compact` does it by hand,
-`--dry-run` shows what would move, `--verify` checks every total on a scratch copy, and
-`--vacuum` lets an existing index give the freed space back to the disk (the dashboard does that
-once on its own, on mains power). `swarmy doctor` shows the size, the growth per day and where
-it will be in a year; so does the SYSTEM panel. What is gone after two weeks: an old agent's
-per-request chart and tool timeline, exact request times and API error texts.
+How Anthropic meters limits is not public, so the shares and projections are estimates.
 
 ## The vault
 
+![picking a saved login for a seat](docs/img/vault-picker.png)
+
+When one account's week runs out, put another account's login into the seat and carry on; switch
+back after the reset. In the dashboard: `Enter` on a seat lists the saved logins, the one with
+the most limit left first; `S` puts that one in directly.
+
 ```sh
-swarmy accounts capture work --label alice      # save the login of seat "work"
-swarmy accounts add --label bob                 # log into another account in a scratch seat
-swarmy accounts switch work bob                 # put bob into seat "work"
-swarmy accounts switch work alice               # and back
-swarmy accounts import old-backup.json --label carol
+swarmy accounts capture work --label alice    # save the login of seat "work"
+swarmy accounts add --label bob               # log into another account in a scratch seat, save it
+swarmy accounts switch work bob               # put bob into seat "work"
+swarmy accounts switch work alice             # and back
+swarmy accounts import backup.json --label carol
 ```
 
-A switch first saves whatever the seat holds — a login that is not in the vault yet is saved
-automatically under the seat's name, so switching never loses a token — then backs up both files
-(the last 20 per seat, in `vault/backups/seats/<seat>/`), writes `claudeAiOauth` atomically while
-keeping the seat's MCP tokens, and restores the account shown by Claude Code, merged into
-`.claude.json` as Claude Code last wrote it. One login is never mounted in two seats unless you
-insist (`--share`). Every change to the vault holds an OS lock, so a dashboard and a CLI run at the
-same time never lose each other's logins; the vault's own `logins.json` and `secrets.json` are
-backed up before each change (the last 30 of each, in `vault/backups/vault/`). Labels are unique.
+What keeps it safe:
 
-The vault follows the seats on its own. Claude Code refreshes the access token every few hours and
-keeps the refresh token: the saved copy just takes the new access token. A different refresh token
-means another login (a `/login`, a copied backup): the saved login is left untouched, the seat is
-shown as *not saved*, and — until Claude Code re-reads the profile in that seat — its account as
-*unconfirmed*, so it is not mixed up with the account the stale profile names. In the dashboard the
-VAULT screen updates as soon as a login file changes; `R` forces a re-read.
+- **A switch never loses a token.** It first saves whatever the seat holds; a login not in the
+  vault yet is saved under the seat's name.
+- **All or nothing.** Both files of the seat are backed up (the last 20 per seat). The login is
+  written atomically, keeping the seat's MCP tokens, and only while the file still holds what was
+  just saved. `.claude.json` is merged as Claude Code last wrote it, never over a version swarmy
+  has not read. If the second write fails, the first is put back.
+- **One transaction at a time.** Every change to the vault holds an OS lock and re-reads the
+  vault under it, so a dashboard and a command running at once never lose each other's logins.
+  The vault's own files are backed up before each change (the last 30).
+- **No surprises.** A switch refuses while Claude Code runs in that seat (`--force` to insist),
+  and one login is never put into two seats (`--share` to insist).
+- **It follows Claude Code.** When Claude Code refreshes a seat's access token, the saved copy
+  takes it; a new `/login` is shown as *not saved* instead of overwriting the saved one.
 
-Secrets are kept in `~/.local/share/swarmy/vault/secrets.json` with mode 0600 — the same
+Secrets live in swarmy's data dir in `vault/secrets.json`, readable only by you: the same
 protection Claude Code gives the same tokens in `.credentials.json`. On macOS, where Claude Code
 keeps the login in the Keychain, the vault cannot switch logins yet.
 
 Use it with your own accounts, within your provider's terms.
 
+## Storage
+
+Claude Code deletes transcripts after 30 days (`cleanupPeriodDays`); after that, swarmy's index
+is the only record of them. The index keeps two weeks of per-request detail and quarter-hour
+rollups of everything older, with every dimension a report groups by. A heavy user (25,000
+requests a day) stays under 0.5 GB after a year instead of about 9 GB; a typical one (5,000 a
+day) under 120 MB.
+
+- **No number changes.** Every report, panel and period gives the same totals before and after a
+  rollup; `swarmy compact --verify` checks that on a scratch copy of your own index.
+- **It runs itself.** The dashboard rolls up what aged out every six hours (a day costs about a
+  CPU-second). `swarmy compact` does it by hand: `--dry-run` shows what would move, `--vacuum`
+  gives the freed space back to the disk.
+- **What goes after two weeks:** an old agent's per-request chart and tool timeline, exact
+  request times and API error texts.
+
+`swarmy doctor` and the SYSTEM panel show the index size, its growth per day and where it will be
+in a year. The design: [`docs/design/storage.md`](docs/design/storage.md).
+
+### Light on the battery
+
+Only the running sessions' transcripts are read every second, and only the files that changed;
+heavier figures refresh every minute to ten minutes; the full process table and the disks are
+read only while SYSTEM is open. On a 4K wall with 15–20 live agents the dashboard takes about 2 CPU-seconds a minute
+(≈3.4% of one core). On battery (Linux, macOS) or with `--eco` it redraws twice a second and
+refreshes every 3 seconds.
+
 ## Privacy
 
-- No network access, no telemetry.
-- Claude Code's directories are only read. The only write is an explicit `accounts switch`.
-- The index lives in `~/.local/share/swarmy/` (macOS: `~/Library/Application Support/swarmy`).
+- **No network access and no telemetry.** Nothing leaves your machine.
+- **Read-only.** swarmy reads Claude Code's directories and writes into them only when you ask:
+  a vault switch, and `swarmy setup` (after a yes, with a backup).
+- **Its own data** (the index, the vault, the status-line readings) lives in swarmy's data dir:
+  `~/.local/share/swarmy/` on Linux, `~/Library/Application Support/swarmy/` on macOS,
+  `%APPDATA%\swarmy\data` on Windows (`SWARMY_DATA_DIR` moves it).
+- **Screen sharing.** `--mask` (or `m` in the dashboard) hides emails, names and full paths;
+  `SWARMY_MASK=1` does the same for the status line.
 
 ## Configuration
 
-Optional, `~/.config/swarmy/config.toml`:
+Everything is optional. `config.toml` lives in swarmy's config dir (`~/.config/swarmy/` on Linux;
+`swarmy doctor` prints the path; `SWARMY_CONFIG_DIR` moves it):
 
 ```toml
-stall_minutes = 20                 # unfinished agent with no activity this long = stalled
+stall_minutes = 20                 # an unfinished agent with no activity this long is stalled
 theme = "ops"                      # ops | phosphor | amber | plain
 
 [[seat]]                           # config dirs that are not ~/.claude or ~/.claude-*
@@ -325,7 +314,7 @@ label = "work"
 match = "/home/user/work/old-name"
 name = "shop"
 
-[[price]]                          # USD per million tokens
+[[price]]                          # USD per million tokens, from a date
 model = "claude-opus-5-5"
 from = "2026-12-01"
 input = 4
@@ -334,22 +323,82 @@ output = 20
 [accounts]                         # display names
 "<account uuid>" = "personal"
 
+[subscription]                     # monthly price per account, for "what a subscription is worth"
+personal = 200
+
+[statusline]
+segments = ["attention", "agents", "week", "five_hour", "context", "cost", "burn"]
+lines = 2                          # a second line: model and effort, git branch, session name
+refresh_seconds = 10               # written into Claude Code's refreshInterval by `swarmy setup`
+reserve = 0                        # columns kept free for Claude Code's own notifications
+mask = false                       # hide session names
+
 [storage]
 keep_raw_days = 14                 # days of per-request detail; older spend is kept per quarter hour
-budget_mb = 1024                   # doctor and SYSTEM warn when a year from now the index passes this
-auto_compact = true                # the dashboard compacts on its own; `swarmy compact` works either way
+budget_mb = 1024                   # doctor and SYSTEM warn when the index will pass this in a year
+auto_compact = true                # the dashboard rolls up old detail on its own
 ```
 
-`keep_raw_days` is at least 8 (the weekly limit window is always read from per-request detail)
-and at most two days less than the shortest transcript retention of your seats (so a rebuild of
-the index finds every day of detail still on disk); swarmy refuses a value outside that range.
-Nothing is ever deleted because of `budget_mb`.
+`keep_raw_days` is at least 8 (the weekly window is always read from full detail) and at most two
+days less than the shortest transcript retention of your seats. Nothing is ever deleted because of
+`budget_mb`.
 
-## Status
+## How the numbers are made
 
-Early. Linux is the main target; macOS and Windows builds, static binaries and packages
-(deb, rpm, Homebrew, AUR, Nix, winget, Scoop) are on the roadmap.
+- **Cost is API-equivalent, not your bill.** Every response's tokens (input, 5-minute and 1-hour
+  cache writes, cache reads, output, web searches) times the list price of its model. On a
+  subscription this is what the same work would cost through the API.
+- **Each response counts once.** Claude Code writes one transcript record per content block, all
+  with the same usage, so responses are de-duplicated by message id.
+- **Prices are versioned data:** built in, overridden by the price table Claude Code caches,
+  overridden by your `config.toml`, each from its date. A model without a price is flagged, never
+  counted as $0.
+- **What is missing:** background calls Claude Code makes without a transcript record (titles,
+  summaries). `swarmy doctor` compares the totals with Claude Code's own counter; they typically
+  agree within 1%.
+- **Projects are git repositories;** worktrees count towards the repository they belong to, also
+  after they are removed.
+
+## Platforms
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| Dashboard, reports, status line | ✓ | ✓ | ✓ |
+| Jump to a session (`J`, `swarmy jump`) | ✓ with tmux | ✓ with tmux | — |
+| Vault: save and switch logins | ✓ | not yet (Keychain) | ✓ |
+| Eco mode on battery | ✓ | ✓ | with `--eco` |
+
+Linux is the main platform. The tests run on Linux, macOS and Windows in CI. Builds: Linux x86_64,
+aarch64, ARMv7 and ARMv6 (static musl), macOS universal, Windows x86_64. Release details:
+[`packaging/README.md`](packaging/README.md).
+
+## Building from source
+
+```sh
+git clone https://github.com/koorchik/swarmy && cd swarmy
+cargo build --release              # target/release/swarmy
+cargo install --locked --path .    # or install it
+```
+
+Rust 2024 edition (a recent stable toolchain) and a C compiler for the bundled SQLite.
+Distributions with a system `libsqlite3` can build with `--no-default-features`. The release
+archives and packages are made by `tools/release-local.sh` (Linux and Windows) and the tag
+workflow; see [`packaging/README.md`](packaging/README.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Before a pull request:
+
+```sh
+tools/check.sh                 # the gate: cargo fmt --check, clippy -D warnings, every test
+tools/perf.sh                  # the battery budget, for changes to the worker, the index reads or the view (needs tmux)
+tools/record-readme.sh         # refresh docs/img after visual changes
+```
+
+[`CLAUDE.md`](CLAUDE.md) holds the architecture, the rules and the reasons behind them. Tests use
+synthetic data only, and screenshots come only from `swarmy demo`.
 
 ## License
 
-MIT OR Apache-2.0, at your option: see LICENSE-MIT and LICENSE-APACHE.
+MIT OR Apache-2.0, at your option: see [LICENSE-MIT](LICENSE-MIT) and
+[LICENSE-APACHE](LICENSE-APACHE).

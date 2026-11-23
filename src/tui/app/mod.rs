@@ -227,6 +227,8 @@ pub struct App {
     pub help: bool,
     /// Help page on small screens: 0 keys, 1 legend (both side by side on wide ones).
     pub help_page: u8,
+    /// The ATTENTION item `n`/`N` went to last; the first press starts at the top.
+    attn_jumped: Option<usize>,
     pub boot: Option<Boot>,
     pub started: Instant,
     pub snapshot: Snapshot,
@@ -299,6 +301,7 @@ impl App {
             zoom: None,
             help: false,
             help_page: 0,
+            attn_jumped: None,
             boot: Some(Boot {
                 started: Instant::now(),
                 progress: Progress::default(),
@@ -519,8 +522,13 @@ impl App {
             self.toast("nothing needs attention", Tone::Good);
             return;
         }
-        let i =
-            (self.cur(Panel::Attention) as isize + delta).rem_euclid(items.len() as isize) as usize;
+        let i = next_attention(
+            self.attn_jumped,
+            self.cur(Panel::Attention),
+            delta,
+            items.len(),
+        );
+        self.attn_jumped = Some(i);
         self.set_cur(Panel::Attention, i);
         self.act_on_attention(&items[i]);
     }
@@ -756,5 +764,43 @@ impl App {
 
     pub fn clock(&self) -> String {
         Local::now().format("%H:%M:%S").to_string()
+    }
+}
+
+/// Where `n` (delta 1) or `N` (delta -1) goes: the first press of a walk starts at the top (or
+/// the bottom for `N`); after that it moves on from the item it went to, wrapping around. A
+/// cursor moved by hand since then starts a new walk.
+fn next_attention(jumped: Option<usize>, cur: usize, delta: isize, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if let Some(j) = jumped.filter(|j| *j == cur && *j < len) {
+        let len = isize::try_from(len).unwrap_or(isize::MAX);
+        let j = isize::try_from(j).unwrap_or(0);
+        return usize::try_from((j + delta).rem_euclid(len)).unwrap_or(0);
+    }
+    if delta < 0 { len - 1 } else { 0 }
+}
+
+#[cfg(test)]
+mod attention_walk_tests {
+    use super::next_attention;
+
+    #[test]
+    fn the_first_press_goes_to_the_top_then_walks_and_wraps() {
+        assert_eq!(
+            next_attention(None, 0, 1, 3),
+            0,
+            "first n: the most urgent item"
+        );
+        assert_eq!(next_attention(Some(0), 0, 1, 3), 1);
+        assert_eq!(next_attention(Some(2), 2, 1, 3), 0, "wraps");
+        assert_eq!(next_attention(None, 0, -1, 3), 2, "first N: the last item");
+        assert_eq!(
+            next_attention(Some(1), 2, 1, 3),
+            0,
+            "cursor moved by hand: start again"
+        );
+        assert_eq!(next_attention(Some(5), 5, 1, 3), 0, "the list shrank");
     }
 }
