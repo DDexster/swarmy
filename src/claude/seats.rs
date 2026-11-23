@@ -33,6 +33,16 @@ impl Seat {
     pub fn credentials_file(&self) -> PathBuf {
         self.dir.join(".credentials.json")
     }
+
+    /// Days Claude Code keeps this seat's transcripts: `cleanupPeriodDays` of its
+    /// `settings.json` (at least 1), `None` when not set (Claude Code's default applies,
+    /// `core::storage::DEFAULT_RETENTION_DAYS`).
+    pub fn cleanup_period_days(&self) -> Option<u32> {
+        let text = std::fs::read_to_string(self.dir.join("settings.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let days = v.get("cleanupPeriodDays")?.as_f64()?;
+        (days.is_finite() && days >= 1.0).then(|| days.min(f64::from(u32::MAX)) as u32)
+    }
 }
 
 /// A config dir is recognised by the files Claude Code creates in it.
@@ -176,6 +186,29 @@ mod tests {
         assert_eq!(seats[0].claude_json, home.join(".claude.json"));
         assert!(seats[2].claude_json.ends_with(".claude-work/.claude.json"));
         assert_eq!(seats[2].found_by, ["home scan", "config.toml"]);
+        // Transcript retention: `cleanupPeriodDays`, else Claude Code's default.
+        assert_eq!(
+            seats[1].cleanup_period_days(),
+            None,
+            "settings.json without it"
+        );
+        assert_eq!(seats[0].cleanup_period_days(), None, "no settings.json");
+        std::fs::write(
+            home.join("custom/cc/settings.json"),
+            r#"{"cleanupPeriodDays": 45}"#,
+        )
+        .unwrap();
+        assert_eq!(seats[1].cleanup_period_days(), Some(45));
+        std::fs::write(
+            home.join("custom/cc/settings.json"),
+            r#"{"cleanupPeriodDays": 0}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            seats[1].cleanup_period_days(),
+            None,
+            "below Claude Code's minimum"
+        );
     }
 
     #[test]

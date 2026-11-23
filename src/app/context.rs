@@ -36,6 +36,8 @@ impl Ctx {
     pub fn load(painter: Painter, mask: bool) -> anyhow::Result<Ctx> {
         let dirs = Dirs::resolve()?;
         let config = Config::load(&dirs)?;
+        // SQLite's temporary files (a VACUUM's copy) next to the index, not in a RAM-backed /tmp.
+        crate::index::use_temp_dir(&dirs.data.join("tmp"))?;
         let procs = ProcTable::snapshot();
         // `SWARMY_ISOLATED=1` (tests, demos): only dirs under $HOME and the config count, not the
         // config dirs of running `claude` processes, which belong to the real user.
@@ -77,8 +79,49 @@ impl Ctx {
             login_labels: Default::default(),
             login_tiers: Default::default(),
         };
+        // `[storage] keep_raw_days` must fit the seats' transcript retention.
+        ctx.keep_raw_days(None)?;
         ctx.drop_unconfirmed();
         Ok(ctx)
+    }
+
+    /// Days Claude Code keeps each seat's transcripts (`cleanupPeriodDays`, else its default),
+    /// and whether the seat sets it.
+    pub fn retention(&self) -> Vec<(String, u32, bool)> {
+        self.seats
+            .iter()
+            .map(|s| match s.cleanup_period_days() {
+                Some(d) => (s.label.clone(), d, true),
+                None => (
+                    s.label.clone(),
+                    crate::core::storage::DEFAULT_RETENTION_DAYS,
+                    false,
+                ),
+            })
+            .collect()
+    }
+
+    /// The raw window: `explicit` (`compact --keep-days`), else `[storage] keep_raw_days`, else
+    /// the default, checked against the weekly window and the seats' transcript retention
+    /// (`core::storage::keep_raw_days`).
+    pub fn keep_raw_days(&self, explicit: Option<i64>) -> anyhow::Result<i64> {
+        let retention: Vec<(String, u32)> = self
+            .retention()
+            .into_iter()
+            .map(|(s, d, _)| (s, d))
+            .collect();
+        crate::core::storage::keep_raw_days(
+            explicit.or(self.config.storage.keep_raw_days),
+            &retention,
+        )
+        .map_err(|e| {
+            let from = if explicit.is_some() {
+                "--keep-days"
+            } else {
+                "[storage] in config.toml"
+            };
+            anyhow::anyhow!("{from}: {e}")
+        })
     }
 
     /// Re-reads what every seat says about itself (account, limit readings, Claude Code's cached
@@ -150,6 +193,7 @@ impl Ctx {
             config: root.join("swarmy-config"),
             home: base.home,
         };
+        crate::index::use_temp_dir(&dirs.data.join("tmp"))?;
         let mut seat_info = Vec::new();
         let mut caches = Vec::new();
         for s in &seats {

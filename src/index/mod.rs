@@ -5,13 +5,23 @@
 //! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
 //! start. The first run reads everything in parallel.
 
+pub mod archive;
+#[cfg(test)]
+pub(crate) mod archive_scenarios;
+pub mod compact;
+#[cfg(test)]
+mod compact_scenarios;
 pub mod insights;
 pub mod live;
+mod marks;
 mod prices;
+mod projects;
+pub use prices::BandDrift;
 pub mod query;
 #[cfg(test)]
 pub(crate) mod scenarios;
 pub mod schema;
+pub mod storage;
 mod write;
 
 use std::collections::HashMap;
@@ -49,6 +59,30 @@ pub struct Index {
 
 /// A settled total: (settled generation, price fingerprint, account, span start, span end).
 type SettledKey = (Option<String>, String, String, i64, i64);
+
+/// How long a write waits for another process's write (a compaction chunk, a VACUUM).
+const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The WAL file is cut back to this many bytes after a checkpoint.
+const JOURNAL_SIZE_LIMIT: i64 = 32 << 20;
+
+/// Points SQLite's temporary files (the copy a `VACUUM` writes, large sorts) at `dir`, inside
+/// swarmy's data dir, instead of the system's temp dir, which is often in RAM. Process-wide, set
+/// once (the first call wins).
+pub fn use_temp_dir(dir: &Path) -> anyhow::Result<()> {
+    static SET: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SET.get().is_some() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    Connection::open_in_memory()?.pragma_update(
+        None,
+        "temp_store_directory",
+        dir.to_string_lossy().as_ref(),
+    )?;
+    let _first = SET.set(());
+    Ok(())
+}
 
 /// Spend older than this no longer changes on its own: requests of the last minutes are still
 /// being written. Older spend changes only when the index says so, by bumping the settled
@@ -97,6 +131,8 @@ pub struct RefreshStats {
     pub files_read: usize,
     pub bytes_read: u64,
     pub requests_new: u64,
+    /// Records read again that were rolled up already, and skipped (`marks`).
+    pub records_skipped: u64,
     pub elapsed: Duration,
 }
 
@@ -113,6 +149,9 @@ struct Work {
     account: Option<String>,
     last_ts: i64,
     reset: bool,
+    /// Whether records older than `rolled_until` are skipped: the file may repeat rolled-up
+    /// ones (`marks::Marks::applies`).
+    marked: bool,
 }
 
 pub fn ms(t: DateTime<Utc>) -> i64 {
@@ -148,12 +187,14 @@ impl Index {
     }
 
     fn init(conn: Connection) -> anyhow::Result<Index> {
-        conn.busy_timeout(Duration::from_secs(10))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         // The live view runs a couple of dozen distinct statements every second (`live.rs`);
         // keep them all prepared instead of the default 16.
         conn.set_prepared_statement_cache_capacity(64);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // The WAL shrinks back to this after a checkpoint (a compaction or a VACUUM grows it).
+        conn.pragma_update(None, "journal_size_limit", JOURNAL_SIZE_LIMIT)?;
         // Facts migrate, the cache is rebuilt when its version changed; requests read again
         // then follow their seat's login history like any new request (`post_pass`).
         schema::migrate(&conn)?;
@@ -183,7 +224,7 @@ impl Index {
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
         let all: Vec<TranscriptFile> = seats.iter().flat_map(files::list).collect();
-        self.refresh_files(all, seat_info, resolver, prices, progress)
+        self.refresh_files(all, seats, seat_info, resolver, prices, progress)
     }
 
     /// A cheap refresh for the live view: only files touched in the last 30 minutes and the files
@@ -229,7 +270,7 @@ impl Index {
         let mut seen = std::collections::HashSet::new();
         out.retain(|f| seen.insert(f.path.clone()));
         let mut quiet = |_p: Progress| {};
-        self.refresh_files(out, seat_info, resolver, prices, &mut quiet)
+        self.refresh_files(out, seats, seat_info, resolver, prices, &mut quiet)
     }
 
     /// The files of a live session, listed again only when one of its dirs changed.
@@ -273,6 +314,7 @@ impl Index {
     fn refresh_files(
         &mut self,
         all: Vec<TranscriptFile>,
+        seats: &[Seat],
         seat_info: &[SeatInfo],
         resolver: &mut Resolver,
         prices: &PriceBook,
@@ -280,16 +322,22 @@ impl Index {
     ) -> anyhow::Result<RefreshStats> {
         let started = Instant::now();
         let files_total = all.len();
-        let work = self.plan(&all)?;
+        let work = self.plan(&all, seats)?;
+        let from_start = work.iter().any(|w| w.start == 0);
         let mut stats = self.ingest(work, seat_info, resolver, prices, progress)?;
+        if from_start {
+            // A seat found after a compaction: its old records go straight into the archive.
+            self.roll_late(prices, seats)?;
+        }
         stats.files_total = files_total;
         stats.elapsed = started.elapsed();
         Ok(stats)
     }
 
     /// What to read of each file: from the stored offset when the file only grew, from the start
-    /// when it was replaced or shrank (`reset`), nothing when it is unchanged.
-    fn plan(&self, all: &[TranscriptFile]) -> anyhow::Result<Vec<Work>> {
+    /// when it was replaced or shrank (`reset`), nothing when it is unchanged. A file read from
+    /// its start gets its read marks here, before anything of this refresh is written.
+    fn plan(&self, all: &[TranscriptFile], seats: &[Seat]) -> anyhow::Result<Vec<Work>> {
         let mut known: HashMap<String, (u64, u64, u64, Option<String>, i64)> = HashMap::new();
         {
             let mut st = self
@@ -314,6 +362,7 @@ impl Index {
         }
 
         let mut work = Vec::new();
+        let mut marks: Option<marks::Marks> = None;
         for f in all.iter() {
             let Ok(m) = std::fs::metadata(&f.path) else {
                 continue;
@@ -335,6 +384,13 @@ impl Index {
                 Some(_) => (0, None, 0, true),
                 None => (0, None, 0, false),
             };
+            if start == 0 && marks.is_none() {
+                marks = Some(marks::Marks::load(&self.conn, seats)?);
+            }
+            let marked = match &marks {
+                Some(m) => m.applies(&self.conn, f, start)?,
+                None => false,
+            };
             work.push(Work {
                 file: f.clone(),
                 expected,
@@ -345,6 +401,7 @@ impl Index {
                 account,
                 last_ts,
                 reset,
+                marked,
             });
         }
         Ok(work)
@@ -380,12 +437,9 @@ impl Index {
         let before: i64 = self
             .conn
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
-        // Rows added by this refresh have a larger rowid (requests are never deleted).
-        let last_rowid: i64 =
-            self.conn
-                .query_row("SELECT COALESCE(MAX(rowid), 0) FROM requests", [], |r| {
-                    r.get(0)
-                })?;
+        // Rows added by this refresh have a larger rowid: rowids are never given out twice, even
+        // after the compactor deleted rows (`compact::requests_rowid_high`).
+        let last_rowid = compact::requests_rowid_high(&self.conn)?;
         let mut cwds: std::collections::HashSet<String> = std::collections::HashSet::new();
         let settled_before = ms(Utc::now()) - SETTLED_AFTER_MS;
         for batch in work.chunks(48) {
@@ -405,6 +459,10 @@ impl Index {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let mut late = false;
+            let mut skipped = 0;
+            let mut rowid = compact::requests_rowid_high(&tx)?;
+            // Read in the write transaction: a compaction committed since the plan counts.
+            let rolled_until = archive::rolled_until(&tx)?;
             for (w, chunk) in parsed {
                 let Ok(chunk) = chunk else { continue };
                 let now: Option<(u64, u64)> = tx
@@ -419,10 +477,25 @@ impl Index {
                     continue;
                 }
                 done.bytes_done += chunk.end - w.start;
-                late |= write::write_file(&tx, w, chunk, &mut cwds, settled_before)?;
+                let at = write::At {
+                    settled_before,
+                    rolled_until,
+                };
+                let wrote = write::write_file(&tx, w, chunk, &mut cwds, at, &mut rowid)?;
+                late |= wrote.late;
+                skipped += wrote.skipped;
             }
             if late {
                 bump_settled(&tx)?;
+            }
+            if skipped > 0 {
+                // A running count for `doctor`: records found again after they were rolled up.
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES ('skipped_records', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + excluded.value",
+                    [skipped as i64],
+                )?;
+                stats.records_skipped += skipped;
             }
             tx.commit()?;
             done.files_done += batch.len();
@@ -529,11 +602,18 @@ impl Index {
             }
         }
         let mut moved = 0;
+        let rolled_until = archive::rolled_until(&tx)?;
         for (seat, ts) in &reattribute {
             moved += tx.execute(
                 &format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"),
                 params![seat, ts],
             )?;
+            // A switch older than the raw window (swarmy was not running): the rollups move too.
+            if *ts < rolled_until {
+                let (insert, delete) = archive::rekey_sql();
+                tx.execute(&insert, params![seat, ts])?;
+                moved += tx.execute(&delete, params![seat, ts])?;
+            }
         }
         if moved > 0 {
             bump_settled(&tx)?;
@@ -567,8 +647,8 @@ impl Index {
                 tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.label])?;
             }
         }
-        // Projects of new working directories. Rule revision 2 (sibling worktrees, orphans taking
-        // the session's project) recomputes every cwd once.
+        // Projects of new working directories; a new rule revision recomputes every cwd, raw or
+        // rolled up, never downgrading one whose dir is gone (`projects`).
         let cwds: Vec<String> = if rev_ok {
             let mut known_cwd = tx.prepare("SELECT 1 FROM projects WHERE cwd = ?1")?;
             new_cwds
@@ -577,79 +657,9 @@ impl Index {
                 .cloned()
                 .collect()
         } else {
-            tx.execute("DELETE FROM projects", [])?;
-            let mut st = tx.prepare("SELECT DISTINCT cwd FROM requests WHERE cwd IS NOT NULL")?;
-
-            st.query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
+            projects::every_cwd(&tx)?
         };
-        let mut orphans: Vec<String> = Vec::new();
-        for cwd in &cwds {
-            let p = resolver.resolve(cwd);
-            if p.orphan {
-                orphans.push(cwd.clone());
-            }
-            tx.execute(
-                "INSERT OR REPLACE INTO projects(cwd, key, name, worktree) VALUES (?1, ?2, ?3, ?4)",
-                params![cwd, p.key, p.name, p.worktree],
-            )?;
-        }
-        if !orphans.is_empty() {
-            // A dir outside any repository (a removed worktree, a scratch dir) used by a session
-            // that runs in a repository belongs to that repository's project.
-            let set: std::collections::HashSet<&str> = orphans.iter().map(String::as_str).collect();
-            let mut votes: HashMap<String, HashMap<String, i64>> = HashMap::new();
-            {
-                let mut st = tx.prepare(
-                    "SELECT r.cwd, s.cwd, count(*) FROM requests r JOIN sessions s ON s.seat = r.seat AND s.session_id = r.session_id
-                     WHERE s.cwd IS NOT NULL AND s.cwd != r.cwd GROUP BY r.cwd, s.cwd",
-                )?;
-                let rows = st.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?;
-                for row in rows {
-                    let (cwd, main, n) = row?;
-                    if set.contains(cwd.as_str()) {
-                        *votes.entry(cwd).or_default().entry(main).or_default() += n;
-                    }
-                }
-            }
-            // Never fold into a home dir or anything as shallow (`/home/x/work` is the least).
-            let under = |dir: &str, root: &str| {
-                root.matches(['/', '\\']).count() >= 4
-                    && dir.starts_with(root)
-                    && dir[root.len()..].starts_with(['/', '\\'])
-            };
-            let mut done: std::collections::HashSet<String> = Default::default();
-            for (cwd, mains) in votes {
-                // A repository the session runs in; else the session's own dir when this one lies
-                // under it (subdirs and `.claude/worktrees/*` of a dir that is gone now).
-                let best = mains
-                    .iter()
-                    .map(|(m, n)| (resolver.resolve(m), *n))
-                    .filter(|(p, _)| !p.orphan)
-                    .max_by_key(|(_, n)| *n)
-                    .map(|x| x.0)
-                    .or_else(|| {
-                        mains
-                            .keys()
-                            .filter(|m| under(&cwd, m))
-                            .max_by_key(|m| m.len())
-                            .map(|m| resolver.resolve(m))
-                    });
-                if let Some(p) = best {
-                    tx.execute(
-                        "UPDATE projects SET key = ?2, name = ?3, worktree = ?1 WHERE cwd = ?1",
-                        params![cwd, p.key, p.name],
-                    )?;
-                    done.insert(cwd);
-                }
-            }
-        }
+        projects::assign(&tx, resolver, &cwds)?;
         if !rev_ok {
             schema::set_meta(&tx, "projects_rev", PROJECTS_REV)?;
         }

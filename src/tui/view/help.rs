@@ -250,6 +250,11 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             th.fg,
             "how long the agent has been in its current state",
         ),
+        row(
+            "index · 12 mo ≈",
+            th.fg,
+            "swarmy's own database · growth a day · size in a year (warning colour: over budget)",
+        ),
         head("colours"),
         Line::from(vec![
             Span::styled(fit("limit", 16), th.bold(th.fg)),
@@ -293,4 +298,26 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             "the Anthropic account behind a login; limits are per account",
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+
+    /// Words the panels put on screen have their legend line (CLAUDE.md: keep them in sync).
+    #[test]
+    fn the_legend_explains_the_storage_line() {
+        let t = tempfile::tempdir().unwrap();
+        let app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
+        let text: Vec<String> = legend_lines(&app)
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        let line = text.iter().find(|l| l.starts_with("index · 12 mo ≈"));
+        assert!(
+            line.is_some_and(|l| l.contains("size in a year") && l.contains("over budget")),
+            "{text:#?}"
+        );
+    }
 }

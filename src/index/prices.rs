@@ -1,10 +1,12 @@
 //! Prices in the index: dating Claude Code's cached prices, and pricing every request.
 
-use chrono::{DateTime, Local, NaiveDate, Utc};
-use rusqlite::{OptionalExtension, params};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
+use super::archive::KEYS;
 use super::{Index, from_ms, ms, schema};
-use crate::core::pricing::{PriceBook, PriceEntry, PriceSource, Rates};
+use crate::core::period::{BUCKET_MS, local_midnight};
+use crate::core::pricing::{CostParts, PriceBook, PriceEntry, PriceSource, Rates};
 use crate::core::usage::Usage;
 
 impl Index {
@@ -156,35 +158,185 @@ impl Index {
             for (id, model, ts, fast, usage) in rows {
                 let day = from_ms(ts).with_timezone(&Local).date_naive();
                 let p = book.cost_parts(&model, day, &usage, fast);
-                // In the order of `schema::COST_PARTS`.
-                let parts = p.map(|p| {
-                    [
-                        p.input,
-                        p.cache_write,
-                        p.cache_read,
-                        p.output,
-                        p.web,
-                        p.cache_saved,
-                    ]
-                });
-                let part = |i: usize| parts.map(|v| v[i]);
+                let part = cost_parts(p);
                 upd.execute(params![
                     p.map(|p| p.total()),
                     p.is_some() as i64,
                     id,
-                    part(0),
-                    part(1),
-                    part(2),
-                    part(3),
-                    part(4),
-                    part(5)
+                    part[0],
+                    part[1],
+                    part[2],
+                    part[3],
+                    part[4],
+                    part[5]
                 ])?;
             }
         }
         if stale {
+            // The archive in the same transaction: no reader sees raw and rolled-up spend at
+            // different prices.
+            reprice_rollups(&tx, &book)?;
             schema::set_meta(&tx, "price_fp", &fp)?;
         }
         tx.commit()?;
         Ok(())
     }
+
+    /// Rolled-up spend whose long-context band was taken against another threshold than the
+    /// one the prices in force give its model on its day (design §3.6): such rows are priced by
+    /// their old band, the one inexact case of repricing. (model, first day, last day, rows),
+    /// by model and first day.
+    pub fn band_drift(&mut self, prices: &PriceBook) -> anyhow::Result<Vec<BandDrift>> {
+        let book = self.dated_prices(prices, Utc::now())?;
+        let mut st = self.conn.prepare(
+            "SELECT model, bucket, lc_threshold, COUNT(*) FROM usage_rollup GROUP BY model, bucket, lc_threshold",
+        )?;
+        let mut rows = st.query([])?;
+        let mut out: Vec<BandDrift> = Vec::new();
+        while let Some(r) = rows.next()? {
+            let (model, bucket, was, n): (String, i64, i64, i64) =
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?);
+            let day = from_ms(bucket * BUCKET_MS)
+                .with_timezone(&Local)
+                .date_naive();
+            if super::compact::lc_threshold_on(&book, &model, day) == was {
+                continue;
+            }
+            match out.iter_mut().find(|d| d.model == model) {
+                Some(d) => {
+                    d.first = d.first.min(day);
+                    d.last = d.last.max(day);
+                    d.rows += n as u64;
+                }
+                None => out.push(BandDrift {
+                    model,
+                    first: day,
+                    last: day,
+                    rows: n as u64,
+                }),
+            }
+        }
+        out.sort_by(|a, b| (&a.model, a.first).cmp(&(&b.model, b.first)));
+        Ok(out)
+    }
+}
+
+/// Rolled-up rows of one model priced by a long-context band another threshold decided.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct BandDrift {
+    pub model: String,
+    pub first: NaiveDate,
+    pub last: NaiveDate,
+    pub rows: u64,
+}
+
+/// Prices every rollup row again from its token sums (design §3.6), at the price in force for
+/// its model on its local day (a quarter hour lies in one local day in every zone), in the band
+/// its `long_ctx` flag records: cost is linear in the tokens within a band, so the sums cost what
+/// their requests would. A model without a price stays unpriced; one that got a price is priced.
+/// Then `agent_rollup` takes the new costs. One local day at a time, so memory stays small.
+fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
+    let (lo, hi): (Option<i64>, Option<i64>) = tx.query_row(
+        "SELECT MIN(bucket), MAX(bucket) FROM usage_rollup",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let (Some(lo), Some(hi)) = (lo, hi) else {
+        return Ok(());
+    };
+    let pk: Vec<&str> = KEYS.iter().map(|k| k.col).collect();
+    let at = |c: &str| pk.iter().position(|k| *k == c);
+    let (Some(i_model), Some(i_fast), Some(i_long)) = (at("model"), at("fast"), at("long_ctx"))
+    else {
+        anyhow::bail!("usage_rollup lost a key column");
+    };
+    let mut sel = tx.prepare(&format!(
+        "SELECT {}, input, cw5, cw1h, cread, output, thinking, web FROM usage_rollup
+         WHERE bucket >= ?1 AND bucket < ?2",
+        pk.join(", ")
+    ))?;
+    let parts = schema::COST_PARTS;
+    let mut upd = tx.prepare(&format!(
+        "UPDATE usage_rollup SET cost = ?1, priced = ?2, {} WHERE {}",
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c} = ?{}", i + 3))
+            .collect::<Vec<_>>()
+            .join(", "),
+        pk.iter()
+            .enumerate()
+            .map(|(i, c)| format!("{c} = ?{}", i + 3 + parts.len()))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    ))?;
+    let n = pk.len();
+    let mut day = from_ms(lo * BUCKET_MS).with_timezone(&Local).date_naive();
+    loop {
+        let (a, b) = (
+            ms(local_midnight(day)).div_euclid(BUCKET_MS),
+            ms(local_midnight(day + Duration::days(1))).div_euclid(BUCKET_MS),
+        );
+        if a > hi {
+            break;
+        }
+        let rows: Vec<(Vec<rusqlite::types::Value>, Usage)> = sel
+            .query_map([a, b], |r| {
+                let key = (0..n)
+                    .map(|i| r.get::<_, rusqlite::types::Value>(i))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let tok =
+                    |i: usize| -> rusqlite::Result<u64> { Ok(r.get::<_, i64>(n + i)? as u64) };
+                Ok((
+                    key,
+                    Usage {
+                        input: tok(0)?,
+                        cache_write_5m: tok(1)?,
+                        cache_write_1h: tok(2)?,
+                        cache_read: tok(3)?,
+                        output: tok(4)?,
+                        thinking: tok(5)?,
+                        web_search: tok(6)?,
+                    },
+                ))
+            })?
+            .collect::<Result<_, _>>()?;
+        for (key, usage) in rows {
+            let int = |i: usize| matches!(key[i], rusqlite::types::Value::Integer(1));
+            let rusqlite::types::Value::Text(model) = &key[i_model] else {
+                anyhow::bail!("a rollup row without a model");
+            };
+            let p = book.cost_parts_in_band(model, day, &usage, int(i_fast), int(i_long));
+            let mut values: Vec<rusqlite::types::Value> =
+                vec![p.map(|p| p.total()).into(), i64::from(p.is_some()).into()];
+            values.extend(cost_parts(p).iter().map(|v| (*v).into()));
+            values.extend(key);
+            upd.execute(params_from_iter(values))?;
+        }
+        day += Duration::days(1);
+    }
+    tx.execute_batch(
+        "UPDATE agent_rollup SET cost = s.cost, unpriced = s.unpriced
+         FROM (SELECT seat, session_id, agent_id, TOTAL(cost) AS cost,
+                      SUM(CASE WHEN priced = 0 THEN requests ELSE 0 END) AS unpriced
+               FROM usage_rollup GROUP BY seat, session_id, agent_id) AS s
+         WHERE agent_rollup.seat = s.seat AND agent_rollup.session_id = s.session_id
+           AND agent_rollup.agent_id = s.agent_id",
+    )?;
+    Ok(())
+}
+
+/// The parts of a cost in the order of `schema::COST_PARTS` (NULL without a price).
+fn cost_parts(p: Option<CostParts>) -> [Option<f64>; 6] {
+    let v = p.map(|p| {
+        [
+            p.input,
+            p.cache_write,
+            p.cache_read,
+            p.output,
+            p.web,
+            p.cache_saved,
+        ]
+    });
+    std::array::from_fn(|i| v.map(|v| v[i]))
 }

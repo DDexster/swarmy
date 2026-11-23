@@ -24,6 +24,7 @@ pub enum Job {
     DaysHeat,
     DiskSizes,
     Power,
+    Compact,
 }
 
 /// What a job reads, which decides how often it may run.
@@ -42,11 +43,13 @@ pub enum Needs {
     System,
 }
 
-/// Whether a job runs on the first tick or waits one period (the start-up refresh covered it).
+/// Whether a job runs on the first tick, waits one period (the start-up refresh covered it), or
+/// first runs this long after the start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Start {
     Due,
     Waits,
+    After(Duration),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +69,7 @@ const fn secs(n: u64) -> Duration {
 
 /// In `Job` order (checked by a test).
 #[rustfmt::skip]
-pub const JOBS: [Spec; 16] = [
+pub const JOBS: [Spec; 17] = [
     // One worker tick: running sessions' new lines (`Index::refresh_hot`), their processes,
     // the live snapshot with reused totals, the selected agent's timeline. Three seconds on
     // battery.
@@ -101,7 +104,21 @@ pub const JOBS: [Spec; 16] = [
     Spec { job: Job::DiskSizes, name: "transcript sizes", every: secs(300), eco: secs(300), start: Start::Due, needs: Needs::Heavy },
     // On battery or not (switches eco mode).
     Spec { job: Job::Power, name: "power source", every: secs(30), eco: secs(30), start: Start::Waits, needs: Needs::PerSeat },
+    // Rolls up what is older than [storage] keep_raw_days and gives the space back; a no-op
+    // check (four indexed MIN(ts)) otherwise. Runs right after a full refresh (prices and
+    // accounts are settled then), first ten minutes after the start; a backlog goes on
+    // `COMPACT_CHUNKS_PER_RUN` chunks at a time every `COMPACT_CATCH_UP` (`_ECO` on battery).
+    // The one-time VACUUM waits for mains power. A 28k-request day costs ≈ 1 CPU-second.
+    Spec { job: Job::Compact, name: "compaction", every: secs(6 * 3600), eco: secs(6 * 3600), start: Start::After(secs(600)), needs: Needs::Heavy },
 ];
+
+/// A compaction run catching up a backlog does at most this many 6-hour chunks (one day)…
+pub const COMPACT_CHUNKS_PER_RUN: usize = 4;
+/// …and the next run comes this soon, until the backlog is gone: a little less than the full
+/// refresh's period, so every full refresh takes the next day (at 60 s a run could just miss one
+/// and wait two minutes).
+pub const COMPACT_CATCH_UP: Duration = secs(50);
+pub const COMPACT_CATCH_UP_ECO: Duration = secs(300);
 
 pub fn spec(job: Job) -> &'static Spec {
     let s = &JOBS[job as usize];
@@ -147,6 +164,7 @@ impl Schedule {
             last: JOBS.map(|s| match s.start {
                 Start::Due => None,
                 Start::Waits => Some(now),
+                Start::After(d) => now.checked_sub(s.every.saturating_sub(d)),
             }),
             eco,
         }
@@ -164,6 +182,11 @@ impl Schedule {
 
     pub fn done(&mut self, job: Job) {
         self.last[job as usize] = Some(Instant::now());
+    }
+
+    /// Ran, and is due again in `soon` instead of its period (a backlog to catch up).
+    pub fn again_in(&mut self, job: Job, soon: Duration) {
+        self.last[job as usize] = Instant::now().checked_sub(self.period(job).saturating_sub(soon));
     }
 
     /// A result computed at `at` by this job is still within its period.
@@ -239,8 +262,32 @@ mod tests {
                 ("days and heat map", 300, 300),
                 ("transcript sizes", 300, 300),
                 ("power source", 30, 30),
+                ("compaction", 21600, 21600),
             ]
         );
+    }
+
+    #[test]
+    fn compaction_is_heavy_and_waits_for_the_boot_refresh() {
+        let c = spec(Job::Compact);
+        assert_eq!(c.needs, Needs::Heavy);
+        assert!(COMPACT_CATCH_UP >= secs(30) && COMPACT_CATCH_UP_ECO >= COMPACT_CATCH_UP);
+        let mut s = Schedule::new(false);
+        assert!(!s.due(Job::Compact), "not on the first tick");
+        // Ten minutes after the start (the boot refresh and the first full refreshes are done).
+        let started = |ago: u64| Instant::now().checked_sub(secs(ago + 6 * 3600 - 600));
+        s.last[Job::Compact as usize] = started(590);
+        assert!(!s.due(Job::Compact));
+        s.last[Job::Compact as usize] = started(601);
+        assert!(s.due(Job::Compact));
+        // A backlog: due again in a minute, then six hours once caught up.
+        s.again_in(Job::Compact, COMPACT_CATCH_UP);
+        assert!(!s.due(Job::Compact));
+        s.last[Job::Compact as usize] =
+            s.last[Job::Compact as usize].and_then(|t| t.checked_sub(secs(61)));
+        assert!(s.due(Job::Compact));
+        s.done(Job::Compact);
+        assert!(!s.due(Job::Compact));
     }
 
     #[test]

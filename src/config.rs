@@ -77,6 +77,33 @@ pub struct Config {
     /// Minutes without transcript activity after which an unfinished agent counts as stalled.
     pub stall_minutes: Option<u64>,
     pub theme: Option<String>,
+    /// How long per-request detail is kept, and the size the index may grow to.
+    pub storage: StorageConf,
+}
+
+/// `[storage]` in config.toml (`docs/design/storage.md` §5).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConf {
+    /// Days of per-request and per-tool-call detail; older detail is kept as quarter-hour
+    /// rollups for good. 8 ..= the shortest transcript retention of the seats − 2
+    /// (`core::storage::keep_raw_days`); unset: 14, less when a seat keeps transcripts shorter.
+    pub keep_raw_days: Option<i64>,
+    /// `doctor` and SYSTEM warn when the 12-month projection goes over this (MB); nothing is
+    /// ever deleted because of it.
+    pub budget_mb: u64,
+    /// The dashboard compacts on its own; `swarmy compact` works either way.
+    pub auto_compact: bool,
+}
+
+impl Default for StorageConf {
+    fn default() -> Self {
+        StorageConf {
+            keep_raw_days: None,
+            budget_mb: crate::core::storage::DEFAULT_BUDGET_MB,
+            auto_compact: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -195,10 +222,20 @@ mod tests {
             "acc-1" = "personal"
             [subscription]
             personal = 200
+            [storage]
+            keep_raw_days = 21
+            auto_compact = false
             "#,
         )
         .unwrap();
         assert_eq!(c.stall_minutes(), 30);
+        assert_eq!(c.storage.keep_raw_days, Some(21));
+        assert!(!c.storage.auto_compact);
+        assert_eq!(
+            c.storage.budget_mb, 1024,
+            "what is left out keeps its default"
+        );
+        assert!(Config::default().storage.auto_compact);
         assert_eq!(
             c.seat_paths(Path::new("/h"))[0].0,
             PathBuf::from("/h/cc-work")

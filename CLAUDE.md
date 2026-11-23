@@ -44,25 +44,40 @@ logins. Users run it in a spare terminal, mostly on laptops.
   map a level to their colour), `current_window`, `runs_out`, `projection_at_reset`, `was_reset`, and `window_of`, the window in force (a reset by hand moves its start; `limits`, the dashboard and `report --period week` all use it). Readings of one window are named by their reset to the minute; a fall counts as a reset only when it holds across sources (`effective_start`).
   Every surface reads an account's limit from `Ctx::latest_readings` (index + seats, newest wins)
   through `limits::all_reports`; the `limit_threshold_copies` ratchet keeps copies out.
-- The index schema (`src/index/schema.rs`) has cache tables (rebuilt from transcripts when
-  `CACHE_VERSION` changes) and fact tables that nothing else records (`seat_accounts`, `accounts`,
-  `readings`, `observed_prices`: migrated by `FACTS_VERSION` steps, never dropped). A new table
-  goes into exactly one list; data rules are `CHECK`s, enum lists generated from the Rust enums.
+- The index schema (`src/index/schema.rs`) has raw tables (requests, tool calls, … dropped and
+  read again from transcripts when `CACHE_VERSION` changes), dimension tables that label them and
+  outlive Claude Code's 30-day transcript retention (`sessions`, `agents`, `projects`,
+  `cost_states`: kept across a bump, merged into on a re-read), archive tables (quarter-hour
+  rollups of raw rows that are gone, `ARCHIVE_VERSION`, never dropped), and fact tables that
+  nothing else records (`seat_accounts`, `accounts`, `readings`, `observed_prices`: migrated by
+  `FACTS_VERSION` steps, never dropped). A new table goes into exactly one list; data rules are `CHECK`s, enum
+  lists generated from the Rust enums.
   `cost` is NULL until priced (`priced` NULL) or when no price is known (`priced = 0`).
+- Bounded storage (`docs/design/storage.md`, §11 for what the code does): raw rows live
+  `keep_raw_days` (`[storage]`, default 14, `core::storage::keep_raw_days` checks it against the
+  weekly window and each seat's `cleanupPeriodDays`), then `Index::compact` rolls them into the
+  quarter-hour archive. Every read of a span reaching `rolled_until` goes through
+  `archive::plan`; a repricing (`price_all`), a login switch (`post_pass`) and a projects
+  recompute cover the rollups too; a file read from its start skips rolled-up records
+  (`marks.rs`), and a refresh rolls up at once whatever a newly found seat added below
+  `rolled_until`. Compaction is `Job::Compact` in the dashboard and `swarmy compact`
+  (`--dry-run`, `--verify` on a copy, `--vacuum`); prove a change with
+  `compact_scenarios.rs` (compacted index = never-compacted index on every surface). SQLite's
+  temp files go to `<data>/tmp` (`index::use_temp_dir`), never `/tmp`.
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `src/lib.rs`, `src/main.rs` | the library holds everything; the binary only parses arguments and calls `cli::run` |
-| `src/core/` | pure domain: usage, pricing, periods, limits math (no I/O) |
+| `src/core/` | pure domain: usage, pricing, periods, limits math, storage rules (raw window, growth, projection; no I/O) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
-| `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
+| `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `archive.rs`: rollup columns declared once (`KEYS`, `SUMS`), read plans (a span inside the raw window reads `requests` with the old SQL; one reaching `rolled_until` reads the union with the rollups); `archive_scenarios.rs`: the proof that rolled-up spend reads the same everywhere; `compact.rs`: the compactor (raw rows older than `keep_raw_days` into the rollups, one transaction per 6-hour chunk; giving space back, the one-time `VACUUM`), proved in `compact_scenarios.rs`; `projects.rs`: the cwd → project table, recomputed over raw and rolled-up cwds, never downgraded; `storage.rs`: the index's size, daily samples, last compaction (doctor, SYSTEM); `marks.rs`: read marks, the one rule that keeps a file read again after a compaction from counting rolled-up records twice; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
 | `src/live/` | live agent states for the dashboard; `state.rs`: how an agent's state is decided (pure, table-tested) |
 | `src/vault/` | login vault and switching |
 | `src/app/` | composition root `Ctx` (dirs, config, seats, prices, index), used by commands and dashboard |
 | `src/limits/` | limit analysis per account (`all_reports`): queries feeding the pure rules of `core::limits` |
-| `src/cli/` | commands: report, models, limits, accounts, doctor, prices |
+| `src/cli/` | commands: report, models, limits, accounts, doctor, prices, compact |
 | `src/tui/` | dashboard: UI loop (`mod.rs`), worker thread (`worker.rs`) on the cadences of `jobs.rs`, analytics passes (`analytics.rs`), state (`app/mod.rs`) and keys (`app/keys.rs`), what needs attention and what gets logged (`alerts.rs`: pure, tested), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
 | `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer (`mod.rs`); dialogs and toast (`overlays.rs`); help and legend (`help.rs`); panels that fill any rect (`panels/`, one file per panel, shared helpers in `panels/mod.rs`); primitives (`kit.rs`) |
 | `src/demo.rs` | made-up world for `swarmy demo` and README media |

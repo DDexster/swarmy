@@ -107,9 +107,29 @@ pub fn system(f: &mut Frame, app: &mut App, area: Rect) {
         sp.push(Span::styled(format!(" {}", hb(*b)), dim(app)));
         lines.push(Line::from(sp));
     }
-    lines.push(Line::from(Span::styled(
-        format!("index      {}", hb(app.analytics.index_bytes)),
-        dim(app),
-    )));
+    // swarmy's own database: its size, growth per day and where it will be in a year.
+    let index = match &app.analytics.storage {
+        Some(o) => Span::styled(
+            fit(
+                &format!(
+                    "index      {} · +{}/day · 12 mo ≈ {}",
+                    hb(o.file_bytes),
+                    hb(o.per_day as u64),
+                    hb(o.in_12_months)
+                ),
+                res.width as usize,
+            ),
+            if o.in_12_months > app.analytics.storage_budget {
+                Style::new().fg(th.warn)
+            } else {
+                dim(app)
+            },
+        ),
+        None => Span::styled(
+            format!("index      {}", hb(app.analytics.index_bytes)),
+            dim(app),
+        ),
+    };
+    lines.push(Line::from(index));
     put(f, res, lines);
 }

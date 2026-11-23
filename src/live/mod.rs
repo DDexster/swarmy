@@ -134,7 +134,7 @@ pub fn build(
         .collect();
 
     let mut rows: Vec<AgentRow> = Vec::new();
-    for row in idx.live_agent_rows(recent, now - Duration::hours(24))? {
+    for row in idx.live_agent_rows(recent, now - Duration::hours(24), &live_keys)? {
         let is_live_main = row.agent_id.is_empty()
             && live_keys.contains(&(row.seat.clone(), row.session_id.clone()));
         let recent_enough = row.last_ts.is_some_and(|t| t >= ms(recent));

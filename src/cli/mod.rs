@@ -1,6 +1,7 @@
 //! Command-line interface.
 
 pub mod accounts;
+pub mod compact;
 pub mod doctor;
 pub mod limits;
 pub mod models;
@@ -57,6 +58,8 @@ pub enum Command {
     Accounts(accounts::AccountsArgs),
     /// What was found on this machine and whether it is readable.
     Doctor,
+    /// Roll per-request detail older than the raw window up into the archive and free the space.
+    Compact(compact::CompactArgs),
     /// Optional: add the swarmy status line to Claude Code (exact limits) and save logins.
     Setup(setup::SetupArgs),
     /// Switch tmux to the Claude Code that has waited for you the longest (bind it to a key).
@@ -237,6 +240,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 Some(Command::Limits { format, top }) => limits::run(&ctx, format, top),
                 Some(Command::Accounts(a)) => accounts::run(&ctx, &a),
                 Some(Command::Doctor) => doctor::run(&ctx),
+                Some(Command::Compact(a)) => compact::run(&ctx, &a),
                 Some(Command::Prices { format }) => prices::run(&ctx, format),
                 None => {
                     use std::io::IsTerminal;

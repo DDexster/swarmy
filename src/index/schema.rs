@@ -1,7 +1,16 @@
-//! The index schema, in two parts.
+//! The index schema. Every table is in exactly one class:
 //!
-//! **Cache tables** hold what the transcripts say. When `CACHE_VERSION` changes they are dropped
-//! and rebuilt from the transcripts.
+//! **Raw tables** hold what the transcripts say, row by row (requests, tool calls, prompts, …).
+//! When `CACHE_VERSION` changes they are dropped and read again from the transcripts.
+//!
+//! **Dimension tables** label the raw rows and outlive them: sessions (titles, compactions),
+//! agents (type, description, lifetime), the project of each working directory and Claude Code's
+//! own cost totals. A `CACHE_VERSION` change keeps them, because Claude Code deletes transcripts
+//! after `cleanupPeriodDays` (30 by default) and nothing else knows what an old agent was; files
+//! read again merge into them (`COALESCE`, `MIN`, `MAX`, the larger total).
+//!
+//! **Archive tables** hold quarter-hour rollups of raw rows that are gone (`archive`): never
+//! dropped; `ARCHIVE_VERSION` steps migrate them.
 //!
 //! **Fact tables** hold what swarmy observed over time and nothing else records: which account
 //! each seat had logged in and since when (`seat_accounts`), the accounts seen (`accounts`), limit
@@ -17,26 +26,49 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::claude::files::FileKind;
 use crate::core::limits::WindowKind;
 
-/// Version of the cache tables; a change drops and rebuilds them (never the facts).
+/// Version of the raw tables; a change drops them and reads the transcripts again (never the
+/// dimensions or the facts).
 pub const CACHE_VERSION: &str = "6";
+
+/// The first cache version whose dimension tables have today's shape: a database older than that
+/// drops them with the raw tables (they are rebuilt from the transcripts, as before the classes
+/// existed). A later change to a dimension table's shape is a step in `CACHE_STEPS`, never a
+/// rebuild.
+const DIMENSIONS_SINCE: u32 = 6;
 
 /// Version of the fact tables; each step up has a migration in `migrate_facts`.
 pub const FACTS_VERSION: u32 = 1;
 
-/// Derived from the transcripts: dropped and rebuilt when `CACHE_VERSION` changes.
-pub const CACHE_TABLES: &[&str] = &[
+/// Read from the transcripts row by row: dropped and read again when `CACHE_VERSION` changes.
+pub const RAW_TABLES: &[&str] = &[
     "files",
     "requests",
     "tool_calls",
-    "sessions",
-    "agents",
     "owners",
-    "projects",
     "prompts",
     "api_errors",
     "compact_events",
-    "cost_states",
     "record_types",
+];
+
+/// What labels the raw rows (sessions, agents, projects, Claude Code's totals): kept across a
+/// `CACHE_VERSION` change, merged into when a file is read again.
+pub const DIMENSION_TABLES: &[&str] = &["sessions", "agents", "projects", "cost_states"];
+
+/// Version of the archive tables (`archive`); each step up has a migration in
+/// `migrate_archive`.
+pub const ARCHIVE_VERSION: u32 = 1;
+
+/// Rollups of raw rows that are gone (`archive`): migrated, never dropped.
+pub const ARCHIVE_TABLES: &[&str] = &[
+    "usage_rollup",
+    "agent_rollup",
+    "tool_rollup",
+    "edit_rollup",
+    "prompt_rollup",
+    "api_error_rollup",
+    "rollup_seats",
+    "storage_samples",
 ];
 
 /// Observed over time and written nowhere else: migrated, never dropped.
@@ -48,8 +80,9 @@ pub const FACT_TABLES: &[&str] = &[
     "observed_prices",
 ];
 
-/// Keys of `meta` that describe the cache tables and go with them.
-pub const CACHE_META: &[&str] = &["price_fp", "projects_rev"];
+/// Keys of `meta` that describe the raw tables and go with them (`projects_rev` describes
+/// `projects`, a dimension, and stays).
+pub const CACHE_META: &[&str] = &["price_fp"];
 
 /// `'a', 'b', 'c'` for an `IN (...)` check.
 fn in_list(keys: &[&str]) -> String {
@@ -92,7 +125,12 @@ pub fn unpriced_sql() -> String {
     s
 }
 
+/// Every table that is not a fact: raw and dimension tables (all `IF NOT EXISTS`).
 pub fn cache_sql() -> String {
+    format!("{}{}", raw_sql(), dimension_sql())
+}
+
+pub fn raw_sql() -> String {
     let file_kinds = file_kinds();
     let cost_parts: String = COST_PARTS
         .iter()
@@ -162,37 +200,6 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 CREATE INDEX IF NOT EXISTS tool_calls_ts ON tool_calls(ts);
 CREATE INDEX IF NOT EXISTS tool_calls_agent ON tool_calls(seat, session_id, agent_id, ts);
 
-CREATE TABLE IF NOT EXISTS sessions (
-  seat TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  title TEXT,
-  ai_title TEXT,
-  cwd TEXT,
-  first_ts INTEGER,
-  last_ts INTEGER,
-  compactions INTEGER NOT NULL DEFAULT 0 CHECK (compactions >= 0),
-  PRIMARY KEY (seat, session_id)
-);
-
-CREATE TABLE IF NOT EXISTS agents (
-  seat TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  agent_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ({file_kinds})),
-  workflow_run TEXT,
-  agent_type TEXT,
-  description TEXT,
-  tool_use_id TEXT,
-  parent_agent_id TEXT,
-  depth INTEGER CHECK (depth IS NULL OR depth >= 0),
-  requested_model TEXT,
-  effort TEXT,
-  finished INTEGER NOT NULL DEFAULT 0 CHECK (finished IN (0, 1)),
-  first_ts INTEGER,
-  last_ts INTEGER,
-  PRIMARY KEY (seat, session_id, agent_id)
-);
-
 -- The account of a session over time, from its `session-owner` records.
 CREATE TABLE IF NOT EXISTS owners (
   seat TEXT NOT NULL,
@@ -200,13 +207,6 @@ CREATE TABLE IF NOT EXISTS owners (
   ts INTEGER NOT NULL,
   account_uuid TEXT NOT NULL,
   PRIMARY KEY (seat, session_id, ts, account_uuid)
-);
-
-CREATE TABLE IF NOT EXISTS projects (
-  cwd TEXT PRIMARY KEY,
-  key TEXT NOT NULL,
-  name TEXT NOT NULL,
-  worktree TEXT
 );
 
 -- Rows with natural keys: reading the same bytes twice (a replaced file, two processes) adds
@@ -240,14 +240,6 @@ CREATE TABLE IF NOT EXISTS compact_events (
   PRIMARY KEY (seat, session_id, ts)
 );
 
-CREATE TABLE IF NOT EXISTS cost_states (
-  seat TEXT NOT NULL,
-  session_id TEXT NOT NULL,
-  total_usd REAL NOT NULL CHECK (total_usd >= 0),
-  models TEXT NOT NULL,
-  PRIMARY KEY (seat, session_id)
-);
-
 -- Record types per transcript file (for `doctor`): a file read again from the start forgets its
 -- counts first; an empty path holds counts kept from before files were told apart.
 CREATE TABLE IF NOT EXISTS record_types (
@@ -256,6 +248,60 @@ CREATE TABLE IF NOT EXISTS record_types (
   count INTEGER NOT NULL CHECK (count >= 0),
   PRIMARY KEY (path, type)
 );
+"#
+    )
+}
+
+pub fn dimension_sql() -> String {
+    let file_kinds = file_kinds();
+    format!(
+        r#"
+CREATE TABLE IF NOT EXISTS sessions (
+  seat TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  title TEXT,
+  ai_title TEXT,
+  cwd TEXT,
+  first_ts INTEGER,
+  last_ts INTEGER,
+  compactions INTEGER NOT NULL DEFAULT 0 CHECK (compactions >= 0),
+  PRIMARY KEY (seat, session_id)
+);
+
+CREATE TABLE IF NOT EXISTS agents (
+  seat TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ({file_kinds})),
+  workflow_run TEXT,
+  agent_type TEXT,
+  description TEXT,
+  tool_use_id TEXT,
+  parent_agent_id TEXT,
+  depth INTEGER CHECK (depth IS NULL OR depth >= 0),
+  requested_model TEXT,
+  effort TEXT,
+  finished INTEGER NOT NULL DEFAULT 0 CHECK (finished IN (0, 1)),
+  first_ts INTEGER,
+  last_ts INTEGER,
+  PRIMARY KEY (seat, session_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+  cwd TEXT PRIMARY KEY,
+  key TEXT NOT NULL,
+  name TEXT NOT NULL,
+  worktree TEXT
+);
+
+CREATE TABLE IF NOT EXISTS cost_states (
+  seat TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  total_usd REAL NOT NULL CHECK (total_usd >= 0),
+  models TEXT NOT NULL,
+  PRIMARY KEY (seat, session_id)
+);
+
 "#
     )
 }
@@ -316,6 +362,8 @@ CREATE INDEX IF NOT EXISTS requests_account_ts ON requests(account_uuid, ts);
 CREATE INDEX IF NOT EXISTS requests_no_account ON requests(seat, session_id) WHERE account_uuid IS NULL;
 CREATE INDEX IF NOT EXISTS files_mtime ON files(mtime);
 CREATE INDEX IF NOT EXISTS tool_calls_msg ON tool_calls(msg_id);
+CREATE INDEX IF NOT EXISTS agents_last_ts ON agents(last_ts);
+CREATE INDEX IF NOT EXISTS agents_session ON agents(session_id);
 "#;
 
 pub(super) fn meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
@@ -345,12 +393,28 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     // Immediate: two processes opening an old index migrate it one after the other.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     migrate_facts(&tx)?;
-    let rebuild = meta(&tx, "schema_version")?.as_deref() != Some(CACHE_VERSION);
+    migrate_archive(&tx)?;
+    let version = meta(&tx, "schema_version")?;
+    let rebuild = version.as_deref() != Some(CACHE_VERSION);
     if rebuild {
-        // Facts are never dropped, whatever the lists say.
-        debug_assert!(CACHE_TABLES.iter().all(|t| !FACT_TABLES.contains(t)));
-        for t in CACHE_TABLES {
+        // Facts and dimensions are never dropped with the raw tables, whatever the lists say.
+        debug_assert!(RAW_TABLES.iter().all(|t| !FACT_TABLES.contains(t)
+            && !DIMENSION_TABLES.contains(t)
+            && !ARCHIVE_TABLES.contains(t)));
+        // Dimension tables of a database older than their current shape go too (rebuilt from
+        // the transcripts, as before the classes existed).
+        let old_dimensions = !matches!(
+            version.as_deref().map(str::parse::<u32>),
+            Some(Ok(v)) if v >= DIMENSIONS_SINCE
+        );
+        let dropped = RAW_TABLES
+            .iter()
+            .chain(DIMENSION_TABLES.iter().filter(|_| old_dimensions));
+        for t in dropped {
             tx.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?;
+        }
+        if old_dimensions {
+            tx.execute("DELETE FROM meta WHERE key = 'projects_rev'", [])?;
         }
         for k in CACHE_META {
             tx.execute("DELETE FROM meta WHERE key = ?1", [k])?;
@@ -378,8 +442,9 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
 
 /// Steps that bring the cache tables of an older database to the shape of `cache_sql` in place,
 /// keeping their rows: a rebuild would lose requests whose transcripts Claude Code already
-/// deleted. Each runs once (`meta.cache_step`), on databases older than the step; a rebuilt cache
-/// already has the latest shape. Steps only ever get appended.
+/// deleted. Each runs once (`meta.cache_step`), on databases older than the step; rebuilt raw
+/// tables already have the latest shape. Steps only ever get appended. A step that reshapes a
+/// dimension table must also run after a rebuild (dimension tables are kept by it).
 type CacheStep = fn(&Connection) -> anyhow::Result<()>;
 const CACHE_STEPS: &[CacheStep] = &[add_cost_parts, add_natural_keys];
 
@@ -458,6 +523,25 @@ fn add_natural_keys(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn migrate_archive(conn: &Connection) -> anyhow::Result<()> {
+    let version: u32 = match meta(conn, "archive_version")? {
+        Some(v) => v.parse()?,
+        None => 0,
+    };
+    if version > ARCHIVE_VERSION {
+        anyhow::bail!(
+            "the index was written by a newer swarmy (archive version {version}); update swarmy"
+        );
+    }
+    // 0 → 1: the rollup tables, empty; nothing is rolled up yet.
+    conn.execute_batch(&super::archive::archive_sql())?;
+    if version < 1 {
+        set_meta(conn, "rolled_until", "0")?;
+    }
+    set_meta(conn, "archive_version", &ARCHIVE_VERSION.to_string())?;
+    Ok(())
+}
+
 fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
     let version: u32 = match meta(conn, "facts_version")? {
         Some(v) => v.parse()?,
@@ -517,12 +601,45 @@ mod tests {
     }
 
     #[test]
-    fn every_table_is_either_cache_or_fact() {
-        let cache = created(&cache_sql());
+    fn every_table_is_in_exactly_one_class() {
+        let raw = created(&raw_sql());
+        let dims = created(&dimension_sql());
+        let archive = created(&super::super::archive::archive_sql());
         let facts = created(&facts_sql());
-        assert_eq!(cache, CACHE_TABLES, "cache tables and CACHE_TABLES differ");
+        assert_eq!(
+            archive, ARCHIVE_TABLES,
+            "archive tables and ARCHIVE_TABLES differ"
+        );
+        assert_eq!(raw, RAW_TABLES, "raw tables and RAW_TABLES differ");
+        assert_eq!(
+            dims, DIMENSION_TABLES,
+            "dimension tables and DIMENSION_TABLES differ"
+        );
         assert_eq!(facts, FACT_TABLES, "fact tables and FACT_TABLES differ");
-        assert!(cache.iter().all(|t| !facts.contains(t)));
+        let mut all: Vec<&String> = raw
+            .iter()
+            .chain(&dims)
+            .chain(&archive)
+            .chain(&facts)
+            .collect();
+        let n = all.len();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), n, "a table is in two classes");
+        // And nothing else is created on open.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let mut on_disk: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        on_disk.sort();
+        let mut want: Vec<String> = all.into_iter().cloned().collect();
+        want.sort();
+        assert_eq!(on_disk, want);
     }
 
     #[test]
@@ -725,6 +842,100 @@ mod tests {
                 assert_eq!(n(t), b, "{t} kept its rows");
                 assert!(b > 0, "{t} had a row");
             }
+        }
+    }
+
+    #[test]
+    fn the_archive_refuses_bad_rows_and_outlives_every_cache_bump() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(meta(&c, "rolled_until").unwrap().as_deref(), Some("0"));
+        let row = |bucket: i64, first: i64, priced: &str, cost: &str| {
+            format!(
+                "INSERT INTO usage_rollup(bucket, seat, session_id, agent_id, model, fast, long_ctx, requests,
+                   input, cw5, cw1h, cread, output, thinking, web, tools, cost, priced, first_ts, last_ts)
+                 VALUES ({bucket}, 's', 'x', '', 'm', 0, 0, 3, 1, 0, 0, 0, 1, 0, 0, 0, {cost}, {priced}, {first}, {first})"
+            )
+        };
+        let b = 1_000;
+        let at = b * 900_000 + 5;
+        for bad in [
+            row(b, at, "NULL", "NULL"),       // pending rows are never rolled up
+            row(b, at, "1", "NULL"),          // priced without a cost
+            row(b, at, "0", "0.5"),           // a cost without a price
+            row(b, at - 900_000, "1", "0.5"), // first_ts outside its bucket
+            row(b, at, "1", "-1"),            // a negative cost
+            "INSERT INTO tool_rollup VALUES (1, 'Bash', '', 2, 3, 0)".to_string(), // more errors than calls
+            "INSERT INTO prompt_rollup VALUES (1, 0, 0)".to_string(),
+            "INSERT INTO storage_samples VALUES ('today', 1, 1, 1, 1)".to_string(),
+        ] {
+            assert!(c.execute(&bad, []).is_err(), "accepted: {bad}");
+        }
+        c.execute(&row(b, at, "1", "0.5"), []).unwrap();
+        c.execute(&row(b + 1, at + 900_000, "0", "NULL"), [])
+            .unwrap();
+        // A cache bump (and even one from before the dimensions' shape) keeps it.
+        set_meta(&c, "schema_version", "1").unwrap();
+        assert!(migrate(&c).unwrap());
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM usage_rollup", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+        // A newer archive is refused.
+        set_meta(&c, "archive_version", "99").unwrap();
+        assert!(migrate(&c).is_err());
+    }
+
+    #[test]
+    fn a_cache_version_bump_keeps_every_dimension_table() {
+        // Agent types, session titles, projects and Claude Code's totals outlive the transcripts
+        // (deleted after 30 days): a bump drops only the raw rows.
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        let fill = |c: &Connection, version: &str| {
+            c.execute_batch(&format!(
+                "INSERT OR IGNORE INTO sessions(seat, session_id, title) VALUES ('work', 's1', 'old work');
+                 INSERT OR IGNORE INTO agents(seat, session_id, agent_id, kind, agent_type) VALUES ('work', 's1', 'a1', 'subagent', 'reviewer');
+                 INSERT OR IGNORE INTO projects VALUES ('/w/shop', 'shop', 'shop', NULL);
+                 INSERT OR IGNORE INTO cost_states VALUES ('work', 's1', 1.5, '{{}}');
+                 INSERT OR REPLACE INTO meta VALUES ('projects_rev', 'r'), ('price_fp', 'p'), ('schema_version', '{version}');
+                 INSERT OR IGNORE INTO prompts VALUES ('work', 's1', 1, 10);"
+            ))
+            .unwrap();
+        };
+        let n = |c: &Connection, t: &str| -> i64 {
+            c.query_row(&format!("SELECT COUNT(*) FROM {t}"), [], |r| r.get(0))
+                .unwrap()
+        };
+        let dims = |c: &Connection| DIMENSION_TABLES.iter().map(|t| n(c, t)).collect::<Vec<_>>();
+        // Another cache version of today's dimension shape: raw rows go, dimensions stay.
+        let other = (CACHE_VERSION.parse::<u32>().unwrap() + 1).to_string();
+        fill(&c, &other);
+        assert!(migrate(&c).unwrap(), "the raw tables are rebuilt");
+        assert_eq!(n(&c, "prompts"), 0);
+        assert_eq!(
+            dims(&c),
+            vec![1, 1, 1, 1],
+            "every dimension table kept its rows"
+        );
+        assert_eq!(
+            c.query_row("SELECT agent_type FROM agents", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "reviewer"
+        );
+        assert_eq!(meta(&c, "projects_rev").unwrap().as_deref(), Some("r"));
+        assert_eq!(
+            meta(&c, "price_fp").unwrap(),
+            None,
+            "raw costs go with the raw rows"
+        );
+        // A version older than the dimensions' shape, or no number at all: they go too.
+        for old in ["5", "x"] {
+            fill(&c, old);
+            assert!(migrate(&c).unwrap());
+            assert_eq!(dims(&c), vec![0, 0, 0, 0], "version {old}");
+            assert_eq!(meta(&c, "projects_rev").unwrap(), None);
         }
     }
 }

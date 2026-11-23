@@ -30,6 +30,8 @@ pub struct Inputs<'a> {
     pub jobs: &'a Schedule,
     /// Bytes of each seat's transcripts.
     pub disk: &'a [(String, u64)],
+    /// The index's outlook (read with the transcript sizes).
+    pub storage: Option<crate::core::storage::Outlook>,
     pub slow: Option<SlowParts>,
     /// The last analytics when this is not a full pass: period aggregates are reused from it.
     pub reuse_period: Option<&'a Analytics>,
@@ -46,6 +48,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         wants: w,
         jobs,
         disk,
+        storage,
         slow,
         reuse_period: prev,
         reuse_limits: prev_limits,
@@ -121,10 +124,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         .unwrap_or(ctx.now);
     let end = ctx.now + chrono::Duration::seconds(1);
     // The period before, of the same length, for trends.
-    let prev_span = (!matches!(period, Period::All)).then(|| Span {
-        start: span.start - (span.end - span.start),
-        end: span.start,
-    });
+    let prev_span = (!matches!(period, Period::All)).then(|| span.previous());
     let mut projects: Vec<ProjectRow> = match reuse {
         Some(prev) => prev
             .projects
@@ -297,5 +297,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         index_bytes: std::fs::metadata(ctx.dirs.index_file())
             .map(|m| m.len())
             .unwrap_or(0),
+        storage,
+        storage_budget: ctx.config.storage.budget_mb << 20,
     })
 }

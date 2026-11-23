@@ -74,6 +74,9 @@ pub struct Analytics {
     pub seats: Vec<SeatRow>,
     pub transcripts_bytes: Vec<(String, u64)>,
     pub index_bytes: u64,
+    /// The index's size, growth and 12-month projection (SYSTEM), and the budget it is held to.
+    pub storage: Option<crate::core::storage::Outlook>,
+    pub storage_budget: u64,
 }
 
 #[derive(Debug, Clone, Default)]

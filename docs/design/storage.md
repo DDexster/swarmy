@@ -1,8 +1,8 @@
 # Bounded index storage: raw detail for two weeks, rollups for the years
 
-Status: design, not implemented. It is based on `main` at 497c94a. `src/index/` is being changed
-in parallel, so line-level details may shift; the tables and queries named here are the ones that
-matter.
+Status: steps 1–8 of §9 implemented (see §11 for where the code differs from this text);
+step 9 (a slimmer raw tier) is optional and not done. The design was written against `main` at 497c94a; the tables and
+queries named here are the ones that matter.
 
 ## 0. Summary
 
@@ -821,3 +821,217 @@ other.
   be.
 - **`keep_raw_days` ≥ retention.** Validation refuses it, because a cache rebuild could no longer
   re-derive the raw window. A seat with a longer `cleanupPeriodDays` only makes this safer.
+
+## 11. Implementation notes
+
+Where the code differs from the text above, and why.
+
+**Step 1 (table classes).**
+- `compact_events` (added to the cache after this design was written) is a **raw** table: it is
+  re-derivable from the transcripts, and its count lives on in `sessions.compactions`, which is
+  kept. A rebuild re-reads the events of the transcripts still on disk and recounts.
+- Dimension tables are kept across a bump only when the stored cache version is at least
+  `DIMENSIONS_SINCE` (6, the first version whose dimension tables have today's shape). An older
+  or unreadable version drops them with the raw tables, as in §8.1 item 4. A later change to a
+  dimension table's shape is an in-place `CACHE_STEPS` step.
+- `projects_rev` is no longer a cache meta key (it describes `projects`, a dimension). A
+  `PROJECTS_REV` change recomputes the cwds that still have raw requests and leaves the others as
+  recorded while their directories existed, a first part of §3.8's "never downgrade".
+
+**Step 2 (quarter-hour spans).**
+- `core::period::quarter_floor` floors `Days`/`Hours` starts; `Span::previous` is the previous
+  period (same length, start floored) used by the dashboard's trends; HISTORY's 14- and 28-day
+  spans are `Period::Days(14|28).span(..)`; `doctor`'s week is `Period::Days(7)` too, so it never
+  trips the alignment check of step 3.
+
+**Step 3 (archive schema and the union read path).**
+- The rollup columns are declared once in `src/index/archive.rs`: `KEYS` (column, type, value
+  from a `requests` row, how a rollup row reads back as the `requests` column) and `SUMS`. The
+  `usage_rollup` table, `rollup_insert_sql` (the compactor's `INSERT … SELECT`) and the union
+  (`Plan::source`) are generated from them. `usage_rollup` also sums `tools` and the six cost
+  parts (`cost_input` … `cache_saved`, added after this design) so the efficiency split stays a
+  `SUM` over the same rows as the cost.
+- `long_ctx` and `lc_threshold` come from a bound `:lc`, the model's long-context threshold on
+  the chunk's day: the compactor runs the generated insert per model (and per local day when a
+  chunk straddles a price change) instead of computing the band in Rust per row.
+- `agent_rollup` also keeps `first_model`, which the event log shows for an agent. It is derived
+  by `agent_rollup_sql`.
+- **Choosing the plan.** A span that starts less than `MIN_RAW_DAYS` (8) ago reads `requests`
+  with no I/O to decide; `keep_raw_days` must never be below it. An older span reads
+  `meta.rolled_until` in the same read transaction as the query, so a compaction committed in
+  between cannot move rows out from under it. Only `start < rolled_until` takes the union.
+- A span **end** inside the archive counts the whole quarter hour it falls in (the union's `ts`
+  of a rollup row is its bucket start). Old limit readings are the only such ends; the
+  calibration span start is floored (`settled_total` plans with `snap`).
+- **Agent types.** §3.4's single `GROUP BY seat, session_id, agent_id` over the union measured
+  4–8× slower on the owner's index than the correlated per-agent sum (0.66 s against 0.085 s CPU
+  for 30 days). The correlated raw sum stays; the archive path adds the rollups grouped once in
+  a `LEFT JOIN`.
+- `live.rs` adds the `agent_rollup` row by primary key unconditionally: one probe into a small
+  table is cheaper than deciding whether it is needed.
+- **`live_agent_rows` is bounded:** an `agents(last_ts)` index, agents active since
+  `min(recent, unfinished_since)`, plus the main threads of running sessions by primary key, sorted
+  in Rust (an `ORDER BY` made SQLite walk the primary key instead of the index).
+- Empty `effort`, `cwd` and `requested_model` are stored as NULL by the parser, so the rollup's
+  `''` for NULL reads back exactly. Rows with `''` written by older versions would read as
+  unknown once rolled up.
+- `efficiency` sums busy time in integer milliseconds before converting, and groups commands in
+  a `BTreeMap`, so raw plus rollup equals raw alone and ties sort the same way.
+- `cost_crosscheck` reads the union only when `rolled_until > 0`.
+- **Checked on real data:** on a read-only copy of the owner's index, rolling up the 65.6k
+  requests older than 14 days (2.7 s, into 2.8k rows) changed no number in `spend_by` (all 11
+  dimensions, 5 periods), totals, substitutions, matrices, `days_by_model`, `efficiency`, API
+  errors, `cost_crosscheck` or any agent's live totals. `efficiency` over 30 days took 0.64 s
+  before and 0.62 s after.
+- **Left for step 4:** the compactor must keep `rolled_until` on a quarter hour, guard pending
+  rows and missing accounts, bind `:lc`, rewrite `agent_rollup` for the agents it touched, roll
+  tool calls up as the proof test does (`command_key` only for shell tools with a summary, the
+  edit hash only for edit tools with a target), and decide on the `MAX(rowid)` note in §4.1.
+
+**Step 4 (the compactor, `src/index/compact.rs`).**
+- `Index::compact(&CompactOpts) -> CompactReport` is the library function; the CLI and the
+  dashboard job come in step 7. `keep_raw_days` below `MIN_RAW_DAYS` (8) is refused, and `now`
+  is never taken later than the real clock (the read plans measure the raw window from it).
+- Chunks are six UTC hours aligned on multiples of six hours, starting at the oldest raw row of
+  any rolled table (`requests`, `tool_calls`, `prompts`, `api_errors`), so gaps cost nothing.
+  `rolled_until` becomes the end of the last committed chunk (never lowered); it can stay below
+  the cutoff when no raw row lies between them.
+- **The guard holds pending requests only.** A request whose `account_uuid` is still NULL after
+  `post_pass` stays NULL for good (no owner record, no login known for its seat): the owner's
+  index has 68 such rows on two days. Waiting for them would stop compaction forever; the
+  rollup's `''` reads back as NULL, so they roll up exactly. Step 6's re-key treats `''` like any
+  account.
+- **The `MAX(rowid)` question is settled with a high mark, not the single-row exception.**
+  `write_file` gives every new request an explicit rowid above `compact::requests_rowid_high`
+  (the larger of `MAX(rowid)` and `meta.requests_rowid_high`), and the compactor records that
+  value in `meta` before it deletes. A rowid is never given out twice, so "rows above the
+  rowid read before the refresh are new" holds without keeping any old row raw, and the no-op
+  check and idempotence need no exception.
+- `agent_rollup` grows by the chunk's per-agent sums (`ON CONFLICT` add, first and last model
+  by time) instead of being rewritten from `usage_rollup` by `agent_rollup_sql`: `usage_rollup`
+  has no index by agent, so the rewrite scans the whole table per agent touched. The tests check
+  that the grown table equals the derived one.
+- `owners` loses every row of a session whose agents all ended before the chunk's end, except
+  the newest. `files` is pruned once per run, after the chunks, for transcripts that are gone and
+  hold nothing newer than `rolled_until`.
+- Tool calls roll up as the step-3 proof did; `command_key` carries a note that rolled-up days
+  keep the keys of the rules they were rolled under.
+- The fault hook is a test-only thread-local (`FAIL_IN_CHUNK`), so `CompactOpts` stays the same
+  in every build.
+
+**Step 5 (read marks, `src/index/marks.rs`).**
+- The rule is `Marks::applies` (whether a file may repeat rolled-up records) plus
+  `marks::rolled_up` (whether one record is older than `rolled_until`). It applies only to a file
+  read **from its start** (replaced, truncated, found again, every file after a rebuild): bytes
+  past a stored offset were never read, so an incremental read is always new, and the per-second
+  path pays nothing.
+- It is decided per file in `plan`, before the refresh writes anything, so a session first seen
+  in this refresh stays new for all its files whatever their order. "Known session" is a probe of
+  a new `agents(session_id)` index instead of a cached set; `rollup_seats` and the seats'
+  canonical dirs are read only when some file is read from its start. `rolled_until` itself is
+  read inside each write transaction, so a compaction committed after the plan counts.
+- Skipped with a request are its tool calls; prompts and API errors older than `rolled_until`
+  are skipped too (they are rolled up as well). Their times, working directory and owner record
+  still count, so `agents`, `sessions` and `owners` end up as if the records had been written.
+- `Work::reset` deletes prompts and API errors only from `rolled_until` on, and only for a file
+  the rule applies to; any other file read again forgets all its rows as before.
+- Skipped records are counted in `RefreshStats::records_skipped` and in `meta.skipped_records`
+  (a running total for `doctor`, step 8).
+- Covered by tests: an append, files replaced and truncated (old and recent sessions), a fork
+  in a compacted seat, a rebuild (also with the first 20 days' transcripts deleted), a seat found
+  after the compaction (raw first, rolled up into existing buckets by the next run). A relabelled
+  seat is covered by rule 1 (session ids stay) and has no test of its own.
+- One gap stays: records of a seat found after a compaction that are older than `rolled_until`
+  are raw until the next compaction; a cache rebuild in between skips them (their session is
+  known by then) and they are lost. The dashboard compacts after its full refresh, so the window
+  is a few hours at most.
+
+**Step 6 (reprice, re-attribution, projects).**
+- `price_all` reprices the rollups in its own transaction whenever the price fingerprint
+  changed: one local day of buckets at a time, each row by `PriceBook::cost_parts_in_band` (the
+  band is the row's `long_ctx`, not its summed prompt), written back by primary key. The
+  multipliers still apply in one place (`core::pricing::cost_parts_in_band`, which `cost_parts`
+  calls with the band of one request). `agent_rollup` then takes its cost and unpriced count
+  from one `GROUP BY` over `usage_rollup` (`UPDATE … FROM`); its first and last model do not
+  change.
+- `Index::band_drift` lists the models and days whose rows took their band against another
+  threshold than the prices in force give (the inexact case; `doctor` shows it in step 8).
+- The re-key is `archive::rekey_sql`, generated from `KEYS` and `SUMS`: insert the seat's rows
+  with `first_ts >= t` whose account at `first_ts` differs under their new key (adding into rows
+  already there), then delete the old keys. `post_pass` runs it only for a switch older than
+  `rolled_until`. `agent_rollup` has no account, so it does not change.
+- `projects` moved to `index/projects.rs`: a new rule revision takes the cwds of raw rows and
+  rollups, orphan votes count rolled-up requests by session, and a cwd whose dir is gone, that
+  resolves as an orphan and has no votes keeps the project recorded for it.
+- Tests: `reprice_after_compaction` (a dated price inside the archive, a price for the unpriced
+  model, new long-context multipliers; then a threshold change listed by `band_drift`),
+  `reattribution_after_compaction` (a switch on a quarter hour changes no number; one between
+  two responses of a rolled-up row moves exactly the second response's cost between the two
+  accounts and nothing else), `projects_come_from_the_union_and_are_never_downgraded`.
+
+**Step 7 (mechanics, the job, the CLI).**
+- `journal_size_limit` is 32 MB, set at open. SQLite's temp dir is `<data>/tmp`, set once per
+  process by `index::use_temp_dir` from `Ctx` (`PRAGMA temp_store_directory`: Rust 2024 makes
+  `set_var` unsafe and the crate forbids unsafe code, so `SQLITE_TMPDIR` is not set). Checked
+  with `strace`: the `VACUUM` copy is an `O_TMPFILE` there.
+- After a compaction that moved anything, `Index::free_space` runs `incremental_vacuum` in steps
+  of 4096 pages while the free list shrinks (only with incremental auto-vacuum), then a passive
+  checkpoint, and a truncating one (waiting at most a second for readers) when the passive one
+  copied the whole WAL.
+- The one-time switch is `Index::vacuum_to_incremental`, decided by the pure `vacuum_verdict`:
+  never twice; unless the user asked (`--vacuum`), only on mains power and with a quarter of the
+  file free; always only with twice the file plus 64 MB free on the data dir's disk (the copy,
+  and the WAL the rewrite goes through). A skip is recorded in `meta.vacuum_skipped` for
+  `doctor`.
+- `Job::Compact`: every 6 h (also on battery), first ten minutes after the start
+  (`Start::After`), only in a tick that just ran the full refresh; a backlog goes on 4 chunks
+  per run every 50 s (so each full refresh, every 60 s, takes the next day; 300 s on battery,
+  `Schedule::again_in`). When nothing is left to roll up,
+  the job tries the one-time switch, which waits for mains power.
+- **The gap step 5 left is closed in the refresh:** a refresh that read any file from its start
+  rolls up at once whatever raw rows lie below `rolled_until` (`Index::roll_late`, the
+  compactor's chunks with `rolled_until` as the cutoff; a no-op check otherwise). A seat found
+  after a compaction therefore never keeps old records raw, and a cache rebuild cannot skip and
+  lose them (test `a_seat_found_after_compaction_is_counted_once_and_rolled_up_at_once`).
+- `swarmy compact` (`cli/compact.rs`) refreshes first, then compacts in the foreground with
+  progress. `--dry-run` reads counts below the cutoff and estimates rollup rows (distinct keys
+  without the band) and bytes from the measured bytes per row. `--verify` copies the index
+  with `VACUUM INTO` to `<data>/tmp`, compares `total` and `spend_by` for every `Dim` over five
+  periods before and after compacting the copy, and deletes it; the index is only read.
+- **Measured on a copy of the owner's index (2026-11-23, 290 MB, 31 days):** rolling up the
+  86,156 requests older than 14 days (46 chunks) took 1.9 s user + 1.9 s sys (12.4 s wall,
+  fsync per chunk); a no-op run 0.07 s user; the one-time `VACUUM` afterwards 0.6 s user + 1.3 s
+  sys and took the file from 290 MB to 191 MB; `--verify` found 0 differences in 14,177 numbers.
+  The dashboard on the same copy (isolated, no seats; CPU of the process): 2.8 CPU-seconds a
+  minute idle before the job, 2.7 over the 15 minutes it caught up (runs of 0.1–2.2 s wall); the
+  last run with the one-time `VACUUM` took 3.5 s wall and ≈ 4.4 CPU-seconds on top of that
+  minute, and the file went from 304 MB to 201 MB.
+
+**Step 8 (config and visibility).**
+- The rules are pure, in `core::storage`: `MIN_RAW_DAYS`, the defaults, the measured bytes per
+  row, `keep_raw_days` (the check of §5) and `outlook` (growth and projection). `archive` and
+  `compact` re-export the constants they used to own.
+- `[storage]` (`config::StorageConf`): `keep_raw_days` unset means 14, shrunk to fit a seat whose
+  retention is shorter (never below 8); a value set outside 8 ..= shortest retention − 2 is
+  refused when the context loads, naming the seat and its `cleanupPeriodDays`. When a seat's
+  retention is below 10 days only 8 fits. `compact --keep-days` goes through the same check.
+  `Seat::cleanup_period_days` reads `settings.json` each time it is asked (`Ctx::retention`).
+- `auto_compact = false` keeps the job, which then only records the day's size sample.
+- `storage_samples.file_bytes` is the bytes **in use** (the file less its free pages): free pages
+  are reused before the file grows, so they are no growth. Samples are written by every
+  compaction run (the job's no-op runs included) and by `doctor`.
+- Growth per day is the least-squares slope of the kept bytes (in use less the raw estimate)
+  over the last 14 samples once there are 7; before that, the requests a day of the raw window
+  × 18 B (`ARCHIVE_BYTES_PER_REQUEST`, §6). The projection is the raw window once full at
+  today's pace, plus the kept bytes, plus a year of growth.
+- `doctor` prints the STORAGE section of §5 (`detail` names the day raw detail starts from,
+  `rolled_until` or the oldest request), plus the one-time `VACUUM` still waiting and why, and
+  `band_drift` rows; without incremental auto-vacuum it says how much free space waits in the
+  file. `Index::storage_report` gathers it: page counts, row counts, the samples,
+  `meta.last_compaction` (written by a compaction that moved something), `meta.skipped_records`.
+- SYSTEM reads the outlook in the transcript-sizes cadence (every 5 min) and shows
+  `index 290.2 MB · +252 KB/day · 12 mo ≈ 300.4 MB`, in the warning colour over `budget_mb`; the
+  legend has a line for it (and a test that keeps it).
+- On a copy of the owner's index before compaction: 290 MB, 287k requests since 2026-10-22,
+  +161 KB/day estimated, ≈ 206 MB in 12 months; after `swarmy compact`, 201k requests of detail,
+  21k rollup rows ≈ 1.4 MB.

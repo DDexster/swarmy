@@ -499,6 +499,23 @@ impl PriceBook {
         }
     }
 
+    /// [`cost_parts_in_band`] at the prices in force for `model` on `day`: the cost of token sums
+    /// whose requests were all inside (`long`) or all outside the long-context band (the
+    /// archive's rollups, repriced from their sums); `None` when no price is known.
+    pub fn cost_parts_in_band(
+        &self,
+        model: &str,
+        day: NaiveDate,
+        usage: &Usage,
+        fast: bool,
+        long: bool,
+    ) -> Option<CostParts> {
+        match self.lookup(model, day) {
+            Some(e) => Some(cost_parts_in_band(&e.rates, usage, fast, long)),
+            None => usage.is_empty().then(CostParts::default),
+        }
+    }
+
     /// Changes whenever any price changes, so stored costs know when to be recomputed.
     pub fn fingerprint(&self) -> String {
         let mut h = Sha256::new();
@@ -532,10 +549,16 @@ impl CostParts {
 /// One request at the given rates, by part. The only place the multipliers apply: long context
 /// (above its threshold, on the prompt and the output), then fast mode (on everything).
 pub fn cost_parts(r: &Rates, u: &Usage, fast: bool) -> CostParts {
+    let long = r.long_context.is_some_and(|lc| u.prompt() > lc.threshold);
+    cost_parts_in_band(r, u, fast, long)
+}
+
+/// [`cost_parts`] with the long-context band given instead of taken from the prompt: `long`
+/// applies the multipliers (when the rates have a long-context rule). Linear in the tokens for a
+/// fixed band, so the sums of many requests of one band cost exactly what the requests do.
+pub fn cost_parts_in_band(r: &Rates, u: &Usage, fast: bool, long: bool) -> CostParts {
     let (mut pin, mut pout) = (1.0, 1.0);
-    if let Some(lc) = r.long_context
-        && u.prompt() > lc.threshold
-    {
+    if let Some(lc) = r.long_context.filter(|_| long) {
         pin = lc.input_multiplier;
         pout = lc.output_multiplier;
     }
@@ -873,6 +896,29 @@ mod tests {
             .cost_parts("claude-haiku-5-5", day(), &u, false)
             .unwrap();
         assert!(close(p.input, 0.15) && close(p.output, 0.01), "{p:?}");
+        // In a band given, sums cost what their requests do: two Haiku prompts above the
+        // threshold, priced one by one and as one sum (the archive reprices its rollups so).
+        let half = Usage {
+            input: 150_000,
+            cache_write_5m: 10_000,
+            cache_write_1h: 5_000,
+            cache_read: 50_000,
+            output: 2_000,
+            web_search: 0,
+            ..Default::default()
+        };
+        let one = book
+            .cost_parts("claude-haiku-5-5", day(), &half, false)
+            .unwrap();
+        let both = book
+            .cost_parts_in_band("claude-haiku-5-5", day(), &u, false, true)
+            .unwrap();
+        assert!(close(2.0 * one.input, both.input) && close(2.0 * one.output, both.output));
+        // Outside the band the same sums take the plain rates: input 300k × 0.10 = $0.03.
+        let plain = book
+            .cost_parts_in_band("claude-haiku-5-5", day(), &u, false, false)
+            .unwrap();
+        assert!(close(plain.input, 0.03), "{plain:?}");
         // No price: no parts; no tokens: zero parts, priced.
         assert_eq!(book.cost_parts("claude-unknown-9", day(), &u, false), None);
         assert_eq!(

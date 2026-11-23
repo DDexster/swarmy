@@ -2,7 +2,7 @@
 
 use rusqlite::params;
 
-use super::{Work, ms, schema};
+use super::{Work, marks, ms, schema};
 use crate::claude::files::{self, FileKind};
 use crate::claude::transcript::{self, Event, TitleKind};
 
@@ -15,16 +15,38 @@ struct FileAgg {
     ai_title: Option<String>,
 }
 
-/// Writes what was read of one file. Returns whether a request older than `settled_before`
-/// (ms) was written: settled spend changed (see [`super::SETTLED_AFTER_MS`]).
+/// The times a write is measured against (epoch ms).
+pub(super) struct At {
+    /// Spend older than this is settled (see [`super::SETTLED_AFTER_MS`]).
+    pub settled_before: i64,
+    /// `meta.rolled_until`, read in the write transaction.
+    pub rolled_until: i64,
+}
+
+/// What writing one file did.
+pub(super) struct Written {
+    /// A request older than `At::settled_before` was written: settled spend changed.
+    pub late: bool,
+    /// Records skipped because they were rolled up already (`marks`).
+    pub skipped: u64,
+}
+
+/// Writes what was read of one file. Records the index rolled up already are skipped (requests
+/// with their tool calls, prompts, API errors; see `marks`); everything else about them (times,
+/// working directory, owner) still counts, as if they had been read.
 pub(super) fn write_file(
     tx: &rusqlite::Transaction,
     w: &Work,
     chunk: transcript::Chunk,
     cwds: &mut std::collections::HashSet<String>,
-    settled_before: i64,
-) -> anyhow::Result<bool> {
+    at: At,
+    rowid: &mut i64,
+) -> anyhow::Result<Written> {
     let mut late = false;
+    let mut skipped = 0;
+    let rolled = |t: i64| marks::rolled_up(w.marked, at.rolled_until, t);
+    // Rows older than this were rolled up and are not read again: a reset keeps them.
+    let kept_before = if w.marked { at.rolled_until } else { i64::MIN };
     let f = &w.file;
     let main = f.kind == FileKind::Main;
     if w.reset {
@@ -34,8 +56,8 @@ pub(super) fn write_file(
         // belong to the main transcript: a subagent's file never touches them.
         if main {
             tx.execute(
-                "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2",
-                params![f.seat, f.session_id],
+                "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2 AND ts >= ?3",
+                params![f.seat, f.session_id, kept_before],
             )?;
             tx.execute(
                 "DELETE FROM compact_events WHERE seat = ?1 AND session_id = ?2",
@@ -43,8 +65,8 @@ pub(super) fn write_file(
             )?;
         }
         tx.execute(
-            "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-            params![f.seat, f.session_id, f.agent_id],
+            "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4",
+            params![f.seat, f.session_id, f.agent_id, kept_before],
         )?;
         tx.execute(
             "DELETE FROM record_types WHERE path = ?1",
@@ -64,8 +86,8 @@ pub(super) fn write_file(
     let mut agg = FileAgg::default();
     let mut ins_req = tx.prepare_cached(&format!(
         "INSERT INTO requests(msg_id, seat, session_id, agent_id, account_uuid, ts, model, requested_model, effort, fast, cwd,
-                              input, cw5, cw1h, cread, output, thinking, web)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                              input, cw5, cw1h, cread, output, thinking, web, rowid)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(msg_id) DO UPDATE SET
            input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
            cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
@@ -90,7 +112,6 @@ pub(super) fn write_file(
             }
             Event::Request(r) => {
                 let t = ms(r.ts);
-                late |= t < settled_before;
                 last_ts = last_ts.max(t);
                 agg.first_ts = Some(agg.first_ts.map_or(t, |x| x.min(t)));
                 agg.last_ts = Some(agg.last_ts.map_or(t, |x| x.max(t)));
@@ -102,7 +123,15 @@ pub(super) fn write_file(
                         cwds.insert(c.clone());
                     }
                 }
+                if rolled(t) {
+                    skipped += 1;
+                    continue;
+                }
+                late |= t < at.settled_before;
                 let u = r.usage;
+                // Numbered above every rowid ever given out (`compact::requests_rowid_high`); a
+                // merge into an existing row leaves the number unused.
+                *rowid += 1;
                 ins_req.execute(params![
                     r.msg_id,
                     f.seat,
@@ -122,6 +151,7 @@ pub(super) fn write_file(
                     u.output as i64,
                     u.thinking as i64,
                     u.web_search as i64,
+                    *rowid,
                 ])?;
                 for tu in &r.tool_uses {
                     if !tu.id.is_empty() {
@@ -157,7 +187,9 @@ pub(super) fn write_file(
             Event::Prompt { ts, text } => {
                 if let Some(t) = ts {
                     last_ts = last_ts.max(ms(t));
-                    if main {
+                    if main && rolled(ms(t)) {
+                        skipped += 1;
+                    } else if main {
                         tx.execute("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
                     }
                 }
@@ -195,6 +227,10 @@ pub(super) fn write_file(
             }
             Event::ApiError { ts, kind, text } => {
                 let t = ts.map(ms).unwrap_or(last_ts);
+                if rolled(t) {
+                    skipped += 1;
+                    continue;
+                }
                 tx.execute(
                     "INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT DO NOTHING",
@@ -277,5 +313,5 @@ pub(super) fn write_file(
             account,
         ],
     )?;
-    Ok(late)
+    Ok(Written { late, skipped })
 }

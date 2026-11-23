@@ -88,9 +88,27 @@ pub struct Span {
     pub end: DateTime<Utc>,
 }
 
-impl Span {}
+/// `t` floored to its UTC quarter hour ([`BUCKET_MS`]).
+pub fn quarter_floor(t: DateTime<Utc>) -> DateTime<Utc> {
+    let ms = t.timestamp_millis();
+    Utc.timestamp_millis_opt(ms - ms.rem_euclid(BUCKET_MS))
+        .single()
+        .unwrap_or(t)
+}
 
-fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
+impl Span {
+    /// The span of the same length right before this one, for trends ("vs previous 7d"). Its
+    /// start is floored to the quarter hour like every rolling start (see [`Period::span`]).
+    pub fn previous(self) -> Span {
+        Span {
+            start: quarter_floor(self.start - (self.end - self.start)),
+            end: self.start,
+        }
+    }
+}
+
+/// The UTC instant of the local midnight that starts day `d` (a quarter hour in every zone).
+pub fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
     let naive = d.and_hms_opt(0, 0, 0).unwrap();
     Local
         .from_local_datetime(&naive)
@@ -102,6 +120,13 @@ fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
 impl Period {
     /// Resolves to a UTC span in the local calendar. `limit_week` is the current weekly window
     /// when the caller knows it.
+    ///
+    /// Rolling periods (`Nd`, `Nh`) start on the UTC quarter hour at or before `now − N`: "last
+    /// 30d" is "since the quarter hour 30 days ago". Spend older than the raw window is kept in
+    /// quarter-hour rollups, which cannot be split, so a span that starts on a quarter hour gives
+    /// the same number whether its far end is raw or rolled up. Calendar periods start at a local
+    /// midnight, which is a quarter hour in every zone. The limit week is the window in force and
+    /// always lies inside the raw window.
     pub fn span(&self, now: DateTime<Utc>, limit_week: Option<Span>) -> Span {
         let today = now.with_timezone(&Local).date_naive();
         let end = now + Duration::seconds(1);
@@ -115,11 +140,11 @@ impl Period {
                 end: local_midnight(today),
             },
             Period::Hours(h) => Span {
-                start: now - Duration::hours(*h),
+                start: quarter_floor(now - Duration::hours(*h)),
                 end,
             },
             Period::Days(d) => Span {
-                start: now - Duration::days(*d),
+                start: quarter_floor(now - Duration::days(*d)),
                 end,
             },
             Period::Month => Span {
@@ -232,6 +257,73 @@ mod tests {
             .unwrap()
             .with_timezone(&tz);
         assert_eq!(old.format("%Y-%m-%d").to_string(), "2026-11-21");
+    }
+
+    #[test]
+    fn rolling_periods_start_on_a_quarter_hour() {
+        let now = DateTime::parse_from_rfc3339("2026-11-22T10:37:12.345Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let end = now + Duration::seconds(1);
+        // 10:37:12.345 minus 7 days is 11-15 10:37:12.345, floored to 10:30.
+        assert_eq!(
+            Period::Days(7).span(now, None),
+            Span {
+                start: t("2026-11-15T10:30:00Z"),
+                end
+            }
+        );
+        assert_eq!(
+            Period::Hours(24).span(now, None).start,
+            t("2026-11-21T10:30:00Z")
+        );
+        assert_eq!(
+            Period::Hours(1).span(now, None).start,
+            t("2026-11-22T09:30:00Z")
+        );
+        // Already on a quarter hour: unchanged.
+        let on = t("2026-11-22T10:45:00Z");
+        assert_eq!(
+            Period::Days(30).span(on, None).start,
+            t("2026-10-23T10:45:00Z")
+        );
+        // The rolling figure moves in quarter-hour steps: one bucket later, one bucket on.
+        let a = Period::Days(7)
+            .span(t("2026-11-22T10:44:59.999Z"), None)
+            .start;
+        let b = Period::Days(7).span(t("2026-11-22T10:45:00Z"), None).start;
+        assert_eq!(b - a, Duration::minutes(15));
+        // Negative times floor down, not towards zero.
+        assert_eq!(
+            quarter_floor(t("1969-12-31T23:59:00Z")),
+            t("1969-12-31T23:45:00Z")
+        );
+        // The limit week is the window in force, never floored.
+        let week = Span {
+            start: t("2026-11-18T09:07:00Z"),
+            end,
+        };
+        assert_eq!(Period::LimitWeek.span(now, Some(week)), week);
+        // Calendar periods start at local midnights, which are quarter hours in every zone.
+        for p in [Period::Today, Period::Yesterday, Period::Month] {
+            assert_eq!(p.span(now, None).start.timestamp_millis() % BUCKET_MS, 0);
+        }
+    }
+
+    #[test]
+    fn the_previous_period_has_the_same_length_and_starts_on_a_quarter_hour() {
+        let t = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+        let now = t("2026-11-22T10:37:12Z");
+        let span = Period::Days(7).span(now, None);
+        let prev = span.previous();
+        assert_eq!(prev.end, span.start);
+        // The span is 7 days, 7 minutes and 13 seconds long (10:30 to 10:37:13); the previous
+        // one starts that much earlier, floored: 11-08 10:22:47 → 10:15.
+        assert_eq!(prev.start, t("2026-11-08T10:15:00Z"));
+        assert_eq!(prev.start.timestamp_millis() % BUCKET_MS, 0);
+        assert!(prev.end - prev.start >= span.end - span.start);
+        assert!(prev.end - prev.start < span.end - span.start + Duration::minutes(15));
     }
 
     #[test]

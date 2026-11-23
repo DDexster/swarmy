@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::params_from_iter;
 use serde::Serialize;
 
+use super::archive::{self, Plan};
 use super::{Index, from_ms, ms};
 use crate::core::limits::{Reading, WindowKind};
 use crate::core::period::{BUCKET_MS, Span, bucket_start};
@@ -127,9 +128,10 @@ pub struct Row {
     pub pending: u64,
 }
 
-/// `FROM requests r` with only the joins the other parts of the query refer to: SQLite does not
-/// drop unused LEFT JOINs, and each one costs a lookup per row.
-fn from_for(parts: &[&str]) -> String {
+/// `FROM requests r` (or the union with the rollups, when the plan reaches them) with only the
+/// joins the other parts of the query refer to: SQLite does not drop unused LEFT JOINs, and each
+/// one costs a lookup per row.
+fn from_for(plan: Plan, parts: &[&str]) -> String {
     let uses = |alias: char| {
         parts.iter().any(|p| {
             let b = p.as_bytes();
@@ -140,7 +142,7 @@ fn from_for(parts: &[&str]) -> String {
             })
         })
     };
-    let mut s = String::from("FROM requests r");
+    let mut s = format!("FROM {} r", plan.source());
     if uses('p') {
         s.push_str(" LEFT JOIN projects p ON p.cwd = r.cwd");
     }
@@ -156,17 +158,15 @@ fn from_for(parts: &[&str]) -> String {
     s
 }
 
-fn where_clause(span: Span, f: &Filter, args: &mut Vec<rusqlite::types::Value>) -> String {
+fn where_clause(plan: Plan, f: &Filter, args: &mut Vec<rusqlite::types::Value>) -> String {
     use rusqlite::types::Value as V;
     let mut w = vec![
         "r.ts >= ?".to_string(),
         "r.ts < ?".to_string(),
         "r.model != '<synthetic>'".to_string(),
     ];
-    args.push(V::Integer(ms(span
-        .start
-        .max(DateTime::<Utc>::from_timestamp(0, 0).unwrap()))));
-    args.push(V::Integer(ms(span.end)));
+    args.push(V::Integer(plan.start));
+    args.push(V::Integer(plan.end));
     if let Some(a) = &f.account {
         // A uuid uses the (account_uuid, ts) index; an email is looked up once.
         if a.contains('@') {
@@ -191,10 +191,6 @@ fn where_clause(span: Span, f: &Filter, args: &mut Vec<rusqlite::types::Value>) 
     }
     format!("WHERE {}", w.join(" AND "))
 }
-
-/// Request count, token sums, then cost (NULL costs left out), unpriced and pending counts.
-const SUMS: &str = "COUNT(*), SUM(r.input), SUM(r.cw5), SUM(r.cw1h), SUM(r.cread), SUM(r.output), SUM(r.thinking), SUM(r.web),
-  TOTAL(r.cost), SUM(r.priced = 0), SUM(r.priced IS NULL)";
 
 /// (requests, usage, cost, unpriced, pending)
 type Sums = (u64, Usage, f64, u64, u64);
@@ -230,40 +226,47 @@ impl Index {
             return self.spend_by_time(dim, span, f);
         }
         let (key, label) = dim.exprs();
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
-        let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
-        let from = from_for(&[key, label, &wh]);
-        let sql = format!("SELECT {key}, {label}, {SUMS} {from} {wh} GROUP BY 1 ORDER BY {order}");
-        let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params_from_iter(args), |r| {
-            let (requests, usage, cost, unpriced, pending) = row_usage(r, 2)?;
-            Ok(Row {
-                key: r.get(0)?,
-                label: r.get(1)?,
-                requests,
-                usage,
-                cost,
-                unpriced,
-                pending,
-            })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        archive::read(&self.conn, span, false, |c, p| {
+            let mut args = Vec::new();
+            let wh = where_clause(p, f, &mut args);
+            let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
+            let from = from_for(p, &[key, label, &wh]);
+            let sums = p.sums();
+            let sql =
+                format!("SELECT {key}, {label}, {sums} {from} {wh} GROUP BY 1 ORDER BY {order}");
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(params_from_iter(args), |r| {
+                let (requests, usage, cost, unpriced, pending) = row_usage(r, 2)?;
+                Ok(Row {
+                    key: r.get(0)?,
+                    label: r.get(1)?,
+                    requests,
+                    usage,
+                    cost,
+                    unpriced,
+                    pending,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Sums per UTC quarter hour; local-time grouping happens in Rust (`time_key`), which is far
     /// cheaper than SQLite's `localtime` on every row and exact in every zone.
     fn buckets(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
-        let from = from_for(&[&wh]);
-        let sql = format!("SELECT r.ts / {BUCKET_MS}, {SUMS} {from} {wh} GROUP BY 1");
-        let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params_from_iter(args), |r| {
-            let (n, u, c, up, pe) = row_usage(r, 1)?;
-            Ok((r.get::<_, i64>(0)?, n, u, c, up, pe))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        archive::read(&self.conn, span, false, |c, p| {
+            let mut args = Vec::new();
+            let wh = where_clause(p, f, &mut args);
+            let from = from_for(p, &[&wh]);
+            let sums = p.sums();
+            let sql = format!("SELECT r.ts / {BUCKET_MS}, {sums} {from} {wh} GROUP BY 1");
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(params_from_iter(args), |r| {
+                let (n, u, c, up, pe) = row_usage(r, 1)?;
+                Ok((r.get::<_, i64>(0)?, n, u, c, up, pe))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     fn time_key(dim: Dim, bucket: i64) -> String {
@@ -309,28 +312,30 @@ impl Index {
         }
         let (ka, la) = a.exprs();
         let (kb, _) = b.exprs();
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
         let la = if la.starts_with("MAX(") {
             la.to_string()
         } else {
             format!("MAX({la})")
         };
-        let from = from_for(&[&la, kb, ka, &wh]);
-        let sql = format!("SELECT {la}, {kb}, TOTAL(r.cost) {from} {wh} GROUP BY {ka}, {kb}");
-        let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params_from_iter(args), |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-            ))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        archive::read(&self.conn, span, false, |c, p| {
+            let mut args = Vec::new();
+            let wh = where_clause(p, f, &mut args);
+            let from = from_for(p, &[&la, kb, ka, &wh]);
+            let sql = format!("SELECT {la}, {kb}, TOTAL(r.cost) {from} {wh} GROUP BY {ka}, {kb}");
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(params_from_iter(args), |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
+                ))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     pub fn total(&self, span: Span, f: &Filter) -> anyhow::Result<Row> {
-        total_on(&self.conn, span, f)
+        archive::read(&self.conn, span, false, |c, p| total_on(c, p, f))
     }
 
     /// `total` together with the price fingerprint its costs were computed with, read in one
@@ -338,7 +343,7 @@ impl Index {
     pub fn total_priced(&self, span: Span, f: &Filter) -> anyhow::Result<(Row, Option<String>)> {
         let tx = self.conn.unchecked_transaction()?;
         let fp = super::schema::meta(&tx, "price_fp")?;
-        let row = total_on(&tx, span, f)?;
+        let row = total_on(&tx, archive::plan(&tx, span, false)?, f)?;
         tx.commit()?;
         Ok((row, fp))
     }
@@ -348,6 +353,10 @@ impl Index {
     /// minute), keyed by the settled generation and the price fingerprint read together with the
     /// total: a reprice, a re-attribution or a late request (here or in another process) is never
     /// cached away. A total with requests still waiting for a price is not remembered.
+    ///
+    /// Limit calibration is the one reader whose span may start off the quarter hour in the
+    /// archive (a manual reset of an account idle for longer than the raw window): the start is
+    /// floored there (`archive::plan`).
     pub fn settled_total(
         &self,
         account: &str,
@@ -359,7 +368,7 @@ impl Index {
             ..Default::default()
         };
         if ms(span.end) >= ms(now) - super::SETTLED_AFTER_MS {
-            return Ok(self.total(span, &filter)?.cost);
+            return Ok(archive::read(&self.conn, span, true, |c, p| total_on(c, p, &filter))?.cost);
         }
         let tx = self.conn.unchecked_transaction()?;
         let generation = super::schema::meta(&tx, "settled_gen")?;
@@ -378,7 +387,7 @@ impl Index {
         {
             return Ok(*v);
         }
-        let row = total_on(&tx, span, &filter)?;
+        let row = total_on(&tx, archive::plan(&tx, span, true)?, &filter)?;
         tx.commit()?;
         if row.pending == 0
             && let Some(fp) = fp
@@ -398,18 +407,21 @@ impl Index {
         span: Span,
         f: &Filter,
     ) -> anyhow::Result<Vec<(String, String, u64)>> {
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
-        let sql = format!(
-            "SELECT r.requested_model, r.model, COUNT(*) {} {wh} AND r.requested_model IS NOT NULL AND r.requested_model != ''
-             AND r.requested_model != r.model GROUP BY 1, 2 ORDER BY 3 DESC",
-            from_for(&[&wh])
-        );
-        let mut st = self.conn.prepare(&sql)?;
-        let rows = st.query_map(params_from_iter(args), |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        archive::read(&self.conn, span, false, |c, p| {
+            let mut args = Vec::new();
+            let wh = where_clause(p, f, &mut args);
+            let sql = format!(
+                "SELECT r.requested_model, r.model, {} {} {wh} AND r.requested_model IS NOT NULL AND r.requested_model != ''
+                 AND r.requested_model != r.model GROUP BY 1, 2 ORDER BY 3 DESC",
+                p.count(),
+                from_for(p, &[&wh])
+            );
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(params_from_iter(args), |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Every stored utilization reading of an account and window, oldest first.
@@ -460,17 +472,25 @@ impl Index {
 
     /// Claude Code's own totals vs. the transcript sums, over sessions that have both:
     /// (sessions, claude code USD, transcript USD).
+    /// A session's transcript sum covers its rolled-up part too: sessions resumed after weeks
+    /// compare in full.
     pub fn cost_crosscheck(&self, span: Span) -> anyhow::Result<(u64, f64, f64)> {
-        let sql = "SELECT COUNT(*), SUM(cs.total_usd), SUM(t.cost) FROM cost_states cs
-                   JOIN (SELECT seat, session_id, TOTAL(cost) AS cost, MAX(ts) AS last FROM requests GROUP BY 1, 2) t
-                     ON t.seat = cs.seat AND t.session_id = cs.session_id
-                   WHERE t.last >= ?1 AND t.last < ?2";
+        let source = if archive::rolled_until(&self.conn)? > 0 {
+            "(SELECT seat, session_id, cost, ts FROM requests
+              UNION ALL SELECT seat, session_id, cost, last_ts FROM usage_rollup)"
+        } else {
+            "requests"
+        };
+        let sql = format!(
+            "SELECT COUNT(*), SUM(cs.total_usd), SUM(t.cost) FROM cost_states cs
+             JOIN (SELECT seat, session_id, TOTAL(cost) AS cost, MAX(ts) AS last FROM {source} GROUP BY 1, 2) t
+               ON t.seat = cs.seat AND t.session_id = cs.session_id
+             WHERE t.last >= ?1 AND t.last < ?2"
+        );
         Ok(self.conn.query_row(
-            sql,
+            &sql,
             rusqlite::params![
-                ms(span
-                    .start
-                    .max(DateTime::<Utc>::from_timestamp(0, 0).unwrap())),
+                ms(span.start.max(DateTime::<Utc>::UNIX_EPOCH)),
                 ms(span.end)
             ],
             |r| {
@@ -500,17 +520,23 @@ impl Index {
     }
 
     pub fn api_errors(&self, span: Span) -> anyhow::Result<Vec<(String, u64)>> {
-        let mut st = self.conn.prepare("SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 AND ts < ?2 GROUP BY 1 ORDER BY 2 DESC")?;
-        let rows = st.query_map(
-            rusqlite::params![
-                ms(span
-                    .start
-                    .max(DateTime::<Utc>::from_timestamp(0, 0).unwrap())),
-                ms(span.end)
-            ],
-            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
-        )?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        archive::read(&self.conn, span, false, |c, p| {
+            let (b0, b1) = p.buckets();
+            let sql = if p.archive {
+                format!(
+                    "SELECT kind, SUM(n) FROM (SELECT kind, 1 AS n FROM api_errors WHERE ts >= ?1 AND ts < ?2
+                       UNION ALL SELECT kind, n FROM api_error_rollup WHERE bucket >= {b0} AND bucket < {b1})
+                     GROUP BY 1 ORDER BY 2 DESC, 1"
+                )
+            } else {
+                "SELECT kind, COUNT(*) FROM api_errors WHERE ts >= ?1 AND ts < ?2 GROUP BY 1 ORDER BY 2 DESC, 1".into()
+            };
+            let mut st = c.prepare(&sql)?;
+            let rows = st.query_map(rusqlite::params![p.start, p.end], |r| {
+                Ok((r.get(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
     }
 
     /// Spend per bucket of `bucket_minutes` over a span, for sparklines and burn rate.
@@ -520,32 +546,34 @@ impl Index {
         bucket_minutes: i64,
         f: &Filter,
     ) -> anyhow::Result<Vec<f64>> {
-        let mut args = Vec::new();
-        let wh = where_clause(span, f, &mut args);
         let bucket = bucket_minutes.max(1) * 60_000;
         let start = ms(span.start);
         let n = (((ms(span.end) - start) as f64) / bucket as f64)
             .ceil()
             .max(1.0) as usize;
-        let sql = format!(
-            "SELECT (r.ts - {start}) / {bucket}, TOTAL(r.cost) {} {wh} GROUP BY 1",
-            from_for(&[&wh])
-        );
-        let mut st = self.conn.prepare(&sql)?;
-        let mut out = vec![0.0; n];
-        let rows = st.query_map(params_from_iter(args), |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-            ))
-        })?;
-        for row in rows {
-            let (i, c) = row?;
-            if (i as usize) < n && i >= 0 {
-                out[i as usize] = c;
+        archive::read(&self.conn, span, false, |c, p| {
+            let mut args = Vec::new();
+            let wh = where_clause(p, f, &mut args);
+            let sql = format!(
+                "SELECT (r.ts - {start}) / {bucket}, TOTAL(r.cost) {} {wh} GROUP BY 1",
+                from_for(p, &[&wh])
+            );
+            let mut st = c.prepare(&sql)?;
+            let mut out = vec![0.0; n];
+            let rows = st.query_map(params_from_iter(args), |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+                ))
+            })?;
+            for row in rows {
+                let (i, c) = row?;
+                if (i as usize) < n && i >= 0 {
+                    out[i as usize] = c;
+                }
             }
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 }
 
@@ -562,11 +590,11 @@ where
     }
 }
 
-fn total_on(conn: &rusqlite::Connection, span: Span, f: &Filter) -> anyhow::Result<Row> {
+fn total_on(conn: &rusqlite::Connection, plan: Plan, f: &Filter) -> anyhow::Result<Row> {
     let mut args = Vec::new();
-    let wh = where_clause(span, f, &mut args);
-    let from = from_for(&[&wh]);
-    let sql = format!("SELECT {SUMS} {from} {wh}");
+    let wh = where_clause(plan, f, &mut args);
+    let from = from_for(plan, &[&wh]);
+    let sql = format!("SELECT {} {from} {wh}", plan.sums());
     Ok(conn.query_row(&sql, params_from_iter(args), |r| {
         let (requests, usage, cost, unpriced, pending) = row_usage(r, 0)?;
         Ok(Row {

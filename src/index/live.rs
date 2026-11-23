@@ -1,7 +1,7 @@
 //! Typed reads for the live view (`crate::live`): the SQL over the index tables stays here, so the
 //! schema has one owner. Times are epoch milliseconds, as stored.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
@@ -97,21 +97,39 @@ pub struct ToolCallRow {
     pub is_error: bool,
 }
 
+/// An agent's rolled-up part (`agent_rollup`), by the agent of `?1`, `?2`, `?3`: an agent
+/// running for longer than the raw window, or a session resumed after weeks.
+macro_rules! rolled {
+    () => {
+        "FROM agent_rollup WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3"
+    };
+}
+/// The same, for the agent `a` of the outer query (as `x`).
+macro_rules! rolled_of_a {
+    () => {
+        "FROM agent_rollup x WHERE x.seat = a.seat AND x.session_id = a.session_id AND x.agent_id = a.agent_id"
+    };
+}
+
 impl Index {
-    /// Agents active since `recent`, unfinished ones active since `unfinished_since`, and every
-    /// main thread (the caller keeps the ones that matter).
+    /// Agents active since `recent`, unfinished ones active since `unfinished_since`, and the
+    /// main threads of the `live` sessions (seat, session id) however long they have been idle.
+    /// Bounded in time: `agents` keeps every agent ever seen (a dimension table), and this runs
+    /// every second.
     pub fn live_agent_rows(
         &self,
         recent: DateTime<Utc>,
         unfinished_since: DateTime<Utc>,
+        live: &HashSet<(String, String)>,
     ) -> anyhow::Result<Vec<AgentRow>> {
-        let mut st = self.conn.prepare_cached(
-            "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
+        macro_rules! columns {
+            () => {
+                "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
                     a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts
-             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
-             WHERE a.last_ts >= ?1 OR (a.finished = 0 AND a.last_ts >= ?2) OR a.agent_id = ''",
-        )?;
-        let rows = st.query_map(params![ms(recent), ms(unfinished_since)], |r| {
+             FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id"
+            };
+        }
+        let row = |r: &rusqlite::Row| {
             Ok(AgentRow {
                 seat: r.get(0)?,
                 session_id: r.get(1)?,
@@ -129,8 +147,34 @@ impl Index {
                 cwd: r.get(13)?,
                 first_ts: r.get(14)?,
             })
-        })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        };
+        let mut out: Vec<AgentRow> = self
+            .conn
+            .prepare_cached(concat!(
+                columns!(),
+                " WHERE a.last_ts >= MIN(?1, ?2) AND (a.last_ts >= ?1 OR a.finished = 0)"
+            ))?
+            .query_map(params![ms(recent), ms(unfinished_since)], row)?
+            .collect::<Result<_, _>>()?;
+        let mut main = self.conn.prepare_cached(concat!(
+            columns!(),
+            " WHERE a.seat = ?1 AND a.session_id = ?2 AND a.agent_id = ''"
+        ))?;
+        let mut sessions: Vec<&(String, String)> = live.iter().collect();
+        sessions.sort();
+        for (seat, session_id) in sessions {
+            let listed = out
+                .iter()
+                .any(|r| r.agent_id.is_empty() && &r.seat == seat && &r.session_id == session_id);
+            if !listed && let Some(r) = main.query_row(params![seat, session_id], row).optional()? {
+                out.push(r);
+            }
+        }
+        // Sorted here: an `ORDER BY` makes SQLite walk the primary key instead of the time index.
+        out.sort_by(|x, y| {
+            (&x.seat, &x.session_id, &x.agent_id).cmp(&(&y.seat, &y.session_id, &y.agent_id))
+        });
+        Ok(out)
     }
 
     /// Project name by working directory.
@@ -158,11 +202,16 @@ impl Index {
             .optional()?)
     }
 
-    /// Requests and their total cost.
+    /// Requests and their total cost over the agent's lifetime (its rolled-up part included).
     pub fn agent_totals(&self, a: AgentKey) -> anyhow::Result<(u64, f64)> {
-        let mut st = self.conn.prepare_cached(
-            "SELECT COUNT(*), TOTAL(cost) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3",
-        )?;
+        let mut st = self.conn.prepare_cached(concat!(
+            "SELECT COUNT(*) + COALESCE((SELECT requests ",
+            rolled!(),
+            "), 0), TOTAL(cost) + COALESCE((SELECT cost ",
+            rolled!(),
+            "), 0)
+             FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3"
+        ))?;
         let (n, cost): (i64, f64) = st
             .query_row(params![a.seat, a.session_id, a.agent_id], |x| {
                 Ok((x.get(0)?, x.get(1)?))
@@ -243,7 +292,8 @@ impl Index {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// A whole session's spend, and its spend since `since`.
+    /// A whole session's spend (its rolled-up part included), and its spend since `since`, a
+    /// recent time (rolled-up spend is older than the raw window).
     pub fn session_spend(
         &self,
         seat: &str,
@@ -251,7 +301,9 @@ impl Index {
         since: DateTime<Utc>,
     ) -> anyhow::Result<(f64, f64)> {
         let mut st = self.conn.prepare_cached(
-            "SELECT TOTAL(cost), TOTAL(CASE WHEN ts >= ?3 THEN cost ELSE 0 END) FROM requests WHERE seat = ?1 AND session_id = ?2",
+            "SELECT TOTAL(cost) + (SELECT TOTAL(cost) FROM agent_rollup WHERE seat = ?1 AND session_id = ?2),
+                    TOTAL(CASE WHEN ts >= ?3 THEN cost ELSE 0 END)
+             FROM requests WHERE seat = ?1 AND session_id = ?2",
         )?;
         Ok(st.query_row(params![seat, session_id, ms(since)], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -282,13 +334,15 @@ impl Index {
 
     /// Agents that finished since `since`, newest first (at most 60).
     pub fn recently_done(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<DoneAgent>> {
-        let mut st = self.conn.prepare_cached(
+        let mut st = self.conn.prepare_cached(concat!(
             "SELECT COALESCE(a.description, a.agent_id), s.cwd, a.first_ts, a.last_ts,
-                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
-                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1)
+                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id)
+                      + COALESCE((SELECT x.cost ", rolled_of_a!(), "), 0),
+                    COALESCE((SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts DESC LIMIT 1),
+                             (SELECT x.last_model ", rolled_of_a!(), "))
              FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id
-             WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60",
-        )?;
+             WHERE a.agent_id != '' AND a.finished = 1 AND a.last_ts >= ?1 ORDER BY a.last_ts DESC LIMIT 60"
+        ))?;
         let rows = st.query_map(params![ms(since)], |r| {
             Ok(DoneAgent {
                 name: r.get(0)?,
@@ -315,13 +369,15 @@ impl Index {
 
     /// Agents spawned, or finished, since `since`.
     pub fn agent_events(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<AgentEventRow>> {
-        let mut st = self.conn.prepare_cached(
+        let mut st = self.conn.prepare_cached(concat!(
             "SELECT COALESCE(a.description, a.agent_type, a.agent_id), a.first_ts, a.last_ts, a.finished,
-                    (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1),
-                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id),
+                    COALESCE((SELECT x.first_model ", rolled_of_a!(), "),
+                             (SELECT model FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id ORDER BY ts LIMIT 1)),
+                    (SELECT TOTAL(cost) FROM requests r WHERE r.seat = a.seat AND r.session_id = a.session_id AND r.agent_id = a.agent_id)
+                      + COALESCE((SELECT x.cost ", rolled_of_a!(), "), 0),
                     a.effort
-             FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))",
-        )?;
+             FROM agents a WHERE a.agent_id != '' AND (a.first_ts >= ?1 OR (a.finished = 1 AND a.last_ts >= ?1))"
+        ))?;
         let rows = st.query_map(params![ms(since)], |r| {
             Ok(AgentEventRow {
                 name: r.get(0)?,

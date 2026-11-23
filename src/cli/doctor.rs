@@ -1,16 +1,15 @@
 //! `swarmy doctor`: what was found, what is readable, what looks off.
 
-use chrono::Duration;
-
 use crate::claude::registry::{self, SessionStatus};
 use crate::claude::transcript::ParseStats;
-use crate::core::period::Span;
+use crate::core::period::Period;
 use crate::index::query::Filter;
 use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 
 use crate::app::context::Ctx;
+use crate::index::Index;
 
 pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let p = &ctx.painter;
@@ -177,7 +176,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
 
     println!();
     println!("{}", p.paint("INDEX", Tone::Header));
-    let (idx, stats) = ctx.index()?;
+    let (mut idx, stats) = ctx.index()?;
     println!(
         "{}",
         ok(&format!(
@@ -227,10 +226,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
-    let week = Span {
-        start: ctx.now - Duration::days(7),
-        end: ctx.now,
-    };
+    let week = Period::Days(7).span(ctx.now, None);
     let total = idx.total(week, &Filter::default())?;
     if total.unpriced > 0 {
         println!(
@@ -269,6 +265,13 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 list.join(", ")
             ))
         );
+    }
+
+    println!();
+    println!("{}", p.paint("STORAGE", Tone::Header));
+    idx.sample_storage(ctx.now.with_timezone(&chrono::Local).date_naive())?;
+    for line in storage(ctx, &mut idx)? {
+        println!("{line}");
     }
 
     println!();
@@ -312,4 +315,236 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         }
     );
     Ok(())
+}
+
+/// The STORAGE section: the index's size, the raw window and the rollups, growth and the
+/// 12-month projection against the budget, the seats' transcript retention, the last
+/// compaction, and what waits (the one-time VACUUM, rows priced by an old long-context band).
+fn storage(ctx: &Ctx, idx: &mut Index) -> anyhow::Result<Vec<String>> {
+    let p = &ctx.painter;
+    let ok = |s: &str| format!("{} {s}", p.paint("[ OK ]", Tone::Good));
+    let warn = |s: &str| format!("{} {s}", p.paint("[WARN]", Tone::Warn));
+    let info = |s: &str| format!("{} {s}", p.paint("[ .. ]", Tone::Dim));
+    let hb = fmt::human_bytes;
+    let local = |t: i64| crate::index::from_ms(t).with_timezone(&chrono::Local);
+    let keep = ctx.keep_raw_days(None)?;
+    let st = idx.storage_report()?;
+    let mut out = Vec::new();
+    out.push(ok(&format!(
+        "index {} (+ WAL {}, {} free) · auto-vacuum {}",
+        hb(st.file.bytes()),
+        hb(st.wal_bytes),
+        hb(st.file.free_bytes()),
+        if st.file.incremental {
+            "incremental"
+        } else {
+            "off"
+        }
+    )));
+    // Since the last compaction's cutoff, or the oldest request when nothing was rolled up.
+    let since = if st.rolled_until > 0 {
+        Some(st.rolled_until)
+    } else {
+        st.oldest_raw
+    };
+    out.push(info(&format!(
+        "detail   since {}: {} requests, {} tool calls ≈ {} · keep_raw_days = {keep}",
+        since.map_or("-".into(), |t| local(t).format("%Y-%m-%d").to_string()),
+        fmt::count(st.raw_requests),
+        fmt::count(st.raw_tool_calls),
+        hb(crate::core::storage::raw_bytes(
+            st.raw_requests,
+            st.raw_tool_calls
+        ))
+    )));
+    out.push(info(&match st.archive_since {
+        Some(t) => format!(
+            "history  since {} in rollups: {} rows ≈ {}",
+            local(t).format("%Y-%m-%d"),
+            fmt::count(st.usage_rows + st.tool_rows + st.edit_rows),
+            hb(st.rollup_bytes())
+        ),
+        None => "history  nothing rolled up yet: all of it is per-request detail".into(),
+    }));
+    let o = st.outlook(ctx.now, keep);
+    let budget = ctx.config.storage.budget_mb << 20;
+    let pace = if o.from_samples {
+        format!("over the last {} days", st.samples.len())
+    } else {
+        "estimated from the requests a day".into()
+    };
+    let growth = format!(
+        "growth   +{}/day {pace} → ≈ {} in 12 months (budget {} MB)",
+        hb(o.per_day as u64),
+        hb(o.in_12_months),
+        ctx.config.storage.budget_mb
+    );
+    out.push(if o.in_12_months > budget {
+        warn(&growth)
+    } else {
+        ok(&growth)
+    });
+    let mut retention: Vec<(u32, bool, usize)> = Vec::new();
+    for (_, days, set) in ctx.retention() {
+        match retention.iter_mut().find(|r| r.0 == days && r.1 == set) {
+            Some(r) => r.2 += 1,
+            None => retention.push((days, set, 1)),
+        }
+    }
+    if !retention.is_empty() {
+        let parts: Vec<String> = retention
+            .iter()
+            .map(|(days, set, n)| {
+                format!(
+                    "after {days} days on {n} seat{} ({})",
+                    if *n == 1 { "" } else { "s" },
+                    if *set {
+                        "cleanupPeriodDays"
+                    } else {
+                        "cleanupPeriodDays, default"
+                    }
+                )
+            })
+            .collect();
+        out.push(info(&format!(
+            "claude   transcripts are deleted {}: older history exists only in this index",
+            parts.join(", ")
+        )));
+    }
+    out.push(info(&match &st.last_compaction {
+        Some(c) => {
+            let at = local(c.at);
+            let day = if at.date_naive() == ctx.now.with_timezone(&chrono::Local).date_naive() {
+                "today".to_string()
+            } else {
+                at.format("%a %d %b").to_string()
+            };
+            format!(
+                "last compaction {day} {}, {} chunks, {} requests, {:.1} s · skipped as already rolled up: {} records",
+                at.format("%H:%M"),
+                c.chunks,
+                fmt::count(c.requests),
+                c.ms as f64 / 1000.0,
+                fmt::count(st.skipped_records)
+            )
+        }
+        None => "last compaction never: `swarmy compact --dry-run` shows what it would do".into(),
+    }));
+    if !ctx.config.storage.auto_compact {
+        out.push(info(
+            "auto_compact = false: the dashboard does not compact; `swarmy compact` does",
+        ));
+    }
+    if let Some(why) = idx.vacuum_skipped()? {
+        out.push(warn(&format!(
+            "auto-vacuum off: the one-time VACUUM {why}; `swarmy compact --vacuum` runs it now"
+        )));
+    } else if !st.file.incremental && st.file.free_pages > 0 {
+        out.push(info(&format!(
+            "auto-vacuum off: {} of free pages stay in the file for new rows; the dashboard (on mains power) or `swarmy compact --vacuum` gives them back once",
+            hb(st.file.free_bytes())
+        )));
+    }
+    for d in idx.band_drift(&ctx.prices)? {
+        out.push(warn(&format!(
+            "{} {}..{}: {} rolled-up rows keep the long-context band of an older price (its threshold changed)",
+            d.model,
+            d.first,
+            d.last,
+            fmt::count(d.rows)
+        )));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::claude::procs::ProcTable;
+    use crate::config::{Config, Dirs};
+    use crate::core::pricing::PriceBook;
+    use crate::index::archive_scenarios::{NOW, populate, refresh};
+    use crate::index::compact::CompactOpts;
+    use crate::index::scenarios::{World, at};
+    use crate::ui::style::{ColorChoice, Painter};
+
+    #[test]
+    fn the_storage_section() {
+        let w = World::new(&["work", "home", "lab"]);
+        populate(&w);
+        std::fs::write(
+            w.seats[2].dir.join("settings.json"),
+            r#"{"cleanupPeriodDays": 60}"#,
+        )
+        .unwrap();
+        let mut idx = w.index("i.sqlite");
+        refresh(&w, &mut idx);
+        let ctx = Ctx {
+            dirs: Dirs {
+                data: w.dir.path().join("data"),
+                config: w.dir.path().join("config"),
+                home: w.dir.path().to_path_buf(),
+            },
+            config: Config::default(),
+            seats: w.seats.clone(),
+            seat_info: Vec::new(),
+            prices: PriceBook::builtin(),
+            procs: ProcTable::empty(),
+            painter: Painter::new(ColorChoice::Never),
+            mask: false,
+            now: at(NOW),
+            login_labels: Default::default(),
+            login_tiers: Default::default(),
+        };
+        let text = |idx: &mut Index| storage(&ctx, idx).unwrap().join("\n");
+        let before = text(&mut idx);
+        assert!(before.contains("auto-vacuum off"), "{before}");
+        assert!(before.contains("nothing rolled up yet"), "{before}");
+        assert!(before.contains("last compaction never"), "{before}");
+        assert!(before.contains("keep_raw_days = 14"), "{before}");
+        assert!(
+            before.contains(
+                "transcripts are deleted after 30 days on 2 seats (cleanupPeriodDays, default), after 60 days on 1 seat (cleanupPeriodDays)"
+            ),
+            "{before}"
+        );
+        assert!(
+            before.contains("estimated from the requests a day")
+                && before.contains("(budget 1024 MB)"),
+            "{before}"
+        );
+        idx.compact(&CompactOpts {
+            keep_raw_days: 14,
+            now: at(NOW),
+            prices: &ctx.prices,
+            seats: &ctx.seats,
+            max_chunks: None,
+        })
+        .unwrap();
+        let after = text(&mut idx);
+        assert!(after.contains("history  since 2026-09-2"), "{after}");
+        assert!(after.contains(" in rollups: "), "{after}");
+        assert!(before.contains("detail   since 2026-09-21: "), "{before}");
+        // From rolled_until: at most a chunk before the local midnight 14 days back.
+        let until = idx.storage_report().unwrap().rolled_until;
+        let since = crate::index::from_ms(until).with_timezone(&chrono::Local);
+        assert!(
+            after.contains(&format!("detail   since {}: ", since.format("%Y-%m-%d"))),
+            "{after}"
+        );
+        assert!(
+            after.contains("chunks") && after.contains("skipped as already rolled up: 0"),
+            "{after}"
+        );
+        assert!(after.contains("[ OK ] growth"), "under the budget: {after}");
+        assert!(after.contains("of free pages stay in the file"), "{after}");
+        idx.vacuum_to_incremental(true, None, false)
+            .unwrap()
+            .unwrap_err();
+        let waits = text(&mut idx);
+        assert!(
+            waits.contains("[WARN] auto-vacuum off: the one-time VACUUM waits for mains power"),
+            "{waits}"
+        );
+    }
 }

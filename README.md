@@ -141,12 +141,16 @@ swarmy models -p 7d          # per-model statistics
 swarmy accounts              # seats, saved logins, limit left on each
 swarmy doctor                # what was found and whether it is readable
 swarmy prices                # the price in force for every model and its source
+swarmy compact               # roll old per-request detail up (--dry-run, --verify, --vacuum)
 swarmy setup                 # optional: status line with exact limits, saved logins
 swarmy jump                  # switch tmux to the session that has waited for you longest
 ```
 
 Periods: `today`, `yesterday`, `week` (the current limit window), `month`, `all`, `24h`, `7d`,
-`YYYY-MM-DD`, `FROM..TO`. Every report takes `--account`, `--seat`, `--project`, `--model` filters
+`YYYY-MM-DD`, `FROM..TO`. Rolling periods (`24h`, `7d`, …) start on the quarter hour: `7d` at
+10:37 counts from 10:30 seven days ago, so the figure moves in 15-minute steps. Spend is kept
+per quarter hour once it is old, and a period that starts on one gives the same number however
+old its data is. Every report takes `--account`, `--seat`, `--project`, `--model` filters
 and `--format table|json|csv`. `--mask` hides emails, names and full paths (for screenshots).
 
 ### The dashboard
@@ -204,6 +208,27 @@ with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
   readings) decides, then Claude Code's `session-owner` records. Seats logged into the same account
   share one limit, and swapping logins under running sessions does not mix the books.
 - **Projects** are git repositories; worktrees count towards the repository they belong to.
+  The project of a directory is recorded while it exists, so spend of a removed worktree keeps
+  its project.
+- **Old spend.** Per-request detail is kept for `keep_raw_days` (14 by default); older requests
+  are summed per quarter hour with everything a report groups by (seat, session, agent,
+  account, directory, model, effort, fast mode, the long-context band) and kept for good. Every
+  report, panel and period gives the same number before and after (`swarmy compact --verify`
+  proves it on your own index). Prices that change later reprice old quarter hours from their
+  token sums; a login switch found late moves them to the right account.
+
+## Storage
+
+Claude Code deletes transcripts after 30 days (`cleanupPeriodDays` in a seat's
+`settings.json`); after that swarmy's index is the only record of them. The index keeps two weeks
+of per-request detail and quarter-hour rollups for everything older: a heavy user (25k requests
+a day) stays under 0.5 GB after a year instead of ≈ 9 GB. The dashboard rolls up whatever aged
+out every six hours (a day costs about a CPU-second); `swarmy compact` does it by hand,
+`--dry-run` shows what would move, `--verify` checks every total on a scratch copy, and
+`--vacuum` lets an existing index give the freed space back to the disk (the dashboard does that
+once on its own, on mains power). `swarmy doctor` shows the size, the growth per day and where
+it will be in a year; so does the SYSTEM panel. What is gone after two weeks: an old agent's
+per-request chart and tool timeline, exact request times and API error texts.
 
 ## The vault
 
@@ -267,7 +292,17 @@ output = 20
 
 [accounts]                         # display names
 "<account uuid>" = "personal"
+
+[storage]
+keep_raw_days = 14                 # days of per-request detail; older spend is kept per quarter hour
+budget_mb = 1024                   # doctor and SYSTEM warn when a year from now the index passes this
+auto_compact = true                # the dashboard compacts on its own; `swarmy compact` works either way
 ```
+
+`keep_raw_days` is at least 8 (the weekly limit window is always read from per-request detail)
+and at most two days less than the shortest transcript retention of your seats (so a rebuild of
+the index finds every day of detail still on disk); swarmy refuses a value outside that range.
+Nothing is ever deleted because of `budget_mb`.
 
 ## Status
 

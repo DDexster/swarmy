@@ -9,12 +9,15 @@ use std::time::Instant;
 use chrono::Utc;
 
 use super::analytics::{self, SlowParts};
-use super::jobs::{Job, Schedule, TICK_STEP};
+use super::jobs::{
+    COMPACT_CATCH_UP, COMPACT_CATCH_UP_ECO, COMPACT_CHUNKS_PER_RUN, Job, Schedule, TICK_STEP,
+};
 use super::{Msg, SystemView, Wants, debug};
 use crate::app::context::Ctx;
 use crate::claude::procs::ProcTable;
 use crate::claude::registry::{self, LiveSession};
-use crate::core::period::Span;
+use crate::core::period::Period;
+use crate::index::compact::{self, CompactOpts};
 use crate::index::query::{Dim, Filter};
 use crate::index::{Index, Progress};
 use crate::limits;
@@ -76,6 +79,7 @@ pub(super) fn worker(
         super::jobs::print_table();
     }
     let mut disk_cache: Vec<(String, u64)> = Vec::new();
+    let mut storage_cache: Option<crate::core::storage::Outlook> = None;
     let mut login_stamp = login_files_stamp(&ctx);
     let mut seats_changed = false;
     let mut sl_stamp = statusline_stamp(&ctx);
@@ -139,7 +143,8 @@ pub(super) fn worker(
             .iter()
             .flat_map(|s| registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs))
             .collect();
-        let res = if jobs.due(Job::FullRefresh) {
+        let full_refresh = jobs.due(Job::FullRefresh);
+        let res = if full_refresh {
             jobs.done(Job::FullRefresh);
             let mut quiet = |_p: Progress| {};
             idx.refresh(
@@ -162,8 +167,30 @@ pub(super) fn worker(
                 &ctx.prices,
             )
         };
+        let refreshed = res.is_ok();
         if let Err(e) = res {
             send(Msg::Error(format!("{e:#}")));
+        }
+        // Right after a full refresh: prices and accounts are settled then.
+        if full_refresh && refreshed && jobs.due(Job::Compact) {
+            match compact(&ctx, &mut idx, jobs.eco) {
+                Ok(true) => jobs.again_in(
+                    Job::Compact,
+                    if jobs.eco {
+                        COMPACT_CATCH_UP_ECO
+                    } else {
+                        COMPACT_CATCH_UP
+                    },
+                ),
+                Ok(false) => jobs.done(Job::Compact),
+                Err(e) => {
+                    jobs.done(Job::Compact);
+                    if debug() {
+                        eprintln!("compaction failed: {e:#}");
+                    }
+                    send(Msg::Error(format!("compaction: {e:#}")));
+                }
+            }
         }
         marks.push(("sessions+refresh", Instant::now()));
         let t1 = Instant::now();
@@ -261,6 +288,12 @@ pub(super) fn worker(
                     .iter()
                     .map(|s| (s.label.clone(), dir_size(&s.projects_dir())))
                     .collect();
+                match outlook(&ctx, &idx) {
+                    Ok(o) => storage_cache = Some(o),
+                    Err(e) => {
+                        send(Msg::Error(format!("{e:#}")));
+                    }
+                }
                 jobs.done(Job::DiskSizes);
             }
             if wants.lock().unwrap().refresh_analytics {
@@ -285,6 +318,7 @@ pub(super) fn worker(
                 wants: &w,
                 jobs: &jobs,
                 disk: &disk_cache,
+                storage: storage_cache,
                 slow: slow.clone(),
                 reuse_period: if full { None } else { prev_analytics.as_ref() },
                 reuse_limits: if limits_due {
@@ -347,17 +381,57 @@ pub(super) fn worker(
     }
 }
 
+/// The compaction job (`jobs::Job::Compact`): at most a day of chunks, then, once nothing is
+/// left to roll up, the one-time switch to incremental auto-vacuum when it is due (never on
+/// battery). Returns whether a backlog is left for another run soon.
+fn compact(ctx: &Ctx, idx: &mut Index, on_battery: bool) -> anyhow::Result<bool> {
+    if !ctx.config.storage.auto_compact {
+        // `[storage] auto_compact = false`: only the day's size sample (growth, projection).
+        idx.sample_storage(ctx.now.with_timezone(&chrono::Local).date_naive())?;
+        return Ok(false);
+    }
+    let t = Instant::now();
+    let r = idx.compact(&CompactOpts {
+        keep_raw_days: ctx.keep_raw_days(None)?,
+        now: ctx.now,
+        prices: &ctx.prices,
+        seats: &ctx.seats,
+        max_chunks: Some(COMPACT_CHUNKS_PER_RUN),
+    })?;
+    let backlog = !r.done && r.waiting.is_none();
+    if !backlog && r.rolled_until > 0 {
+        let vacuum =
+            idx.vacuum_to_incremental(on_battery, compact::free_disk(&ctx.dirs.data), false)?;
+        if debug() {
+            eprintln!("compaction: one-time VACUUM {vacuum:?}");
+        }
+    }
+    if debug() {
+        eprintln!(
+            "compaction {:?}: {} chunks, {} requests, {} tool calls, freed {} B, backlog {backlog}",
+            t.elapsed(),
+            r.chunks,
+            r.requests,
+            r.tool_calls,
+            r.freed_bytes
+        );
+    }
+    Ok(backlog)
+}
+
+/// The index's size, growth and 12-month projection for SYSTEM.
+fn outlook(ctx: &Ctx, idx: &Index) -> anyhow::Result<crate::core::storage::Outlook> {
+    Ok(idx
+        .storage_report()?
+        .outlook(ctx.now, ctx.keep_raw_days(None)?))
+}
+
 /// Day bars (14 days), the weekday × hour heat map (28 days) and day × model spend.
 fn days_and_heat(ctx: &Ctx, idx: &Index) -> Option<SlowParts> {
     let f = Filter::default();
-    let days_span = Span {
-        start: ctx.now - chrono::Duration::days(14),
-        end: ctx.now + chrono::Duration::seconds(1),
-    };
-    let heat_span = Span {
-        start: ctx.now - chrono::Duration::days(28),
-        end: ctx.now + chrono::Duration::seconds(1),
-    };
+    // Rolling periods: they start on a quarter hour (`Period::span`).
+    let days_span = Period::Days(14).span(ctx.now, None);
+    let heat_span = Period::Days(28).span(ctx.now, None);
     let (Ok(d), Ok(h), Ok(dm)) = (
         idx.spend_by(Dim::Day, days_span, &f),
         idx.matrix(Dim::Weekday, Dim::Hour, heat_span, &f),
@@ -519,17 +593,8 @@ fn system_view(ctx: &Ctx, live: &[LiveSession], sys: Option<&sysinfo::System>) -
         v.mem_total = s.total_memory();
         v.mem_available = s.available_memory();
     }
-    v.disk_free = free_space(&ctx.dirs.home);
+    v.disk_free = compact::free_disk(&ctx.dirs.home);
     v
-}
-
-fn free_space(path: &std::path::Path) -> Option<u64> {
-    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
-    disks
-        .iter()
-        .filter(|d| path.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(|d| d.available_space())
 }
 
 fn dir_size(p: &std::path::Path) -> u64 {

@@ -508,11 +508,13 @@ fn parse_assistant(r: RawRecord, ts: Option<DateTime<Utc>>, out: &mut Vec<Event>
         request_id: r.request_id,
         ts,
         model: msg.model.unwrap_or_default(),
-        requested_model: r.requested_model,
-        effort: r.effort,
+        // An empty string says nothing: stored as unknown, like a missing field (the rollups of
+        // old spend keep unknown as '').
+        requested_model: r.requested_model.filter(|s| !s.is_empty()),
+        effort: r.effort.filter(|s| !s.is_empty()),
         fast: u.speed.as_deref() == Some("fast"),
         usage,
-        cwd: r.cwd,
+        cwd: r.cwd.filter(|s| !s.is_empty()),
         git_branch: r.git_branch,
         agent_id: r.agent_id,
         tool_uses,

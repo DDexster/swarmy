@@ -432,6 +432,94 @@ mod tests {
         assert_eq!(after[2], "r3|acc-b");
     }
 
+    #[test]
+    fn a_cache_rebuild_keeps_agent_types_and_session_titles_of_deleted_transcripts() {
+        // Claude Code deletes transcripts after 30 days; a cache rebuild reads the transcripts
+        // again and must not forget what only the dimension tables still know.
+        let w = World::new(&["work"]);
+        let m = "claude-sonnet-5-5";
+        for (session, cwd, title) in [
+            ("old", "/w/shop", "old work"),
+            ("new", "/w/docs", "new work"),
+        ] {
+            w.append(
+                "work",
+                session,
+                &[
+                    serde_json::json!({"type": "custom-title", "customTitle": title, "sessionId": "s"}).to_string(),
+                    assistant(&format!("{session}-r1"), "2026-11-10T10:00:00Z", m, cwd, (1000, 10), &[]),
+                    compact("2026-11-10T10:01:00Z"),
+                    serde_json::json!({"type": "cost-state", "totalCostUSD": 0.5, "modelUsage": {}}).to_string(),
+                ],
+            );
+            let agent = format!("{session}-a");
+            w.write_subagent(
+                "work",
+                session,
+                &agent,
+                &[assistant(
+                    &format!("{session}-r2"),
+                    "2026-11-10T10:02:00Z",
+                    m,
+                    cwd,
+                    (100, 1),
+                    &[],
+                )],
+            );
+            std::fs::write(
+                w.subagent("work", session, &agent)
+                    .with_extension("meta.json"),
+                r#"{"agentType":"reviewer","description":"check the totals","finished":true}"#,
+            )
+            .unwrap();
+        }
+        let path = w.dir.path().join("i.sqlite");
+        let mut idx = Index::open(&path).unwrap();
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let dims = |idx: &Index| -> Vec<Vec<String>> {
+            crate::index::schema::DIMENSION_TABLES
+                .iter()
+                .map(|t| dump(idx, &format!("SELECT * FROM {t} ORDER BY 1, 2, 3")))
+                .collect()
+        };
+        let before = dims(&idx);
+        assert_eq!(before[0].len(), 2, "two sessions");
+        assert_eq!(before[1].len(), 4, "two main threads, two subagents");
+        // The old session's transcripts are deleted, then the cache version changes.
+        std::fs::remove_file(w.transcript("work", "old")).unwrap();
+        std::fs::remove_dir_all(w.transcript("work", "old").with_extension("")).unwrap();
+        drop(idx);
+        Index::open(&path)
+            .unwrap()
+            .set_meta("schema_version", "7")
+            .unwrap();
+        let mut idx = Index::open(&path).unwrap();
+        assert_eq!(
+            idx.count("requests").unwrap(),
+            0,
+            "the raw rows were dropped"
+        );
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        // The new session is read again and merges into its rows unchanged; the old one keeps
+        // its title, compactions, agent type and project although nothing on disk says so.
+        assert_eq!(dims(&idx), before);
+        let types = idx
+            .spend_by(
+                Dim::AgentType,
+                all("2026-11-11T00:00:00Z"),
+                &Filter::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            types
+                .iter()
+                .map(|r| (r.key.as_str(), r.requests))
+                .collect::<Vec<_>>(),
+            vec![("main thread", 1), ("reviewer", 1)],
+            "only the new session's requests are left to count"
+        );
+    }
+
     fn cache_book(input: f64, output: f64) -> PriceBook {
         let mut b = PriceBook::builtin();
         let cache = serde_json::json!({"claude-sonnet-5-5": {"inputTokens": input, "outputTokens": output}});
@@ -806,7 +894,7 @@ mod tests {
         // completely, then A writes what it read: A's work is dropped, nothing counts twice.
         let mut a = w.index("shared.sqlite");
         let mut b = w.index("shared.sqlite");
-        let work = a.plan(&w.files()).unwrap();
+        let work = a.plan(&w.files(), &w.seats).unwrap();
         assert_eq!(work.len(), 2);
         w.refresh(&mut b, &[], &prices);
         let mut resolver = Resolver::new(Vec::new());
@@ -818,7 +906,7 @@ mod tests {
         // More lines arrive; both refresh again, in turn and interleaved: still once.
         w.append("work", "s1", &[prompt("2026-11-10T10:05:00Z", "Thanks")]);
         w.append("work", "s1", &[compact("2026-11-10T10:06:00Z")]);
-        let work = a.plan(&w.files()).unwrap();
+        let work = a.plan(&w.files(), &w.seats).unwrap();
         w.refresh(&mut b, &[], &prices);
         a.ingest(work, &[], &mut resolver, &prices, &mut |_| {})
             .unwrap();
