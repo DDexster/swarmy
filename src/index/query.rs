@@ -232,6 +232,30 @@ pub(super) type BucketRow = (i64, u64, Usage, f64, u64, u64);
 /// One cell of a two-dimension matrix: (key of the first, its label, key of the second, cost).
 pub(super) type Cell = (String, String, String, f64);
 
+/// The tables `Index::count` counts: a name from a closed list, never text from outside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Counted {
+    Requests,
+    ToolCalls,
+    Sessions,
+    Agents,
+    UsageRollup,
+    SeatAccounts,
+}
+
+impl Counted {
+    pub fn table(self) -> &'static str {
+        match self {
+            Counted::Requests => "requests",
+            Counted::ToolCalls => "tool_calls",
+            Counted::Sessions => "sessions",
+            Counted::Agents => "agents",
+            Counted::UsageRollup => "usage_rollup",
+            Counted::SeatAccounts => "seat_accounts",
+        }
+    }
+}
+
 impl Index {
     pub fn spend_by(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
         if dim.is_time() {
@@ -492,12 +516,27 @@ impl Index {
         )?)
     }
 
-    pub fn count(&self, table: &str) -> anyhow::Result<u64> {
+    /// The rows of one table (a table walk: for `doctor` and tests, never a per-second path).
+    pub fn count(&self, t: Counted) -> anyhow::Result<u64> {
         Ok(self
             .conn
-            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| {
+            .query_row(&format!("SELECT COUNT(*) FROM {}", t.table()), [], |r| {
                 r.get::<_, i64>(0)
             })? as u64)
+    }
+
+    /// Transcripts the last refresh that tried could not read, whose file is still there: (path,
+    /// error, since when in epoch ms), oldest first.
+    pub fn unreadable_files(&self) -> anyhow::Result<Vec<(String, String, i64)>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT path, error, since FROM unreadable_files ORDER BY since, path",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let all: Vec<(String, String, i64)> = rows.collect::<Result<_, _>>()?;
+        Ok(all
+            .into_iter()
+            .filter(|(p, ..)| std::path::Path::new(p).exists())
+            .collect())
     }
 
     pub fn record_types(&self) -> anyhow::Result<Vec<(String, u64)>> {
@@ -543,8 +582,12 @@ impl Index {
         let parts = self.settled_read(&format!("series|{bucket}|{f:?}"), span, |c, s| {
             series_on(c, s, origin, bucket, n, f)
         })?;
+        // The kept part was summed for the span end of the call that read it: its length can
+        // differ from this call's (its buckets past the horizon are empty anyway). The length is
+        // this call's.
         Ok(match parts {
             (Some(mut a), b) => {
+                a.resize(n, 0.0);
                 for (x, y) in a.iter_mut().zip(b) {
                     *x += y;
                 }

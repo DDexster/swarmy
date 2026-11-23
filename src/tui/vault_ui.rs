@@ -467,7 +467,17 @@ impl App {
             })?;
             Ok(())
         })();
-        let _ = std::fs::remove_dir_all(&scratch);
+        // A scratch dir left behind holds a live login: say where it is (as the CLI does).
+        if let Err(e) = std::fs::remove_dir_all(&scratch)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            let msg = format!(
+                "cannot remove {} (it holds a login): {e}",
+                scratch.display()
+            );
+            crate::diag::log("vault", &msg);
+            self.log_event("⚿", msg, Tone::Bad);
+        }
         match res {
             Ok(()) => {
                 self.log_event("⚿", format!("new login saved: {label}"), Tone::Accent);

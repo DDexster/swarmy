@@ -64,7 +64,7 @@ mod tests {
                 ("r2", "2026-11-10T12:00:00Z"),
             ],
         );
-        // The seat's login was swapped to acc-b at 11:00.
+        // The seat reports acc-b; its session's owner records say acc-a, and they decide.
         let swap = info("work", "acc-b", "2026-11-10T11:00:00Z");
         let mut idx = w.index("i.sqlite");
         let mut book = PriceBook::builtin();
@@ -113,7 +113,7 @@ mod tests {
         );
         assert_eq!(
             dump(&idx, "SELECT msg_id, account_uuid FROM requests ORDER BY 1"),
-            ["r1|acc-a", "r2|acc-b", "r3|acc-b"]
+            ["r1|acc-a", "r2|acc-a", "r3|acc-a"]
         );
         assert_eq!(
             dump(&idx, "SELECT COUNT(*) FROM seat_accounts"),

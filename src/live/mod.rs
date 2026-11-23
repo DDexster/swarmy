@@ -379,13 +379,23 @@ pub fn build(
     // Session totals for the main rows.
     if let Some(p) = prev {
         for a in agents.iter_mut().filter(|a| a.is_main()) {
-            if let Some(o) = p
+            match p
                 .agents
                 .iter()
                 .find(|o| o.is_main() && o.seat == a.seat && o.session_id == a.session_id)
             {
-                a.session_cost = o.session_cost.max(a.cost);
-                a.session_burn = o.session_burn;
+                Some(o) => {
+                    a.session_cost = o.session_cost.max(a.cost);
+                    a.session_burn = o.session_burn;
+                }
+                // A session first seen on a light tick: read once now (from the next tick on it
+                // is carried over), not shown at $0 until the next heavy tick.
+                None => {
+                    let (total, hour) =
+                        idx.session_spend(&a.seat, &a.session_id, now - Duration::hours(1))?;
+                    a.session_cost = total.max(a.cost);
+                    a.session_burn = hour;
+                }
             }
             if let Some(n) = a.pid.and_then(|pid| procs.nodes.get(&pid)) {
                 a.cpu = n.cpu;
@@ -763,6 +773,51 @@ mod tests {
             last_request_ts: None,
             lane: Vec::new(),
         }
+    }
+
+    /// Review L7: a session that shows up between two heavy ticks has its spend at once.
+    #[test]
+    fn a_session_first_seen_on_a_light_tick_has_its_spend() {
+        use crate::core::pricing::PriceBook;
+        use crate::index::scenarios::{World, assistant, owner};
+        let w = World::new(&["work"]);
+        let now = Utc::now();
+        let line = |id: &str, ago: i64| {
+            let t = (now - Duration::seconds(ago)).to_rfc3339();
+            assistant(id, &t, "claude-sonnet-5-5", "/w/shop", (20_000, 2_000), &[])
+        };
+        let book = PriceBook::builtin();
+        w.append("work", "s1", &[owner("acc-a"), line("m1", 90)]);
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &book);
+        let procs = crate::claude::procs::ProcTable::empty();
+        let opts = Options::default();
+        let mut reads = Reads::default();
+        let heavy = build(&idx, &[], &procs, &opts, now, None, &mut reads).unwrap();
+        w.append(
+            "work",
+            "s2",
+            &[owner("acc-a"), line("m2", 30), line("m3", 20)],
+        );
+        w.refresh(&mut idx, &[], &book);
+        let light = build(&idx, &[], &procs, &opts, now, Some(&heavy), &mut reads).unwrap();
+        let main = |s: &Snapshot, sid: &str| {
+            s.agents
+                .iter()
+                .find(|a| a.is_main() && a.session_id.as_str() == sid)
+                .map(|a| (a.session_cost, a.session_burn))
+                .unwrap()
+        };
+        let (cost, burn) = main(&light, "s2");
+        let (total, _) = idx
+            .session_spend(&w.id("work"), &SessionId::new("s2"), now)
+            .unwrap();
+        assert!(
+            total > 0.0 && (cost - total).abs() < 1e-12,
+            "{cost} vs {total}"
+        );
+        assert!((burn - total).abs() < 1e-12, "all of it in the last hour");
+        assert_eq!(main(&light, "s1"), main(&heavy, "s1"), "carried over");
     }
 
     #[test]

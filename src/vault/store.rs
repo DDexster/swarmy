@@ -8,6 +8,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::errors::VaultError;
 use crate::fsutil::{self, Mode};
 
 /// Secrets by login id: the verbatim `claudeAiOauth` objects.
@@ -51,24 +52,41 @@ fn stamp(path: &Path) -> Option<Stamp> {
     })
 }
 
+/// How many times a write into a seat file starts again because Claude Code changed the file
+/// meanwhile (or was half way through writing it), before the write gives up.
+const ATTEMPTS: usize = 8;
+/// The pause before reading a file again that did not parse: Claude Code may be mid-write.
+const RETRY_PAUSE: Duration = Duration::from_millis(15);
+
 /// Rewrites a file that another program (Claude Code) also rewrites: reads it, applies `change`
 /// to the text, writes the result to a temp file and renames it over the target only if the file
-/// has not changed since it was read; otherwise starts again from the newer text. Returns false
-/// (and writes nothing) when the file does not exist.
+/// has not changed since it was read; otherwise starts again from the newer text. A text that
+/// `change` refuses (a torn read while Claude Code writes) is read again after a short pause.
+/// After [`ATTEMPTS`] it fails ([`VaultError::SeatBusy`], or `change`'s own error when the file
+/// never parsed) instead of writing over a version it has not seen. Returns false (and writes
+/// nothing) when the file does not exist.
 pub fn rewrite_merging(
     path: &Path,
     change: impl Fn(&str) -> anyhow::Result<String>,
 ) -> anyhow::Result<bool> {
-    const ATTEMPTS: usize = 8;
-    for attempt in 1..=ATTEMPTS {
+    let mut refused = None;
+    for _ in 0..ATTEMPTS {
         let before = stamp(path);
         let Some(text) = read_optional(path)? else {
             return Ok(false);
         };
-        let staged = fsutil::stage(path, change(&text)?.as_bytes(), Mode::Private)
+        let new = match change(&text) {
+            Ok(t) => t,
+            Err(e) => {
+                refused = Some(e);
+                std::thread::sleep(RETRY_PAUSE);
+                continue;
+            }
+        };
+        refused = None;
+        let staged = fsutil::stage(path, new.as_bytes(), Mode::Private)
             .with_context(|| format!("cannot write next to {}", path.display()))?;
-        // The last attempt writes anyway: the window between this check and the rename is tiny.
-        if stamp(path) == before || attempt == ATTEMPTS {
+        if stamp(path) == before {
             staged
                 .commit(path)
                 .with_context(|| format!("cannot replace {}", path.display()))?;
@@ -77,7 +95,47 @@ pub fn rewrite_merging(
         // Dropped: the temp file is removed, and the next attempt starts from the newer text.
         drop(staged);
     }
-    Ok(false)
+    Err(match refused {
+        Some(e) => e.context(format!(
+            "{} did not parse in {ATTEMPTS} reads",
+            path.display()
+        )),
+        None => VaultError::SeatBusy(path.to_path_buf()).into(),
+    })
+}
+
+/// Replaces `path` with `bytes` only while it still holds exactly `expected` (`None`: no file):
+/// the check and the rename are a few microseconds apart, and a change in between (another
+/// writer's rename) is caught by the file's stamp. Returns false, writing nothing, when the file
+/// is not what the caller read: the caller starts again from what is there now. With `bytes`
+/// `None` the file is removed instead.
+pub fn replace_if_unchanged(
+    path: &Path,
+    expected: Option<&str>,
+    bytes: Option<&[u8]>,
+) -> anyhow::Result<bool> {
+    let staged = match bytes {
+        Some(b) => Some(
+            fsutil::stage(path, b, Mode::Private)
+                .with_context(|| format!("cannot write next to {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let before = stamp(path);
+    if read_optional(path)?.as_deref() != expected || stamp(path) != before {
+        return Ok(false);
+    }
+    match staged {
+        Some(s) => s
+            .commit(path)
+            .with_context(|| format!("cannot replace {}", path.display()))?,
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot remove {}", path.display())),
+        },
+    }
+    Ok(true)
 }
 
 pub fn restrict_dir(dir: &Path) -> anyhow::Result<()> {
@@ -149,7 +207,7 @@ pub struct Lock {
 }
 
 impl Lock {
-    /// Waits up to `timeout` for the lock.
+    /// Waits up to `timeout` for the lock (zero: tries once).
     pub fn acquire(path: &Path, timeout: Duration) -> anyhow::Result<Lock> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);

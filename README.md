@@ -204,9 +204,9 @@ with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
 - **Limit resets.** When a limit is reset early (Claude Code's limit reset), utilization falls
   while the window is still open; swarmy notices the fall between two readings and counts the
   window from there (with the status line, within one response of the reset).
-- **Accounts** are tracked per request: each seat's login history (from the seat's own profile and
-  readings) decides, then Claude Code's `session-owner` records. Seats logged into the same account
-  share one limit, and swapping logins under running sessions does not mix the books.
+- **Accounts** are tracked per request: Claude Code's `session-owner` records decide; for sessions
+  without one, the seat's login history fills in (a change counts from when swarmy sees it). Seats
+  logged into the same account share one limit.
 - **Projects** are git repositories; worktrees count towards the repository they belong to.
   The project of a directory is recorded while it exists, so spend of a removed worktree keeps
   its project.
@@ -215,7 +215,7 @@ with `--eco` it redraws at 2 frames a second and refreshes every 3 seconds.
   account, directory, model, effort, fast mode, the long-context band) and kept for good. Every
   report, panel and period gives the same number before and after (`swarmy compact --verify`
   proves it on your own index). Prices that change later reprice old quarter hours from their
-  token sums; a login switch found late moves them to the right account.
+  token sums; a login switch found late never moves them.
 
 ## Storage
 

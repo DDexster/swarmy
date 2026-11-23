@@ -351,6 +351,96 @@ mod tests {
         check(&idx, "new request");
     }
 
+    /// A kept sum asked again later with a later span end (the limit curve: a fixed window
+    /// start, `end = now + 1s` every minute) reads what a fresh read of that span gives, length
+    /// included: the kept part was summed for the first call's end.
+    #[test]
+    fn kept_parts_follow_a_later_span_end() {
+        let w = World::new(&["work"]);
+        let now = Utc::now();
+        let mut lines = vec![owner("acc-a")];
+        lines.extend((0..120).map(|i| {
+            assistant(
+                &format!("m{i}"),
+                &ts(now - Duration::minutes(2 * i + 1)),
+                "claude-sonnet-5-5",
+                "/w/shop",
+                (100 + i as u64, 40),
+                &[],
+            )
+        }));
+        w.append("work", "s1", &lines);
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        let start = quarter_floor(now - Duration::hours(3));
+        let f = Filter::default();
+        for later in [0, 5, 9] {
+            let span = Span {
+                start,
+                end: now + Duration::seconds(1) + Duration::minutes(later),
+            };
+            let n = ((ms(span.end) - ms(start)) as f64 / 60_000.0).ceil() as usize;
+            let fresh = series_on(&idx.conn, span, ms(start), 60_000, n, &f).unwrap();
+            let kept = idx.spend_series(span, 1, &f).unwrap();
+            assert_eq!(kept.len(), fresh.len(), "{later} min later");
+            assert!(
+                kept.iter().zip(&fresh).all(|(a, b)| close(*a, *b)),
+                "{later} min later"
+            );
+            let one = crate::index::archive::read(&idx.conn, span, false, |c, p| {
+                super::super::query::total_on(c, p, &f)
+            })
+            .unwrap();
+            assert!(close(one.cost, idx.total(span, &f).unwrap().cost));
+        }
+    }
+
+    /// Old requests that get their account only later (the seat's login became known after
+    /// they were indexed) change an account's settled spend: a kept total must not keep the
+    /// old value.
+    #[test]
+    fn a_late_account_moves_the_settled_totals() {
+        use crate::index::SeatInfo;
+        use crate::index::scenarios::account;
+        let w = World::new(&["work"]);
+        let now = Utc::now();
+        let line = |id: &str, t: DateTime<Utc>| {
+            assistant(id, &ts(t), "claude-sonnet-5-5", "/w/shop", (5000, 400), &[])
+        };
+        // No owner record and no known login: the request has no account yet.
+        w.append("work", "s1", &[line("m1", now - Duration::hours(3))]);
+        let mut idx = w.index("i.sqlite");
+        let book = PriceBook::builtin();
+        w.refresh(&mut idx, &[], &book);
+        let span = Span {
+            start: now - Duration::hours(6),
+            end: now - Duration::hours(1),
+        };
+        assert_eq!(idx.settled_total("acc-a", span, now).unwrap(), 0.0);
+        // The seat's login is known now (no time it was recorded at); a new response arrives.
+        let mut login = account("acc-a", "2026-01-01T00:00:00Z");
+        login.profile_fetched_at = None;
+        let info = [SeatInfo {
+            seat: Default::default(),
+            label: "work".into(),
+            account: Some(login),
+            utilization: None,
+        }];
+        w.append("work", "s1", &[line("m2", now)]);
+        w.refresh(&mut idx, &info, &book);
+        let fresh = crate::index::archive::read(&idx.conn, span, true, |c, p| {
+            let f = Filter {
+                account: Some(crate::core::ids::AccountId::new("acc-a")),
+                ..Default::default()
+            };
+            super::super::query::total_on(c, p, &f)
+        })
+        .unwrap()
+        .cost;
+        assert!(fresh > 0.0);
+        assert!(close(idx.settled_total("acc-a", span, now).unwrap(), fresh));
+    }
+
     #[test]
     fn the_horizon_is_a_quarter_hour_at_least_fifteen_minutes_old() {
         let now = Utc.with_ymd_and_hms(2026, 3, 2, 10, 7, 30).unwrap();

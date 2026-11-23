@@ -71,6 +71,13 @@ impl Ctx {
             }
             seat_info.push(info);
         }
+        // A seat whose transcript retention cannot be read is said so (the raw window is
+        // checked against Claude Code's default for it).
+        for s in &seats {
+            if let Err(e) = s.cleanup_period_days() {
+                problems.push(format!("seat {}: {e}", s.label));
+            }
+        }
         let prices = price_book(&caches, &config, Utc::now())?;
         let mut ctx = Ctx {
             dirs,
@@ -98,8 +105,9 @@ impl Ctx {
         self.seats
             .iter()
             .map(|s| match s.cleanup_period_days() {
-                Some(d) => (s.label.clone(), d, true),
-                None => (
+                Ok(Some(d)) => (s.label.clone(), d, true),
+                // A damaged file is in `problems` (`Ctx::load`).
+                Ok(None) | Err(_) => (
                     s.label.clone(),
                     crate::core::storage::DEFAULT_RETENTION_DAYS,
                     false,
@@ -173,9 +181,10 @@ impl Ctx {
     }
 
     /// Seats whose current login is not confirmed lose the stale profile, so they are not merged
-    /// into another account and do not borrow its limit reading.
+    /// into another account and do not borrow its limit reading. A read: it takes no vault lock
+    /// and writes nothing (`Vault::seat_states`), so a report never waits for a switch.
     pub fn drop_unconfirmed(&mut self) -> anyhow::Result<()> {
-        let mut v = crate::vault::Vault::open(&self.dirs.vault_dir())?;
+        let v = crate::vault::Vault::open(&self.dirs.vault_dir())?;
         // Names and plan tiers of saved logins, for accounts that are in no seat right now.
         self.login_labels.clear();
         self.login_tiers.clear();
@@ -190,7 +199,7 @@ impl Ctx {
                 }
             }
         }
-        let states = v.edit(|tx| tx.seat_states(&self.seats))?;
+        let states = v.seat_states(&self.seats)?;
         for si in &mut self.seat_info {
             if states
                 .get(&si.seat)
@@ -519,9 +528,9 @@ pub fn price_book(
 }
 
 /// What a seat says about itself: its account from `.claude.json`, and its limit readings — the
-/// status line's when newer than Claude Code's cached ones (see `claude::statusline`).
-/// A file that cannot be read adds to `problems` (the seat then shows no account and no reading,
-/// and says why).
+/// status line's when newer than Claude Code's cached ones and of the same account (see
+/// `statusline::reading`). A file that cannot be read adds to `problems` (the seat then shows no
+/// account and no reading, and says why).
 pub fn seat_info_of(
     s: &Seat,
     data_dir: &std::path::Path,
@@ -537,9 +546,16 @@ pub fn seat_info_of(
         }
     };
     let live =
-        crate::claude::statusline::read(&crate::claude::statusline::file_of(data_dir, &s.id));
-    let account = cj.account.as_ref().map(|a| a.account_uuid.clone());
-    let utilization = crate::claude::statusline::merge(cj.utilization, account.as_deref(), live);
+        crate::statusline::reading::read(&crate::statusline::reading::file_of(data_dir, &s.id));
+    // A status-line reading counts only for the account it names (review H2).
+    let utilization = match cj.account.as_ref() {
+        Some(a) => crate::statusline::reading::merge(
+            cj.utilization,
+            &AccountId::new(a.account_uuid.clone()),
+            live,
+        ),
+        None => cj.utilization,
+    };
     (
         SeatInfo {
             seat: s.id.clone(),
@@ -574,5 +590,45 @@ mod tests {
         assert!(problems[0].starts_with("seat work:") && problems[0].contains("damaged"));
         // The vault refuses to read the seat rather than save a login without its account.
         assert!(crate::vault::read_seat(&seat).is_err());
+    }
+
+    /// Review H2: the status line wrote acc-a's 80% at 09:00; the seat was switched to acc-b at
+    /// 12:00 and Claude Code's cached reading (acc-b's) is from before. The seat's reading stays
+    /// acc-b's own: acc-a's 80% is not relabelled, so neither `readings` nor the login history
+    /// get a wrong fact from it.
+    #[test]
+    fn a_status_line_reading_of_the_previous_account_is_not_relabelled() {
+        use crate::statusline::reading::{LiveLimits, VERSION, file_of, write};
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join(".claude-work");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seat = Seat::new("work", dir.clone(), dir.join(".claude.json"), false);
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        let cj = serde_json::json!({
+            "oauthAccount": {"accountUuid": "acc-b"},
+            "cachedUsageUtilization": {"accountUuid": "acc-b", "fetchedAtMs": at("2026-11-22T08:00:00Z").timestamp_millis(),
+                "utilization": {"seven_day": {"utilization": 10.0, "resets_at": "2026-11-25T00:00:00Z"}}}
+        });
+        std::fs::write(&seat.claude_json, cj.to_string()).unwrap();
+        let reading = |account: &str| LiveLimits {
+            v: VERSION,
+            at: at("2026-11-22T09:00:00Z"),
+            account: AccountId::new(account),
+            config_dir: dir.to_string_lossy().into_owned(),
+            session_id: None,
+            five_hour: None,
+            seven_day: Some((80.0, at("2026-11-25T00:00:00Z"))),
+        };
+        write(&file_of(t.path(), &seat.id), &reading("acc-a")).unwrap();
+        let mut problems = Vec::new();
+        let (info, _) = seat_info_of(&seat, t.path(), &mut problems);
+        let u = info.utilization.unwrap();
+        assert_eq!(u.account_uuid, "acc-b");
+        assert_eq!(u.readings[0].utilization, 10.0, "acc-b's own reading");
+        // The same reading under acc-b's name is acc-b's, and newer: it wins.
+        write(&file_of(t.path(), &seat.id), &reading("acc-b")).unwrap();
+        let (info, _) = seat_info_of(&seat, t.path(), &mut problems);
+        assert_eq!(info.utilization.unwrap().readings[0].utilization, 80.0);
+        assert!(problems.is_empty(), "{problems:?}");
     }
 }

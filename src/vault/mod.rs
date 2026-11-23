@@ -1,9 +1,12 @@
 //! The login vault: saved Claude Code OAuth logins, and switching which one a seat uses.
 //!
 //! A *login* is the `claudeAiOauth` object of a credentials file (an OAuth grant) plus facts
-//! about it. A *seat* is a Claude Code config dir. Claude Code rotates the refresh token when it
-//! refreshes, so a copy goes stale while the login is in use: the vault tracks which seat each
-//! login is mounted in and, before every change, takes the seat's current tokens back first.
+//! about it, named by the fingerprint of its refresh token. A *seat* is a Claude Code config dir.
+//! Claude Code refreshes the access token every few hours and keeps the refresh token (verified
+//! on 2.1.329), so a saved copy's access token goes stale while the login is in use: the vault
+//! tracks which seat each login is mounted in and, before every change, takes the seat's
+//! current tokens back first. A refresh token that rotates anyway is followed explicitly
+//! (`VaultTx::sync_seat`), so the login keeps its identity.
 //!
 //! Secrets live in `vault/secrets.json` with mode 0600 — the same protection Claude Code gives the
 //! very same tokens in `.credentials.json` on Linux and Windows.
@@ -13,9 +16,12 @@
 //! OS lock, re-reads the files under it, and saves them through a [`VaultTx`].
 
 mod logins;
-pub mod store;
+mod seats;
+mod store;
+mod switch;
 
-use logins::{Index, SeatSeen, read_index};
+use logins::{Index, read_index};
+pub use switch::SwitchReport;
 
 use std::path::{Path, PathBuf};
 
@@ -62,16 +68,11 @@ pub struct SeatState {
     pub saved_as: Option<String>,
 }
 
-/// Refresh tokens are issued for 30 days: a token issued after the profile was read means a new
-/// login the profile does not describe yet.
-const REFRESH_LIFETIME_DAYS: i64 = 30;
-
 /// How long a change waits for another swarmy (process or thread) to finish its own.
 const LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Copies kept of each of the vault's own files, and of each seat file per seat.
 const VAULT_BACKUPS: usize = 30;
 const SEAT_BACKUPS: usize = 20;
-
 /// A read-only view of the vault, as of the last `open` or `edit`.
 pub struct Vault {
     dir: PathBuf,
@@ -191,7 +192,45 @@ impl Vault {
         &mut self,
         f: impl FnOnce(&mut VaultTx<'_>) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let lock = store::Lock::acquire(&self.dir.join("lock"), LOCK_TIMEOUT)?;
+        self.edit_within(LOCK_TIMEOUT, f)
+    }
+
+    /// [`Vault::edit`] when no other swarmy is changing the vault right now, else `None` at once
+    /// (nothing waits, nothing is written): for bookkeeping a reader may do on the side.
+    pub fn try_edit<T>(
+        &mut self,
+        f: impl FnOnce(&mut VaultTx<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<Option<T>> {
+        match self.edit_within(std::time::Duration::ZERO, f) {
+            Ok(v) => Ok(Some(v)),
+            Err(e)
+                if e.downcast_ref::<VaultError>()
+                    .is_some_and(|v| matches!(v, VaultError::Locked(_))) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// What every seat holds, as the vault sees it, without the lock and without writing
+    /// anything: for read paths (`Ctx::load`, reports, `doctor`), which must never wait for or
+    /// fail on another swarmy's change. The bookkeeping this would do (copies kept current,
+    /// rotations followed, first-seen times) is saved only by changes: `swarmy accounts`, a
+    /// switch, and the dashboard's [`Vault::try_edit`].
+    pub fn seat_states(
+        &self,
+        seats: &[Seat],
+    ) -> anyhow::Result<std::collections::BTreeMap<SeatId, SeatState>> {
+        VaultTx::detached(&self.dir)?.seat_states(seats)
+    }
+
+    fn edit_within<T>(
+        &mut self,
+        timeout: std::time::Duration,
+        f: impl FnOnce(&mut VaultTx<'_>) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let lock = store::Lock::acquire(&self.dir.join("lock"), timeout)?;
         let mut tx = VaultTx::begin(&self.dir, &lock)?;
         let out = f(&mut tx).and_then(|v| tx.save().map(|()| v));
         match &out {
@@ -215,7 +254,8 @@ pub struct VaultTx<'a> {
     disk_logins: Option<String>,
     disk_secrets: Secrets,
     disk_secrets_text: Option<String>,
-    _lock: &'a store::Lock,
+    /// `None` only for a read view (`VaultTx::detached`), which cannot save.
+    lock: Option<&'a store::Lock>,
 }
 
 impl<'a> VaultTx<'a> {
@@ -238,7 +278,23 @@ impl<'a> VaultTx<'a> {
             disk_logins,
             disk_secrets,
             disk_secrets_text,
-            _lock: lock,
+            lock: Some(lock),
+        })
+    }
+
+    /// The vault as it is on disk, without the lock and without its secrets: the state for a
+    /// read view ([`Vault::seat_states`]). It never saves.
+    fn detached(dir: &Path) -> anyhow::Result<VaultTx<'static>> {
+        let (mut index, disk_logins) = read_index(dir)?;
+        index.dedupe_labels();
+        Ok(VaultTx {
+            dir: dir.to_path_buf(),
+            index,
+            secrets: Secrets::new(),
+            disk_logins,
+            disk_secrets: Secrets::new(),
+            disk_secrets_text: None,
+            lock: None,
         })
     }
 
@@ -246,6 +302,9 @@ impl<'a> VaultTx<'a> {
     /// removed ones after the index that no longer does, so a reader never finds a listed login
     /// without its secret. Each changed file is backed up first.
     fn save(&mut self) -> anyhow::Result<()> {
+        if self.lock.is_none() {
+            anyhow::bail!("a read view of the vault cannot be saved");
+        }
         let logins_text = serde_json::to_string_pretty(&self.index)?;
         let logins_changed = self.disk_logins.as_deref() != Some(logins_text.as_str());
         let secrets_changed = self.secrets != self.disk_secrets;
@@ -305,7 +364,10 @@ impl<'a> VaultTx<'a> {
     }
 
     fn journal(&self, line: &str) {
-        journal(&self.dir, line);
+        // A read view changes nothing, so it has nothing to tell.
+        if self.lock.is_some() {
+            journal(&self.dir, line);
+        }
     }
 
     /// `backups/seats/<seat id>`: kept per seat whatever its label. Backups an older swarmy kept
@@ -322,7 +384,7 @@ impl<'a> VaultTx<'a> {
     }
 
     /// Stores a login. When `mounted_in` names the seat it came from, the entry already mounted
-    /// there is updated (its refresh token may have rotated); otherwise an entry with the same
+    /// there is updated (its tokens are newer); otherwise an entry with the same
     /// grant is updated, or a new one is created. A given `label` must not name another login.
     pub fn put(
         &mut self,
@@ -470,261 +532,6 @@ impl<'a> VaultTx<'a> {
         )
     }
 
-    /// Compares a seat with what was seen there before. A new refresh token with no newer
-    /// profile means a new login (or a restored backup) whose account is not known yet.
-    fn observe(&mut self, seat: &Seat, s: &SeatLogin) -> SeatState {
-        let Some(sec) = &s.secret else {
-            self.index.seats.remove(&seat.id);
-            return SeatState::default();
-        };
-        let meta = sec.meta();
-        let fp = meta.fingerprint.clone();
-        let profile_at = s.account.as_ref().and_then(|a| a.profile_fetched_at);
-        let account = s.account.as_ref().map(|a| a.account_uuid.clone());
-        let prev = self.index.seats.get(&seat.id).cloned();
-        let unverified_since = match &prev {
-            // First sight: a refresh token issued after the profile was read is a newer login;
-            // a file written after the profile with an access token already expired at that time
-            // was copied in (Claude Code only writes fresh tokens).
-            None => {
-                let issued = meta
-                    .refresh_expires_at
-                    .map(|t| t - chrono::Duration::days(REFRESH_LIFETIME_DAYS));
-                let copied_in = match (s.written_at, meta.access_expires_at, profile_at) {
-                    (Some(w), Some(exp), Some(p))
-                        if w > p && exp + chrono::Duration::minutes(5) < w =>
-                    {
-                        Some(w)
-                    }
-                    _ => None,
-                };
-                match (issued, profile_at) {
-                    (Some(i), Some(p)) if i > p + chrono::Duration::minutes(10) => Some(i),
-                    _ => copied_in,
-                }
-            }
-            Some(p) if p.fingerprint != fp => {
-                if profile_at > p.profile_at {
-                    None
-                } else {
-                    Some(Utc::now())
-                }
-            }
-            Some(p) => p.unverified_since.filter(|_| profile_at <= p.profile_at),
-        };
-        let seen = SeatSeen {
-            label: seat.label.clone(),
-            fingerprint: fp.clone(),
-            account_uuid: account.clone(),
-            profile_at: if unverified_since.is_some() {
-                prev.as_ref().and_then(|p| p.profile_at).or(profile_at)
-            } else {
-                profile_at
-            },
-            unverified_since,
-        };
-        if prev.as_ref() != Some(&seen) {
-            self.index.seats.insert(seat.id.clone(), seen);
-        }
-        let saved_as = self
-            .index
-            .logins
-            .iter()
-            .find(|l| l.meta.fingerprint == fp)
-            .map(|l| l.label.clone());
-        SeatState {
-            fingerprint: Some(fp),
-            account_uuid: if unverified_since.is_some() {
-                None
-            } else {
-                account
-            },
-            unverified_since,
-            saved_as,
-        }
-    }
-
-    /// The state of every seat (also brings the vault up to date, see `sync`).
-    pub fn seat_states(
-        &mut self,
-        seats: &[Seat],
-    ) -> anyhow::Result<std::collections::BTreeMap<SeatId, SeatState>> {
-        self.sync(seats)?;
-        let mut out = std::collections::BTreeMap::new();
-        for seat in seats {
-            // A seat that cannot be read has no state to show; its failure is not the vault's.
-            match read_seat(seat) {
-                Ok(s) => {
-                    out.insert(seat.id.clone(), self.observe(seat, &s));
-                }
-                Err(e) => crate::diag::log("vault", &format!("seat {}: {e:#}", seat.label)),
-            }
-        }
-        Ok(out)
-    }
-
-    /// Keeps the vault copy of every mounted login current with its seat.
-    ///
-    /// Claude Code refreshes the access token every few hours and keeps the refresh token: the
-    /// saved copy simply takes the new access token. A different refresh token is another login
-    /// (a `/login`, a restored backup): the saved login is left untouched and no longer counts as
-    /// mounted there, so its tokens are never overwritten by someone else's.
-    pub fn sync(&mut self, seats: &[Seat]) -> anyhow::Result<()> {
-        self.index.adopt_seats(seats);
-        for seat in seats {
-            let Some(mounted) = self
-                .index
-                .logins
-                .iter()
-                .find(|l| l.mounted.as_ref() == Some(&seat.id))
-                .cloned()
-            else {
-                continue;
-            };
-            let s = match read_seat(seat) {
-                Ok(s) => s,
-                Err(e) => {
-                    // The saved copy stays as it is until the seat can be read again.
-                    crate::diag::log("vault", &format!("seat {}: {e:#}", seat.label));
-                    continue;
-                }
-            };
-            match s.secret {
-                Some(sec) if sec.meta().fingerprint == mounted.meta.fingerprint => {
-                    // Same grant, maybe a fresher access token: keep the copy current.
-                    if self.secret(&mounted.id).as_ref() != Some(&sec) {
-                        self.set_secret(&mounted.id, &sec);
-                        if let Some(l) = self.index.find_mut(&mounted.id) {
-                            l.meta = sec.meta();
-                            l.updated_at = Utc::now();
-                        }
-                    }
-                }
-                Some(_) => {
-                    // Another login now lives in that seat; ours keeps its own tokens.
-                    if let Some(l) = self.index.find_mut(&mounted.id) {
-                        l.mounted = None;
-                    }
-                    self.journal(&format!(
-                        "seat={} has a new login; '{}' kept unchanged",
-                        seat.label, mounted.label
-                    ));
-                }
-                None => {
-                    if let Some(l) = self.index.find_mut(&mounted.id) {
-                        l.mounted = None;
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Writes `login_key` into `seat`, first saving whatever the seat holds.
-    pub fn switch(
-        &mut self,
-        seat: &Seat,
-        login_key: &str,
-        allow_shared: bool,
-    ) -> anyhow::Result<SwitchReport> {
-        let target = self.find(login_key).cloned()?;
-        if let Some(other) = target
-            .mounted
-            .as_ref()
-            .filter(|m| **m != seat.id)
-            .map(|m| self.index.seat_name(m))
-            && !allow_shared
-        {
-            return Err(VaultError::SharedGrant {
-                login: target.label,
-                seat: other,
-            }
-            .into());
-        }
-        let secret = self
-            .secret(&target.id)
-            .ok_or_else(|| VaultError::MissingSecret(target.label.clone()))?;
-
-        // 1. Save what the seat holds now, on disk before the seat is overwritten.
-        self.sync(std::slice::from_ref(seat))?;
-        let before = read_seat(seat)?;
-        let known_before = before.secret.as_ref().is_some_and(|sec| {
-            self.index
-                .logins
-                .iter()
-                .any(|l| l.meta.fingerprint == sec.meta().fingerprint)
-        });
-        let previous = match &before.secret {
-            Some(sec) => Some(self.save_seat_login(seat, &before, sec, None)?),
-            None => None,
-        };
-        let auto_saved = previous
-            .as_ref()
-            .filter(|_| !known_before)
-            .and_then(|id| self.index.label_of(id));
-        if previous.as_deref() == Some(target.id.as_str()) {
-            return Ok(SwitchReport {
-                auto_saved: None,
-                seat: seat.label.clone(),
-                from: Some(target.label.clone()),
-                to: target.label,
-                backup: None,
-                unchanged: true,
-            });
-        }
-        self.save()?;
-
-        // 2. Back up both files, kept per seat.
-        let bdir = self.seat_backups(seat)?;
-        let cred_text = store::read_optional(&seat.credentials_file())?;
-        let cj_text = store::read_optional(&seat.claude_json)?;
-        store::backup(
-            &bdir,
-            &[
-                ("credentials.json", cred_text.as_deref()),
-                ("claude.json", cj_text.as_deref()),
-            ],
-            SEAT_BACKUPS,
-        )?;
-
-        // 3. Write the new login, keeping mcpOAuth and every other key.
-        let new_creds = credentials::with_login(cred_text.as_deref(), &secret)?;
-        atomic_write(&seat.credentials_file(), new_creds.as_bytes())?;
-        // 4. The account shown by Claude Code: only `oauthAccount` changes, merged into the file
-        //    as it is right now (Claude Code rewrites it every few seconds).
-        if let Some(acct) = &target.oauth_account {
-            store::rewrite_merging(&seat.claude_json, |t| {
-                config_json::with_oauth_account(t, Some(acct))
-            })?;
-        }
-
-        // 5. Bookkeeping.
-        let from_label = previous.as_ref().and_then(|id| self.index.label_of(id));
-        for l in &mut self.index.logins {
-            if l.mounted.as_ref() == Some(&seat.id) {
-                l.mounted = None;
-            }
-        }
-        if let Some(l) = self.index.find_mut(&target.id) {
-            l.mounted = Some(seat.id.clone());
-            l.mounted_label = None;
-        }
-        self.journal(&format!(
-            "switch seat={} from={} to={}",
-            seat.label,
-            from_label.as_deref().unwrap_or("-"),
-            target.label
-        ));
-        Ok(SwitchReport {
-            auto_saved,
-            seat: seat.label.clone(),
-            from: from_label,
-            to: target.label,
-            backup: Some(bdir),
-            unchanged: false,
-        })
-    }
-
     pub fn rename(&mut self, key: &str, new_label: &str) -> anyhow::Result<()> {
         let id = self.find(key).map(|l| l.id.clone())?;
         self.index.check_label(new_label, Some(&id))?;
@@ -764,17 +571,6 @@ enum Label<'a> {
     Given(&'a str),
     /// A base for a new login's label (made unique); an existing login keeps its own.
     Default(String),
-}
-
-#[derive(Debug)]
-pub struct SwitchReport {
-    /// The seat held a login that was not in the vault; it was saved under this label.
-    pub auto_saved: Option<String>,
-    pub seat: String,
-    pub from: Option<String>,
-    pub to: String,
-    pub backup: Option<PathBuf>,
-    pub unchanged: bool,
 }
 
 #[cfg(test)]

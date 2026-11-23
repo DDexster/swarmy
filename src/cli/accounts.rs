@@ -48,7 +48,7 @@ pub enum AccountsCmd {
         /// Switch even though Claude Code is running in that seat.
         #[arg(long)]
         force: bool,
-        /// Allow the same login in two seats (one of them breaks when the token rotates).
+        /// Allow the same login in two seats (both refresh one grant; one is logged out if it is ever revoked).
         #[arg(long)]
         share: bool,
     },

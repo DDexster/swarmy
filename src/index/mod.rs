@@ -44,8 +44,16 @@ use crate::claude::seats::{Seat, SeatId};
 use crate::claude::transcript;
 use crate::core::pricing::PriceBook;
 
-/// The account of a request from its seat's login history (see `seat_accounts`).
-const SEAT_ACCOUNT_AT: &str = "COALESCE((SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1), requests.account_uuid)";
+/// The account of a request (review H1). The transcripts say which account a request used:
+/// the session's `session-owner` record in force at the request (else its first one) decides.
+/// The seat's login history (`seat_accounts`) only fills in for sessions with no owner record:
+/// the login in force at the request, else the seat's earliest known one.
+const SEAT_ACCOUNT_AT: &str = "COALESCE(
+  (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat AND o.session_id = requests.session_id AND o.ts <= requests.ts ORDER BY o.ts DESC LIMIT 1),
+  (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat AND o.session_id = requests.session_id ORDER BY o.ts ASC LIMIT 1),
+  (SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts ORDER BY sa.ts DESC LIMIT 1),
+  (SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = requests.seat ORDER BY sa.ts ASC LIMIT 1),
+  requests.account_uuid)";
 
 /// Revision of the cwd → project rules; a change recomputes the `projects` table.
 const PROJECTS_REV: &str = "5";
@@ -211,6 +219,9 @@ pub struct RefreshStats {
     pub requests_new: u64,
     /// Records read again that were rolled up already, and skipped (`marks`).
     pub records_skipped: u64,
+    /// Transcripts that could not be read (path, error): nothing of them was written, and they
+    /// are tried again on the next refresh (`Index::unreadable_files`).
+    pub unreadable: Vec<(String, String)>,
     pub elapsed: Duration,
 }
 
@@ -227,9 +238,42 @@ struct Work {
     account: Option<String>,
     last_ts: i64,
     reset: bool,
-    /// Whether records older than `rolled_until` are skipped: the file may repeat rolled-up
-    /// ones (`marks::Marks::applies`).
-    marked: bool,
+    /// Whether records older than `rolled_until` are skipped: what the file may repeat of the
+    /// rolled-up records (`marks::Marks::of`).
+    mark: marks::Mark,
+}
+
+/// Records that the transcript at `path` could not be read (`unreadable_files`).
+fn note_unreadable(tx: &Connection, path: &str, e: &std::io::Error) -> rusqlite::Result<()> {
+    tx.prepare_cached(
+        "INSERT INTO unreadable_files(path, error, since) VALUES (?1, ?2, ?3)
+         ON CONFLICT(path) DO UPDATE SET error = excluded.error WHERE error IS NOT excluded.error",
+    )?
+    .execute(params![path, e.to_string(), ms(Utc::now())])?;
+    Ok(())
+}
+
+/// The index's failures that a user can act on, by kind (`IndexError`, coded): SQLite's busy,
+/// damaged and disk-full results anywhere in `e`'s chain. Anything else is left as it is.
+fn typed(e: anyhow::Error) -> anyhow::Error {
+    use rusqlite::ErrorCode as C;
+    let code = e
+        .chain()
+        .find_map(|c| c.downcast_ref::<rusqlite::Error>())
+        .and_then(rusqlite::Error::sqlite_error_code);
+    let Some(code) = code else { return e };
+    let msg = format!("{e:#}");
+    // `ErrorCode` is non-exhaustive: every other code stays as it is.
+    let kind = if matches!(code, C::DatabaseBusy | C::DatabaseLocked) {
+        crate::errors::IndexError::Busy(msg)
+    } else if matches!(code, C::DatabaseCorrupt | C::NotADatabase) {
+        crate::errors::IndexError::Damaged(msg)
+    } else if code == C::DiskFull {
+        crate::errors::IndexError::NoSpace(msg)
+    } else {
+        return e;
+    };
+    kind.into()
 }
 
 pub fn ms(t: DateTime<Utc>) -> i64 {
@@ -261,7 +305,7 @@ impl Index {
         }
         let conn =
             Connection::open(path).with_context(|| format!("cannot open {}", path.display()))?;
-        Self::init(conn)
+        Self::init(conn).map_err(typed)
     }
 
     fn init(conn: Connection) -> anyhow::Result<Index> {
@@ -442,6 +486,19 @@ impl Index {
         prices: &PriceBook,
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
+        self.refresh_files_untyped(all, seats, seat_info, resolver, prices, progress)
+            .map_err(typed)
+    }
+
+    fn refresh_files_untyped(
+        &mut self,
+        all: Vec<TranscriptFile>,
+        seats: &[Seat],
+        seat_info: &[SeatInfo],
+        resolver: &mut Resolver,
+        prices: &PriceBook,
+        progress: &mut dyn FnMut(Progress),
+    ) -> anyhow::Result<RefreshStats> {
         let started = Instant::now();
         self.note_other_writers()?;
         let files_total = all.len();
@@ -522,9 +579,9 @@ impl Index {
             if start == 0 && marks.is_none() {
                 marks = Some(marks::Marks::load(&self.conn, seats)?);
             }
-            let marked = match &marks {
-                Some(m) => m.applies(&self.conn, f, start)?,
-                None => false,
+            let mark = match &marks {
+                Some(m) => m.of(&self.conn, f, start)?,
+                None => marks::Mark::New,
             };
             work.push(Work {
                 file: f.clone(),
@@ -536,7 +593,7 @@ impl Index {
                 account,
                 last_ts,
                 reset,
-                marked,
+                mark,
             });
         }
         Ok(work)
@@ -597,7 +654,19 @@ impl Index {
             let rolled_until = archive::rolled_until(&tx)?;
             let mut written: Vec<AgentOf> = Vec::new();
             for (w, chunk) in parsed {
-                let Ok(chunk) = chunk else { continue };
+                let path = w.file.path.to_string_lossy();
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Never dropped silently: recorded (`doctor`, ATTENTION), returned, and
+                        // read again next time (its offset did not move).
+                        note_unreadable(&tx, &path, &e)?;
+                        stats.unreadable.push((path.into_owned(), e.to_string()));
+                        continue;
+                    }
+                };
+                tx.prepare_cached("DELETE FROM unreadable_files WHERE path = ?1")?
+                    .execute([&path])?;
                 let now: Option<(u64, u64)> = tx
                     .prepare_cached("SELECT ino, offset FROM files WHERE path = ?1")?
                     .query_row([w.file.path.to_string_lossy()], |r| {
@@ -652,7 +721,11 @@ impl Index {
             |r| r.get(0),
         )?;
         stats.requests_new = added.max(0) as u64;
-        self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
+        // Only a refresh that read something commits: a commit makes every other process's
+        // per-agent caches read again (`note_other_writers`).
+        if done.files_done > 0 {
+            self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
+        }
         Ok(stats)
     }
 
@@ -673,7 +746,10 @@ impl Index {
                 tx.prepare_cached("INSERT INTO accounts(account_uuid, email, display_name, org_name, plan, tier, seat, seen_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(account_uuid) DO UPDATE SET email = excluded.email, display_name = excluded.display_name,
-                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at")?.execute(params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now])?;
+                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at
+                     WHERE (email, display_name, org_name, plan, tier, seat) IS NOT
+                             (excluded.email, excluded.display_name, excluded.org_name, excluded.plan, excluded.tier, excluded.seat)
+                       OR seen_at < excluded.seen_at - 3600000")?.execute(params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now])?;
             }
             if let Some(u) = &si.utilization {
                 for r in &u.readings {
@@ -695,58 +771,43 @@ impl Index {
                 }
             }
         }
-        // What each seat has logged in now, with the time the seat itself recorded it. A change of
-        // account re-attributes the seat's requests from that moment on.
+        // What each seat has logged in now. A change of login is dated when swarmy sees it
+        // (review H1): never at the profile's `profileFetchedAt` (after a vault switch that is when
+        // the login was saved, maybe days ago and in another seat) nor at a reading's time, and
+        // never before the seat's newest recorded change, so the history only moves forward.
         let mut reattribute: Vec<(SeatId, i64)> = Vec::new();
         for si in seat_info {
             let Some(a) = &si.account else { continue };
-            let mut events: Vec<(i64, &str)> = Vec::new();
-            if let Some(t) = a.profile_fetched_at {
-                events.push((ms(t), a.account_uuid.as_str()));
-            }
-            if let Some(u) = si
-                .utilization
+            let newest: Option<(i64, String)> = tx
+                .prepare_cached(
+                    "SELECT ts, account_uuid FROM seat_accounts WHERE seat = ?1 ORDER BY ts DESC LIMIT 1",
+                )?
+                .query_row(params![si.seat], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if newest
                 .as_ref()
-                .filter(|u| u.account_uuid == a.account_uuid)
+                .is_some_and(|(_, acc)| *acc == a.account_uuid)
             {
-                events.push((ms(u.fetched_at), u.account_uuid.as_str()));
+                continue;
             }
-            for (ts, acc) in events {
-                let before: Option<String> = tx
-                    .query_row(
-                        "SELECT account_uuid FROM seat_accounts WHERE seat = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1",
-                        params![si.seat, ts],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                // Only changes are kept: readings arrive after every response.
-                if before.as_deref() == Some(acc) {
-                    continue;
-                }
-                let added = tx
-                    .prepare_cached(
-                        "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(seat, ts) DO NOTHING",
-                    )?
-                    .execute(params![si.seat, ts, acc])?;
-                if added > 0 {
-                    reattribute.push((si.seat.clone(), ts));
-                }
-            }
+            let ts = newest.map_or(now, |(t, _)| now.max(t + 1));
+            tx.prepare_cached(
+                "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)",
+            )?
+            .execute(params![si.seat, ts, a.account_uuid])?;
+            reattribute.push((si.seat.clone(), ts));
         }
+        // Requests of the seat from the change on follow it, unless their transcript names the
+        // owner (`SEAT_ACCOUNT_AT`). Rollups are never re-keyed: they were attributed while their
+        // raw rows, owners included, were still there, and the archive cannot tell an owner's
+        // attribution from the seat's; a change dated at the moment it is seen is newer than
+        // `rolled_until` anyway. So no rollup is ever moved on weaker evidence than it was made.
         let mut moved = 0;
-        let rolled_until = archive::rolled_until(&tx)?;
         for (seat, ts) in &reattribute {
             moved += tx.execute(
                 &format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"),
                 params![seat, ts],
             )?;
-            // A switch older than the raw window (swarmy was not running): the rollups move too.
-            if *ts < rolled_until {
-                let (insert, delete) = archive::rekey_sql();
-                tx.execute(&insert, params![seat, ts])?;
-                moved += tx.execute(&delete, params![seat, ts])?;
-            }
         }
         if moved > 0 {
             bump_settled(&tx)?;
@@ -756,15 +817,23 @@ impl Index {
             tx.commit()?;
             return self.price_all(prices);
         };
-        // New requests follow their seat's login history too: requests read for the first time,
-        // which after a cache rebuild is all of them.
+        // New requests follow the same rule: requests read for the first time, which after a
+        // cache rebuild is all of them.
         tx.execute(
             &format!(
                 "UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT}
-                 WHERE rowid > ?1 AND EXISTS (SELECT 1 FROM seat_accounts sa WHERE sa.seat = requests.seat AND sa.ts <= requests.ts)"
+                 WHERE rowid > ?1 AND EXISTS (SELECT 1 FROM seat_accounts sa WHERE sa.seat = requests.seat)"
             ),
             params![new_after_rowid],
         )?;
+        // Settled requests that get their account below change settled spend (`bump_settled`).
+        let unattributed = |tx: &Connection| -> rusqlite::Result<i64> {
+            tx.prepare_cached(
+                "SELECT COUNT(*) FROM requests WHERE account_uuid IS NULL AND ts < ?1",
+            )?
+            .query_row([now - SETTLED_AFTER_MS], |r| r.get(0))
+        };
+        let unattributed_before = unattributed(&tx)?;
         // The account of subagent requests comes from the session's owner at that time.
         tx.execute_batch(
             "UPDATE requests SET account_uuid = (SELECT o.account_uuid FROM owners o WHERE o.seat = requests.seat
@@ -779,6 +848,9 @@ impl Index {
             if let Some(a) = &si.account {
                 tx.prepare_cached("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2")?.execute(params![a.account_uuid, si.seat])?;
             }
+        }
+        if unattributed(&tx)? != unattributed_before {
+            bump_settled(&tx)?;
         }
         // Projects of new working directories; a new rule revision recomputes every cwd, raw or
         // rolled up, never downgrading one whose dir is gone (`projects`).
@@ -805,15 +877,69 @@ impl Index {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::query::Counted;
 
     #[test]
     fn a_fresh_index_opens_and_reopens() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("i.sqlite");
         let i = Index::open(&p).unwrap();
-        assert_eq!(i.count("requests").unwrap(), 0);
+        assert_eq!(i.count(Counted::Requests).unwrap(), 0);
         drop(i);
         assert!(Index::open(&p).is_ok());
+    }
+
+    /// Review M12: a failure the user can act on reaches the front ends as a coded kind, not a
+    /// bare SQLite message: the write lock held by another process (a compaction, a VACUUM),
+    /// a damaged file.
+    #[test]
+    fn index_failures_are_typed() {
+        use crate::index::scenarios::{World, assistant, owner};
+        let w = World::new(&["work"]);
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                assistant(
+                    "m1",
+                    "2026-11-01T10:00:00Z",
+                    "claude-sonnet-5-5",
+                    "/w",
+                    (10, 5),
+                    &[],
+                ),
+            ],
+        );
+        let path = w.dir.path().join("i.sqlite");
+        let mut idx = Index::open(&path).unwrap();
+        idx.conn.busy_timeout(Duration::from_millis(50)).unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        let mut resolver = Resolver::new(Vec::new());
+        let e = idx
+            .refresh(
+                &w.seats,
+                &[],
+                &mut resolver,
+                &PriceBook::builtin(),
+                &mut |_| {},
+            )
+            .unwrap_err();
+        assert_eq!(crate::errors::code_of(&e), Some("index-busy"), "{e:#}");
+        other.execute_batch("ROLLBACK;").unwrap();
+        idx.refresh(
+            &w.seats,
+            &[],
+            &mut resolver,
+            &PriceBook::builtin(),
+            &mut |_| {},
+        )
+        .unwrap();
+        let bad = w.dir.path().join("bad.sqlite");
+        std::fs::write(&bad, "not a database ".repeat(40)).unwrap();
+        let e = Index::open(&bad).err().unwrap();
+        assert_eq!(crate::errors::code_of(&e), Some("index-damaged"), "{e:#}");
     }
 
     /// `agent_seq` moves for the agent whose transcript was read further, not for the others,
@@ -868,10 +994,32 @@ mod tests {
         let (main1, sub1) = (seq(&idx, ""), seq(&idx, "a1"));
         w.refresh(&mut idx, &[], &book);
         assert_eq!((seq(&idx, ""), seq(&idx, "a1")), (main1, sub1));
+        // Another process's refresh that finds nothing new (the same login too) commits
+        // nothing: nothing moves.
+        let info = [SeatInfo {
+            seat: Default::default(),
+            label: "work".into(),
+            account: Some(crate::index::scenarios::account(
+                "acc-a",
+                "2026-10-01T00:00:00Z",
+            )),
+            utilization: None,
+        }];
+        let mut second = w.index("i.sqlite");
+        w.refresh(&mut second, &info, &book);
+        w.refresh(&mut idx, &info, &book);
+        let (main2, sub2) = (seq(&idx, ""), seq(&idx, "a1"));
+        w.refresh(&mut second, &info, &book);
+        w.refresh(&mut idx, &info, &book);
+        assert_eq!(
+            (seq(&idx, ""), seq(&idx, "a1")),
+            (main2, sub2),
+            "a second reader"
+        );
         // Another process commits: everything counts as changed.
         let other = w.index("i.sqlite");
         other.set_meta("refreshed_at", "1").unwrap();
         w.refresh(&mut idx, &[], &book);
-        assert_ne!(seq(&idx, "a1"), sub1);
+        assert_ne!(seq(&idx, "a1"), sub2);
     }
 }

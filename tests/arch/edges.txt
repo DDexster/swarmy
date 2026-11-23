@@ -9,16 +9,14 @@ app -> diag
 # Failures users see come from the error catalogue (src/errors.rs, review L3).
 app -> errors
 app -> index
+# A seat's limit reading merges the status line's (statusline::reading, a published language).
+app -> statusline
 # Ctx::index draws the first-run progress bar with ui::fmt.
 app -> ui
 app -> vault
-claude -> config
 claude -> core
-# Failures that the status line must swallow go to the debug channel.
-claude -> diag
-claude -> fleet
-# Every file replacement goes through fsutil::atomic_write (review M8).
-claude -> fsutil
+# A seat's damaged settings.json is a coded failure from the error catalogue (src/errors.rs).
+claude -> errors
 # Commands start from the composition root.
 cli -> app
 cli -> claude
@@ -35,6 +33,8 @@ cli -> fsutil
 cli -> index
 # `swarmy limits` and `swarmy accounts` print the limit analysis.
 cli -> limits
+# `swarmy statusline` (the status line is its own front end, review M10).
+cli -> statusline
 cli -> tui
 cli -> ui
 cli -> vault
@@ -62,6 +62,18 @@ limits -> core
 # The queries feeding the estimation.
 limits -> index
 live -> claude
+# The status line reads Claude Code's files through the reader layer (seat ids, the session
+# registry, a transcript's tail, `.claude.json`'s account).
+statusline -> claude
+# `[statusline]` of config.toml and the data dir.
+statusline -> config
+statusline -> core
+# Failures that the status line must swallow go to the debug channel.
+statusline -> diag
+# The dashboard's fleet summary (`fleet.json`).
+statusline -> fleet
+# The reading file is written with fsutil::atomic_write.
+statusline -> fsutil
 live -> core
 live -> index
 tui -> claude
@@ -78,6 +90,8 @@ tui -> index
 tui -> limits
 tui -> live
 tui -> power
+# Status-line reading files are a trigger to re-read the seats.
+tui -> statusline
 tui -> ui
 tui -> vault
 ui -> core

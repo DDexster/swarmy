@@ -161,6 +161,14 @@ impl Index {
         opts: &CompactOpts,
         progress: &mut dyn FnMut(&CompactReport),
     ) -> anyhow::Result<CompactReport> {
+        self.compact_untyped(opts, progress).map_err(super::typed)
+    }
+
+    fn compact_untyped(
+        &mut self,
+        opts: &CompactOpts,
+        progress: &mut dyn FnMut(&CompactReport),
+    ) -> anyhow::Result<CompactReport> {
         anyhow::ensure!(
             opts.keep_raw_days >= MIN_RAW_DAYS,
             "keep_raw_days must be at least {MIN_RAW_DAYS} (the current weekly window stays raw)"

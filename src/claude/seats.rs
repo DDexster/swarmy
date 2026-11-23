@@ -33,6 +33,17 @@ pub fn seat_id(dir: &Path) -> SeatId {
     SeatId::of_canonical_dir(&canon)
 }
 
+/// Where the `.claude.json` of config dir `dir` lives: `~/.claude.json` for the default dir
+/// (`~/.claude`), `<dir>/.claude.json` for any other (the rule [`discover`] follows).
+pub fn claude_json_of(dir: &Path, home: &Path) -> PathBuf {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    if canon(dir) == canon(&home.join(".claude")) {
+        home.join(".claude.json")
+    } else {
+        dir.join(".claude.json")
+    }
+}
+
 impl Seat {
     /// A seat of `dir`, its id derived from the path.
     pub fn new(
@@ -65,12 +76,28 @@ impl Seat {
 
     /// Days Claude Code keeps this seat's transcripts: `cleanupPeriodDays` of its
     /// `settings.json` (at least 1), `None` when not set (Claude Code's default applies,
-    /// `core::storage::DEFAULT_RETENTION_DAYS`).
-    pub fn cleanup_period_days(&self) -> Option<u32> {
-        let text = std::fs::read_to_string(self.dir.join("settings.json")).ok()?;
-        let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let days = v.get("cleanupPeriodDays")?.as_f64()?;
-        (days.is_finite() && days >= 1.0).then(|| days.min(f64::from(u32::MAX)) as u32)
+    /// `core::storage::DEFAULT_RETENTION_DAYS`). A file that exists but cannot be read or parsed
+    /// is an error, never "not set".
+    pub fn cleanup_period_days(&self) -> Result<Option<u32>, crate::errors::ConfigError> {
+        let path = self.dir.join("settings.json");
+        let damaged = |message: String| crate::errors::ConfigError::SeatSettings {
+            path: path.clone(),
+            message,
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(damaged(e.to_string())),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| damaged(e.to_string()))?;
+        let Some(days) = v
+            .get("cleanupPeriodDays")
+            .and_then(serde_json::Value::as_f64)
+        else {
+            return Ok(None);
+        };
+        Ok((days.is_finite() && days >= 1.0).then(|| days.min(f64::from(u32::MAX)) as u32))
     }
 }
 
@@ -219,27 +246,39 @@ mod tests {
         assert_eq!(seats[2].found_by, ["home scan", "config.toml"]);
         // Transcript retention: `cleanupPeriodDays`, else Claude Code's default.
         assert_eq!(
-            seats[1].cleanup_period_days(),
+            seats[1].cleanup_period_days().unwrap(),
             None,
             "settings.json without it"
         );
-        assert_eq!(seats[0].cleanup_period_days(), None, "no settings.json");
+        assert_eq!(
+            seats[0].cleanup_period_days().unwrap(),
+            None,
+            "no settings.json"
+        );
         std::fs::write(
             home.join("custom/cc/settings.json"),
             r#"{"cleanupPeriodDays": 45}"#,
         )
         .unwrap();
-        assert_eq!(seats[1].cleanup_period_days(), Some(45));
+        assert_eq!(seats[1].cleanup_period_days().unwrap(), Some(45));
         std::fs::write(
             home.join("custom/cc/settings.json"),
             r#"{"cleanupPeriodDays": 0}"#,
         )
         .unwrap();
         assert_eq!(
-            seats[1].cleanup_period_days(),
+            seats[1].cleanup_period_days().unwrap(),
             None,
             "below Claude Code's minimum"
         );
+        // A damaged file is no "not set": the retention is unknown, and said so (coded).
+        std::fs::write(
+            home.join("custom/cc/settings.json"),
+            r#"{"cleanupPeriodDays": 7"#,
+        )
+        .unwrap();
+        let e = anyhow::Error::from(seats[1].cleanup_period_days().unwrap_err());
+        assert_eq!(crate::errors::code_of(&e), Some("config-seat-settings"));
     }
 
     /// Review H3: a seat's id comes from its dir, never from its label. Discovering again with

@@ -84,13 +84,25 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
     // An unreadable vault is said so in ATTENTION, never shown as an empty one.
     match Vault::open(&ctx.dirs.vault_dir()) {
         Ok(mut v) => {
-            match v.edit(|tx| tx.seat_states(&ctx.seats)) {
+            // The dashboard keeps the vault's bookkeeping current, but never waits for another
+            // swarmy's change: when the vault is busy it shows what the vault says now.
+            let checked = v
+                .try_edit(|tx| tx.seat_states(&ctx.seats))
+                .and_then(|s| match s {
+                    Some(s) => Ok(s),
+                    None => v.seat_states(&ctx.seats),
+                });
+            match checked {
                 Ok(s) => states = s,
                 Err(e) => problems.push(format!("vault: seats not checked: {e:#}")),
             }
             vault_logins = v.logins().to_vec();
         }
         Err(e) => problems.push(format!("vault unreadable: {e:#}")),
+    }
+    // A transcript the index cannot read counts nothing until it can: said so, never silent.
+    for (path, error, _) in idx.unreadable_files()? {
+        problems.push(format!("cannot read {}: {error}", ctx.show_path(&path)));
     }
     problems.dedup();
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {

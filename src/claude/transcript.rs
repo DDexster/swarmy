@@ -325,6 +325,11 @@ pub struct ParseStats {
     pub by_type: BTreeMap<String, u64>,
 }
 
+/// The name under which the index keeps a file's count of damaged records (next to its record
+/// types): lines that were no JSON record, and records with numbers out of range. What they held
+/// is not counted, and `doctor` says so.
+pub const MALFORMED: &str = "(malformed line)";
+
 const KNOWN: &[&str] = &[
     "assistant",
     "user",
@@ -342,7 +347,11 @@ impl ParseStats {
     pub fn unknown_types(&self) -> Vec<(&str, u64)> {
         self.by_type
             .iter()
-            .filter(|(k, _)| !KNOWN.contains(&k.as_str()) && !SKIP.contains(&k.as_str()))
+            .filter(|(k, _)| {
+                !KNOWN.contains(&k.as_str())
+                    && !SKIP.contains(&k.as_str())
+                    && k.as_str() != MALFORMED
+            })
             .map(|(k, v)| (k.as_str(), *v))
             .collect()
     }
@@ -627,6 +636,57 @@ pub fn read_from(path: &Path, offset: u64) -> std::io::Result<Chunk> {
     Ok(chunk)
 }
 
+/// What the end of a transcript says about its last API response: when it was written and the
+/// account the session ran under then (the `session-owner` record before it, else the last one
+/// in the file).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Tail {
+    pub owner: Option<String>,
+    pub last_response: Option<DateTime<Utc>>,
+}
+
+/// Reads the end of a transcript: 64 KiB, then four times more each step up to `max` bytes,
+/// until the window holds the last response and the owner it ran under, or reaches the start of
+/// the file. For the status line, which needs these two facts and must not read whole files.
+pub fn tail(path: &Path, max: u64) -> std::io::Result<Tail> {
+    use std::io::Read as _;
+    let len = std::fs::metadata(path)?.len();
+    let mut window: u64 = 64 * 1024;
+    loop {
+        let start = len.saturating_sub(window);
+        let mut f = File::open(path)?;
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        f.take(len - start).read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+        let mut lines = text.split('\n');
+        if start > 0 {
+            // Starts inside a record.
+            lines.next();
+        }
+        let (mut owner, mut last, mut last_owner) = (None, None, None);
+        let (mut events, mut stats) = (Vec::new(), ParseStats::default());
+        for line in lines {
+            parse_line(line, &mut events, &mut stats);
+            for e in events.drain(..) {
+                if let Event::Owner { account_uuid } = e {
+                    owner = Some(account_uuid);
+                } else if let Event::Request(r) = e {
+                    last = Some(last.map_or(r.ts, |t: DateTime<Utc>| t.max(r.ts)));
+                    last_owner.clone_from(&owner);
+                }
+            }
+        }
+        if (last.is_some() && last_owner.is_some()) || start == 0 || window >= max {
+            return Ok(Tail {
+                owner: last_owner.or(owner),
+                last_response: last,
+            });
+        }
+        window = (window * 4).min(max);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,6 +701,55 @@ mod tests {
     }
 
     const ASSISTANT: &str = r#"{"parentUuid":"p","isSidechain":false,"cwd":"/w/proj","gitBranch":"main","effort":"high","requestedModel":"claude-opus-5-5","message":{"id":"msg_1","model":"claude-opus-5-5","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"cargo test --no-fail-fast\nsecond line"}}],"stop_reason":"tool_use","usage":{"input_tokens":2,"cache_creation_input_tokens":409,"cache_read_input_tokens":155527,"output_tokens":192,"output_tokens_details":{"thinking_tokens":7},"server_tool_use":{"web_search_requests":1},"cache_creation":{"ephemeral_1h_input_tokens":409,"ephemeral_5m_input_tokens":0},"speed":"standard"}},"requestId":"req_1","type":"assistant","uuid":"u1","timestamp":"2026-11-22T11:53:56.181Z","sessionId":"s"}"#;
+
+    /// The status line's view of a transcript: the last response and the owner it ran under,
+    /// found from the end, however far back the owner record is.
+    #[test]
+    fn the_tail_names_the_last_response_and_its_owner() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("s.jsonl");
+        let owner =
+            |a: &str| format!(r#"{{"type":"session-owner","accountUuid":"{a}","sessionId":"s"}}"#);
+        let at = |ts: &str| ASSISTANT.replace("2026-11-22T11:53:56.181Z", ts);
+        let filler = format!(
+            r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+            "x".repeat(70_000)
+        );
+        let mut lines = vec![owner("acc-a"), at("2026-11-22T10:00:00Z")];
+        lines.extend(std::iter::repeat_n(filler.clone(), 3));
+        lines.push(at("2026-11-22T11:00:00Z"));
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        let got = tail(&p, 1 << 20).unwrap();
+        assert_eq!(got.owner.as_deref(), Some("acc-a"), "found 200 KiB back");
+        assert_eq!(
+            got.last_response,
+            Some(parse_ts(Some("2026-11-22T11:00:00Z")).unwrap())
+        );
+        // A newer owner record after the last response (the next turn has not answered yet):
+        // the response still ran under the old one.
+        lines.push(owner("acc-b"));
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert_eq!(tail(&p, 1 << 20).unwrap().owner.as_deref(), Some("acc-a"));
+        lines.push(at("2026-11-22T12:00:00Z"));
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert_eq!(tail(&p, 1 << 20).unwrap().owner.as_deref(), Some("acc-b"));
+        // Too far back for the window: no owner, rather than reading the whole file.
+        let got = tail(&p, 64 * 1024).unwrap();
+        assert_eq!(got.owner.as_deref(), Some("acc-b"));
+        std::fs::write(
+            &p,
+            [
+                owner("acc-a"),
+                filler.clone(),
+                filler,
+                at("2026-11-22T13:00:00Z"),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        assert_eq!(tail(&p, 64 * 1024).unwrap().owner, None);
+    }
 
     #[test]
     fn assistant_request_with_tool_use() {

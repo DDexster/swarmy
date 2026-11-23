@@ -24,7 +24,7 @@ pub enum VaultError {
     #[error("a label is needed")]
     LabelEmpty,
     #[error(
-        "login '{login}' is in use in seat '{seat}'. One OAuth grant in two seats breaks one of them when the token rotates. Log in separately there (`swarmy accounts add`), or pass --share to copy it anyway."
+        "login '{login}' is in use in seat '{seat}'. One OAuth grant in two seats is refreshed by both, and if the server ever rotates or revokes its refresh token one of them is logged out. Log in separately there (`swarmy accounts add`), or pass --share to copy it anyway."
     )]
     SharedGrant { login: String, seat: String },
     #[error(
@@ -35,6 +35,15 @@ pub enum VaultError {
     MissingSecret(String),
     #[error("on macOS Claude Code keeps the login in the Keychain; the vault cannot read it yet")]
     Keychain,
+    #[error(
+        "{} kept changing while swarmy tried to write it (Claude Code is writing it); nothing was overwritten, try again",
+        .0.display()
+    )]
+    SeatBusy(PathBuf),
+    #[error(
+        "the switch of seat '{seat}' stopped half way: {what}. The vault records what the seat holds now; run the switch again"
+    )]
+    SwitchIncomplete { seat: String, what: String },
 }
 
 /// `config.toml`.
@@ -47,6 +56,12 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    /// A seat's `settings.json` (Claude Code's) that cannot be read: its transcript retention
+    /// (`cleanupPeriodDays`) is unknown, never taken for the default silently.
+    #[error(
+        "{path} is damaged ({message}): transcript retention unknown, Claude Code's default assumed"
+    )]
+    SeatSettings { path: PathBuf, message: String },
 }
 
 /// `swarmy setup` (Claude Code's `settings.json`).
@@ -61,6 +76,14 @@ pub enum SetupError {
 pub enum IndexError {
     #[error("the index was written by a newer swarmy ({what} version {version}); update swarmy")]
     NewerVersion { what: &'static str, version: u32 },
+    /// Another process held the index's write lock past the busy timeout (a compaction chunk, a
+    /// `VACUUM`, a second dashboard's refresh).
+    #[error("another swarmy is writing the index (a compaction or VACUUM?); try again ({0})")]
+    Busy(String),
+    #[error("the index is damaged ({0}); move it aside and swarmy builds a new one")]
+    Damaged(String),
+    #[error("no space left on the disk of the index ({0})")]
+    NoSpace(String),
 }
 
 /// What a user named on the command line (`--account`, `--seat`).
@@ -98,6 +121,8 @@ impl Coded for VaultError {
             VaultError::InUse { .. } => "vault-in-use",
             VaultError::MissingSecret(_) => "vault-missing-secret",
             VaultError::Keychain => "vault-keychain",
+            VaultError::SeatBusy(_) => "vault-seat-busy",
+            VaultError::SwitchIncomplete { .. } => "vault-switch-incomplete",
         }
     }
 }
@@ -107,6 +132,7 @@ impl Coded for ConfigError {
         match self {
             ConfigError::Invalid { .. } => "config-invalid",
             ConfigError::Unreadable { .. } => "config-unreadable",
+            ConfigError::SeatSettings { .. } => "config-seat-settings",
         }
     }
 }
@@ -123,6 +149,9 @@ impl Coded for IndexError {
     fn code(&self) -> &'static str {
         match self {
             IndexError::NewerVersion { .. } => "index-newer",
+            IndexError::Busy(_) => "index-busy",
+            IndexError::Damaged(_) => "index-damaged",
+            IndexError::NoSpace(_) => "index-no-space",
         }
     }
 }
@@ -204,6 +233,12 @@ mod tests {
             .code(),
             VaultError::MissingSecret(String::new()).code(),
             VaultError::Keychain.code(),
+            VaultError::SeatBusy(PathBuf::new()).code(),
+            VaultError::SwitchIncomplete {
+                seat: String::new(),
+                what: String::new(),
+            }
+            .code(),
             ConfigError::Invalid {
                 path: PathBuf::new(),
                 message: String::new(),
@@ -214,12 +249,20 @@ mod tests {
                 source: std::io::Error::other("x"),
             }
             .code(),
+            ConfigError::SeatSettings {
+                path: PathBuf::new(),
+                message: String::new(),
+            }
+            .code(),
             SetupError::SettingsDamaged(PathBuf::new()).code(),
             IndexError::NewerVersion {
                 what: "facts",
                 version: 9,
             }
             .code(),
+            IndexError::Busy(String::new()).code(),
+            IndexError::Damaged(String::new()).code(),
+            IndexError::NoSpace(String::new()).code(),
             LookupError::NoAccount(String::new()).code(),
             LookupError::AmbiguousAccount {
                 key: String::new(),

@@ -252,22 +252,22 @@ fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
         anyhow::bail!("usage_rollup lost a key column");
     };
     let mut sel = tx.prepare(&format!(
-        "SELECT {}, input, cw5, cw1h, cread, output, thinking, web FROM usage_rollup
+        "SELECT {}, input, cw5, cw1h, cread, output, thinking, web, requests, n_empty FROM usage_rollup
          WHERE bucket >= ?1 AND bucket < ?2",
         pk.join(", ")
     ))?;
     let parts = schema::COST_PARTS;
     let mut upd = tx.prepare(&format!(
-        "UPDATE usage_rollup SET cost = ?1, priced = ?2, {} WHERE {}",
+        "UPDATE usage_rollup SET cost = ?1, priced = ?2, n_unpriced = ?3, {} WHERE {}",
         parts
             .iter()
             .enumerate()
-            .map(|(i, c)| format!("{c} = ?{}", i + 3))
+            .map(|(i, c)| format!("{c} = ?{}", i + 4))
             .collect::<Vec<_>>()
             .join(", "),
         pk.iter()
             .enumerate()
-            .map(|(i, c)| format!("{c} = ?{}", i + 3 + parts.len()))
+            .map(|(i, c)| format!("{c} = ?{}", i + 4 + parts.len()))
             .collect::<Vec<_>>()
             .join(" AND ")
     ))?;
@@ -281,7 +281,7 @@ fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
         if a > hi {
             break;
         }
-        let rows: Vec<(Vec<rusqlite::types::Value>, Usage)> = sel
+        let rows: Vec<(Vec<rusqlite::types::Value>, Usage, i64, i64)> = sel
             .query_map([a, b], |r| {
                 let key = (0..n)
                     .map(|i| r.get::<_, rusqlite::types::Value>(i))
@@ -299,18 +299,27 @@ fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
                         thinking: tok(5)?,
                         web_search: tok(6)?,
                     },
+                    r.get(n + 7)?,
+                    r.get(n + 8)?,
                 ))
             })?
             .collect::<Result<_, _>>()?;
-        for (key, usage) in rows {
+        for (key, usage, requests, empty) in rows {
             let int = |i: usize| matches!(key[i], rusqlite::types::Value::Integer(1));
             let rusqlite::types::Value::Text(model) = &key[i_model] else {
                 anyhow::bail!("a rollup row without a model");
             };
-            let p = book.cost_parts_in_band(model, day, &usage, int(i_fast), int(i_long));
+            let mut p = book.cost_parts_in_band(model, day, &usage, int(i_fast), int(i_long));
+            // Without a price, the requests without tokens still cost $0 each, as they do raw
+            // (`PriceBook::cost_parts`): the row's cost is known (0) when it has any.
+            let unpriced = if p.is_some() { 0 } else { requests - empty };
+            if p.is_none() && empty > 0 {
+                p = Some(CostParts::default());
+            }
             let mut values: Vec<rusqlite::types::Value> = vec![
                 p.map(|p| p.total().get()).into(),
                 i64::from(p.is_some()).into(),
+                unpriced.into(),
             ];
             values.extend(cost_parts(p).iter().map(|v| (*v).into()));
             values.extend(key);
@@ -321,7 +330,7 @@ fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
     tx.execute_batch(
         "UPDATE agent_rollup SET cost = s.cost, unpriced = s.unpriced
          FROM (SELECT seat, session_id, agent_id, TOTAL(cost) AS cost,
-                      SUM(CASE WHEN priced = 0 THEN requests ELSE 0 END) AS unpriced
+                      SUM(n_unpriced) AS unpriced
                FROM usage_rollup GROUP BY seat, session_id, agent_id) AS s
          WHERE agent_rollup.seat = s.seat AND agent_rollup.session_id = s.session_id
            AND agent_rollup.agent_id = s.agent_id",

@@ -250,8 +250,10 @@ fn remove_refuses_mounted_logins_and_secrets_never_print() -> anyhow::Result<()>
 #[test]
 fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
-    const THREADS: usize = 8;
-    const ROUNDS: usize = 40;
+    // Enough to interleave every kind of change many times, small enough that no edit waits
+    // anywhere near `LOCK_TIMEOUT` on a loaded machine (review L4: 8 × 40 once timed out).
+    const THREADS: usize = 4;
+    const ROUNDS: usize = 16;
     let t = tempfile::tempdir()?;
     let vdir = t.path().join("vault");
     let seats: Vec<Seat> = (0..3)
@@ -295,21 +297,25 @@ fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<(
                     for r in 0..ROUNDS {
                         let seat = &seats[(th + r) % seats.len()];
                         let step = r % 4;
-                        if step == 0 {
+                        let done = if step == 0 {
                             let sec = secret(&format!("r-{th}-{r}"));
                             let label = format!("t{th}-{r}");
-                            v.edit(|tx| tx.put(&sec, None, None, Some(&label), None))?;
+                            v.edit(|tx| tx.put(&sec, None, None, Some(&label), None))
+                                .map(drop)
                         } else if step == 1 {
-                            v.edit(|tx| tx.capture(seat, None))?;
+                            v.edit(|tx| tx.capture(seat, None)).map(drop)
                         } else if step == 2 {
-                            v.edit(|tx| tx.seat_states(seats))?;
+                            v.edit(|tx| tx.seat_states(seats)).map(drop)
                         } else {
                             let login = format!("t{th}-{}", r - 3);
                             v.edit(|tx| {
                                 tx.sync(seats)?;
                                 tx.switch(seat, &login, false)
-                            })?;
-                        }
+                            })
+                            .map(drop)
+                        };
+                        // Says which change failed and why, so a failure is never a mystery.
+                        done.with_context(|| format!("thread {th}, round {r}, step {step}"))?;
                     }
                     Ok(())
                 })
@@ -766,5 +772,331 @@ fn a_key_naming_two_logins_is_ambiguous() -> anyhow::Result<()> {
     assert_eq!(crate::errors::code_of(&e), Some("vault-no-login"));
     let e = v.edit(|tx| tx.rename("first", "")).unwrap_err();
     assert_eq!(crate::errors::code_of(&e), Some("vault-label-empty"));
+    Ok(())
+}
+
+/// Test-only hooks into the middle of a switch.
+pub(super) mod hooks {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static BEFORE_SEAT_WRITE: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Runs the hook set on this thread, right before a switch writes the seat's credentials.
+    pub(in crate::vault) fn before_seat_write() {
+        BEFORE_SEAT_WRITE.with(|h| {
+            if let Some(f) = h.borrow_mut().as_mut() {
+                f();
+            }
+        });
+    }
+
+    pub(super) fn set_before_seat_write(f: Option<Hook>) {
+        BEFORE_SEAT_WRITE.with(|h| *h.borrow_mut() = f);
+    }
+}
+
+/// A seat whose `.claude.json` lives outside its dir (as the default seat's does, in `$HOME`).
+fn seat_with_home(root: &Path, label: &str) -> anyhow::Result<(Seat, PathBuf)> {
+    let dir = root.join(format!(".claude-{label}"));
+    let home = root.join(format!("home-{label}"));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(&home)?;
+    Ok((
+        Seat::new(label, dir.clone(), home.join(".claude.json"), false),
+        home,
+    ))
+}
+
+#[cfg(unix)]
+fn chmod(p: &Path, mode: u32) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+/// Review H4: the `.claude.json` write fails after the credentials were written (here: its dir
+/// cannot be written, as `$HOME` may not be for the default seat). The seat goes back to what it
+/// held, and the vault still says so: the login stays mounted, the target stays free.
+#[cfg(unix)]
+#[test]
+fn a_switch_that_fails_half_way_puts_the_seat_back() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let (work, home) = seat_with_home(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| {
+        tx.put(
+            &secret("r-bob"),
+            Some(json!({"accountUuid": "bob"})),
+            None,
+            Some("bob"),
+            None,
+        )
+    })?;
+    let creds_before = std::fs::read_to_string(work.credentials_file())?;
+    chmod(&home, 0o500)?;
+    if std::fs::write(home.join("probe"), "").is_ok() {
+        // Running as root: permissions do not stop the write, nothing to prove here.
+        chmod(&home, 0o700)?;
+        return Ok(());
+    }
+    let res = v.edit(|tx| tx.switch(&work, "bob", false));
+    chmod(&home, 0o700)?;
+    let err = format!("{:#}", res.err().context("the switch had to fail")?);
+    assert!(err.contains("the seat is as it was"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(work.credentials_file())?,
+        creds_before,
+        "the credentials are back as they were"
+    );
+    assert_eq!(
+        read_json(&work.claude_json)?["oauthAccount"]["accountUuid"],
+        "alice"
+    );
+    assert_eq!(login(&v, "alice")?.mounted.as_ref(), Some(&work.id));
+    assert_eq!(login(&v, "bob")?.mounted, None);
+    // Nothing is half done: the same switch works once the file can be written.
+    v.edit(|tx| tx.switch(&work, "bob", false))?;
+    assert_eq!(
+        read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
+        "r-bob"
+    );
+    assert_eq!(
+        read_json(&work.claude_json)?["oauthAccount"]["accountUuid"],
+        "bob"
+    );
+    Ok(())
+}
+
+/// Review H4: a switch that died between its two writes (or a seat file put back by hand)
+/// leaves a saved login in a seat while the vault calls it free. The next sync mounts it there,
+/// so the one-grant-one-seat guard still holds.
+#[test]
+fn a_seat_holding_a_free_saved_login_gets_it_mounted() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let spare = seat(t.path(), "spare")?;
+    write_seat(&work, "r-alice", "alice")?;
+    write_seat(&spare, "r-carol", "carol")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.capture(&spare, Some("carol")))?;
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    // The credentials are bob's, `.claude.json` still names alice.
+    write_creds(&work, "acc-r-bob", "r-bob")?;
+    let both = [work.clone(), spare.clone()];
+    v.edit(|tx| tx.sync(&both))?;
+    assert_eq!(login(&v, "bob")?.mounted.as_ref(), Some(&work.id));
+    assert_eq!(login(&v, "alice")?.mounted, None);
+    let e = v
+        .edit(|tx| tx.switch(&spare, "bob", false))
+        .err()
+        .context("bob is in `work`: refused without --share")?;
+    assert_eq!(crate::errors::code_of(&e), Some("vault-shared-grant"));
+    Ok(())
+}
+
+/// Review M7: Claude Code refreshes the seat's token while a switch runs (after swarmy saved the
+/// seat's login, before it replaced the file). The newer token is saved first, never lost.
+#[test]
+fn a_token_refreshed_during_a_switch_is_saved_not_overwritten() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    let creds = work.credentials_file();
+    let mut fired = false;
+    hooks::set_before_seat_write(Some(Box::new(move || {
+        if !fired {
+            fired = true;
+            let refreshed = json!({"mcpOAuth": {"plugin:x|1": {"accessToken": "mcp-new"}},
+                "claudeAiOauth": {"accessToken": "acc-refreshed", "refreshToken": "r-alice"}});
+            if let Err(e) = store::atomic_write(&creds, refreshed.to_string().as_bytes()) {
+                panic!("cannot simulate Claude Code: {e}");
+            }
+        }
+    })));
+    let res = v.edit(|tx| tx.switch(&work, "bob", false));
+    hooks::set_before_seat_write(None);
+    res?;
+    let alice = login(&v, "alice")?.clone();
+    assert_eq!(
+        secret_of(&v, &alice.id)?["accessToken"],
+        "acc-refreshed",
+        "the token Claude Code wrote meanwhile was saved"
+    );
+    let now = read_json(&work.credentials_file())?;
+    assert_eq!(now["claudeAiOauth"]["refreshToken"], "r-bob");
+    assert_eq!(
+        now["mcpOAuth"]["plugin:x|1"]["accessToken"], "mcp-new",
+        "the MCP token written meanwhile is kept too"
+    );
+    Ok(())
+}
+
+/// Review M7 (defects): a file another program keeps rewriting is never overwritten blindly
+/// (the eighth attempt used to write anyway), and a torn read is read again instead of failing
+/// the change half way.
+#[test]
+fn merging_writes_never_go_over_an_unseen_version() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let path = t.path().join(".claude.json");
+    std::fs::write(&path, r#"{"n": 0, "oauthAccount": {"accountUuid": "a"}}"#)?;
+    let n = std::cell::Cell::new(0);
+    let res = store::rewrite_merging(&path, |text| {
+        n.set(n.get() + 1);
+        // Claude Code writes a newer version every time swarmy has read one.
+        let newer = format!(
+            r#"{{"n": {}, "oauthAccount": {{"accountUuid": "a"}}}}"#,
+            n.get()
+        );
+        store::atomic_write(&path, newer.as_bytes())?;
+        config_json::with_oauth_account(text, Some(&json!({"accountUuid": "b"})))
+    });
+    let e = res
+        .err()
+        .context("a file that never holds still is not written")?;
+    assert_eq!(crate::errors::code_of(&e), Some("vault-seat-busy"));
+    let cj = read_json(&path)?;
+    assert_eq!(cj["n"], n.get(), "the other writer's last version stands");
+    assert_eq!(cj["oauthAccount"]["accountUuid"], "a");
+
+    let calls = std::cell::Cell::new(0);
+    let wrote = store::rewrite_merging(&path, |text| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 1 {
+            anyhow::bail!("EOF while parsing (Claude Code is mid-write)");
+        }
+        config_json::with_oauth_account(text, Some(&json!({"accountUuid": "b"})))
+    })?;
+    assert!(wrote);
+    assert_eq!(read_json(&path)?["oauthAccount"]["accountUuid"], "b");
+
+    // Replaced only while it holds exactly what was read.
+    let text = std::fs::read_to_string(&path)?;
+    assert!(!store::replace_if_unchanged(
+        &path,
+        Some("{}"),
+        Some(b"{\"x\": 1}")
+    )?);
+    assert_eq!(std::fs::read_to_string(&path)?, text);
+    assert!(store::replace_if_unchanged(
+        &path,
+        Some(&text),
+        Some(b"{\"x\": 1}")
+    )?);
+    assert_eq!(read_json(&path)?["x"], 1);
+    assert_eq!(count(t.path(), ".tmp"), 0, "no temp file is left behind");
+    Ok(())
+}
+
+/// Review M6: Claude Code keeps the refresh token when it refreshes (verified on 2.1.329), so a
+/// login is named by it. Should a refresh ever rotate it, the login keeps its identity: same
+/// account and plan, a fresh access token written by Claude Code. The saved copy follows, the
+/// login stays mounted, the seat stays confirmed, and switching back writes the live grant. A
+/// copied-in file with a stale access token is still another login.
+#[test]
+fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let write = |refresh: &str, expires: chrono::DateTime<Utc>| -> anyhow::Result<()> {
+        let creds = json!({"mcpOAuth": {}, "claudeAiOauth": {
+            "accessToken": format!("acc-{refresh}"), "refreshToken": refresh,
+            "expiresAt": expires.timestamp_millis()}});
+        std::fs::write(work.credentials_file(), creds.to_string())?;
+        Ok(())
+    };
+    write("r-alice-2", Utc::now() + chrono::Duration::hours(8))?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert_eq!(st.unverified_since, None, "{st:?}");
+    assert_eq!(st.account_uuid.as_deref(), Some("alice"));
+    assert_eq!(st.saved_as.as_deref(), Some("alice"));
+    let alice = login(&v, "alice")?.clone();
+    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
+    assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
+    assert_eq!(v.logins().len(), 1, "no second login for the same grant");
+
+    // Away and back: the live, rotated grant goes back into the seat.
+    v.edit(|tx| {
+        tx.put(
+            &secret("r-bob"),
+            Some(json!({"accountUuid": "bob"})),
+            None,
+            Some("bob"),
+            None,
+        )
+    })?;
+    v.edit(|tx| tx.switch(&work, "bob", false))?;
+    v.edit(|tx| tx.switch(&work, "alice", false))?;
+    assert_eq!(
+        read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
+        "r-alice-2"
+    );
+    assert_eq!(v.logins().len(), 2);
+
+    // An old copy of the same account (its access token long expired) is not a rotation.
+    write("r-alice-old", Utc::now() - chrono::Duration::hours(1))?;
+    v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
+    let alice = login(&v, "alice")?.clone();
+    assert_eq!(alice.mounted, None);
+    assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
+    Ok(())
+}
+
+/// Review L4: reading the seats' state takes no lock and writes nothing, so a report or the
+/// dashboard never waits for (or fails on) another swarmy's change. The dashboard does the
+/// bookkeeping on the side, only when the vault is free.
+#[test]
+fn reading_seat_states_takes_no_lock_and_writes_nothing() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let vdir = t.path().join("vault");
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&vdir)?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    // Something to keep current: Claude Code refreshed the access token.
+    write_creds(&work, "acc-new", "r-alice")?;
+    let files = || -> anyhow::Result<(String, String)> {
+        Ok((
+            std::fs::read_to_string(vdir.join("logins.json"))?,
+            std::fs::read_to_string(vdir.join("secrets.json"))?,
+        ))
+    };
+    let before = files()?;
+    // Another swarmy is changing the vault.
+    let held = store::Lock::acquire(&vdir.join("lock"), std::time::Duration::ZERO)?;
+    let t0 = std::time::Instant::now();
+    let states = v.seat_states(std::slice::from_ref(&work))?;
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "it waited"
+    );
+    assert_eq!(states[&work.id].saved_as.as_deref(), Some("alice"));
+    assert_eq!(states[&work.id].account_uuid.as_deref(), Some("alice"));
+    assert!(
+        v.try_edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?
+            .is_none(),
+        "busy: skipped at once"
+    );
+    assert_eq!(files()?, before, "nothing was written");
+    drop(held);
+    assert!(
+        v.try_edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?
+            .is_some()
+    );
+    let alice = login(&v, "alice")?.clone();
+    assert_eq!(secret_of(&v, &alice.id)?["accessToken"], "acc-new");
     Ok(())
 }

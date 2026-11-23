@@ -135,7 +135,7 @@ mod tests {
             }
             let mut rec = json!({
                 "type": "assistant", "timestamp": ts(t), "cwd": cwd, "sessionId": "s",
-                "message": {"id": msg, "model": model, "content": content,
+                "message": {"id": msg, "model": model, "content": [],
                     "usage": {"input_tokens": self.rng.below(6000), "output_tokens": self.rng.below(3000),
                         "cache_creation_input_tokens": 0, "cache_read_input_tokens": cread,
                         "cache_creation": {"ephemeral_5m_input_tokens": self.rng.below(2000),
@@ -150,7 +150,15 @@ mod tests {
             if let Some(r) = requested {
                 rec["requestedModel"] = json!(r);
             }
-            self.lines.push(rec.to_string());
+            // As Claude Code writes a response: one record per content block, the same message
+            // id and usage, each block at its own time (a text block, then each tool call two
+            // seconds apart).
+            let blocks = std::iter::once(json!({"type": "text", "text": "on it"})).chain(content);
+            for (k, block) in blocks.enumerate() {
+                rec["timestamp"] = json!(ts(t + Duration::seconds(2 * k as i64)));
+                rec["message"]["content"] = json!([block]);
+                self.lines.push(rec.to_string());
+            }
             self.lines.extend(results.iter().map(Value::to_string));
         }
 
@@ -319,8 +327,8 @@ mod tests {
         write(&dir("work").join("long.jsonl"), &long, false);
     }
 
-    /// The login history: `lab` and `work` had acc-a, `home` acc-b; `work` swapped to acc-b on
-    /// day 19 (the long session keeps writing its old owner, the seat decides).
+    /// The login history: `lab` and `work` had acc-a, `home` acc-b; `work` shows acc-b later
+    /// (seen when refreshed, after every request here: the sessions' owners decide).
     pub(crate) fn refresh(w: &World, idx: &mut Index) {
         let book = PriceBook::builtin();
         let info = |work: &str, since: &str| {

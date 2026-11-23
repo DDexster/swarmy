@@ -473,7 +473,7 @@ fn fleet_of(
     snap: &live::Snapshot,
     limits: &[limits::AccountReport],
 ) -> crate::fleet::Fleet {
-    use crate::fleet::{Fleet, NeedsYou, SeatLimit};
+    use crate::fleet::{Fleet, NeedsYou};
     let mut f = Fleet {
         v: crate::fleet::VERSION,
         writer_pid: std::process::id(),
@@ -549,23 +549,34 @@ fn fleet_of(
             });
         f.seats.insert(
             s.id.clone(),
-            SeatLimit {
-                label: s.label.clone(),
-                account_name: ctx.account_name(&acct),
-                week_used: week.map(|w| w.estimate_now.get()),
-                runs_out_at: week.and_then(|w| w.eta).map(|d| ctx.now + d),
-                resets_at: week.map(|w| w.reading.resets_at),
-            },
+            seat_limit(&s.label, ctx.account_name(&acct), week),
         );
     }
     f
+}
+
+/// A seat's week in the fleet summary, from the last limits pass only: nothing here moves with
+/// the clock, so an unchanged pass gives an equal summary and `fleet.json` is written only on
+/// the keep-alive (review L2: `now + eta` each tick drifted and rewrote it every second).
+fn seat_limit(
+    label: &str,
+    account_name: String,
+    week: Option<&limits::WindowReport>,
+) -> crate::fleet::SeatLimit {
+    crate::fleet::SeatLimit {
+        label: label.to_string(),
+        account_name,
+        week_used: week.map(|w| w.estimate_now.get()),
+        runs_out_at: week.and_then(|w| w.runs_out_at),
+        resets_at: week.map(|w| w.reading.resets_at),
+    }
 }
 
 /// Modification times of the seats' status-line readings (one `stat` per seat).
 fn statusline_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
     ctx.seats
         .iter()
-        .map(|s| crate::claude::statusline::file_of(&ctx.dirs.data, &s.id))
+        .map(|s| crate::statusline::reading::file_of(&ctx.dirs.data, &s.id))
         .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         .collect()
 }
@@ -629,4 +640,56 @@ fn dir_size(p: &std::path::Path) -> u64 {
         }
     }
     total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::limits::{Reading, WindowKind};
+    use crate::core::units::{Pct, Usd};
+
+    /// Review L2: the fleet's week comes from the last limits pass only. Two ticks a few
+    /// seconds apart with the same pass give an equal summary (so `fleet.json` waits for the
+    /// keep-alive), and the run-out time is the instant estimated then, not `now + eta` again.
+    #[test]
+    fn the_fleet_week_does_not_move_with_the_clock() {
+        let pass = "2026-11-22T10:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        let reading = Reading {
+            kind: WindowKind::SevenDay,
+            utilization: 70.0,
+            resets_at: pass + chrono::Duration::days(2),
+            fetched_at: pass,
+        };
+        let week = limits::WindowReport {
+            reading,
+            reset_passed: false,
+            window: reading.window(),
+            manual_reset: None,
+            own_usd_per_point: None,
+            usd_per_point: None,
+            reference: None,
+            cost_in_window: Usd::ZERO,
+            estimate_now: Pct::new(70.0),
+            visible_points: None,
+            outside_points: None,
+            burn_usd_per_hour: Usd::ZERO,
+            points_per_hour: None,
+            eta: Some(chrono::Duration::hours(7)),
+            runs_out_at: Some(pass + chrono::Duration::hours(7)),
+            eta_seconds: Some(7 * 3600),
+            shares: Vec::new(),
+            window_usd: None,
+            curve: Vec::new(),
+            curve_step: chrono::Duration::hours(1),
+            marks: Vec::new(),
+        };
+        let tick = || seat_limit("work", "alice".into(), Some(&week));
+        let first = tick();
+        assert_eq!(first.runs_out_at, Some(pass + chrono::Duration::hours(7)));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert_eq!(tick(), first);
+        assert_eq!(first.week_used, Some(70.0));
+    }
 }

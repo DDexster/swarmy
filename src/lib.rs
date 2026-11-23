@@ -17,6 +17,7 @@ pub mod index;
 pub mod limits;
 pub mod live;
 pub mod power;
+pub mod statusline;
 pub mod tui;
 pub mod ui;
 pub mod vault;

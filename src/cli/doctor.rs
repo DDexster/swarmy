@@ -3,7 +3,7 @@
 use crate::claude::registry::{self, SessionStatus};
 use crate::claude::transcript::ParseStats;
 use crate::core::period::Period;
-use crate::index::query::Filter;
+use crate::index::query::{Counted, Filter};
 use crate::ui::fmt;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
@@ -198,10 +198,10 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         ok(&format!(
             "{} transcripts · {} requests · {} tool calls · {} sessions · {} agents",
             fmt::count(stats.files_total as u64),
-            fmt::count(idx.count("requests")?),
-            fmt::count(idx.count("tool_calls")?),
-            fmt::count(idx.count("sessions")?),
-            fmt::count(idx.count("agents")?)
+            fmt::count(idx.count(Counted::Requests)?),
+            fmt::count(idx.count(Counted::ToolCalls)?),
+            fmt::count(idx.count(Counted::Sessions)?),
+            fmt::count(idx.count(Counted::Agents)?)
         ))
     );
     println!(
@@ -215,7 +215,32 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     );
     let mut ps = ParseStats::default();
     for (t, n) in idx.record_types()? {
-        ps.by_type.insert(t, n);
+        if t == crate::claude::transcript::MALFORMED {
+            ps.malformed = n;
+        } else {
+            ps.by_type.insert(t, n);
+        }
+    }
+    if ps.malformed > 0 {
+        println!(
+            "{}",
+            warn(&format!(
+                "{} transcript records are damaged (no JSON, or numbers out of range): what they held is not counted",
+                fmt::count(ps.malformed)
+            ))
+        );
+    }
+    for (path, error, since) in idx.unreadable_files()? {
+        println!(
+            "{}",
+            warn(&format!(
+                "cannot read {} since {}: {error}; nothing of it is counted until it can be read",
+                ctx.show_path(&path),
+                crate::index::from_ms(since)
+                    .with_timezone(&chrono::Local)
+                    .format("%a %d %b %H:%M")
+            ))
+        );
     }
     let unknown = ps.unknown_types();
     if unknown.is_empty() {

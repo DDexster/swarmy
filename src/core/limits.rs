@@ -470,6 +470,9 @@ pub struct WindowEstimate {
     pub points_per_hour: Option<Pct>,
     /// When it runs out at this pace, if before the reset ([`runs_out`]).
     pub eta: Option<Duration>,
+    /// The same as an instant, fixed when estimated: `now + eta` added again on every later tick
+    /// would drift by up to a limits pass (review L2).
+    pub runs_out_at: Option<DateTime<Utc>>,
     pub shares: Vec<Share>,
     /// ≈ API-equivalent dollars of a full window.
     pub window_usd: Option<Usd>,
@@ -523,6 +526,7 @@ pub fn window_estimate(
         burn_usd_per_hour,
         points_per_hour,
         eta,
+        runs_out_at: eta.map(|d| now + d),
         shares,
         window_usd: usd_per_point.map(|u| Pct::new(100.0) * u),
         curve,
@@ -862,6 +866,7 @@ mod tests {
         assert!(near(e.burn_usd_per_hour, 2.0));
         assert!(near(e.points_per_hour.unwrap(), 4.0));
         assert_eq!(e.eta, Some(Duration::hours(15)));
+        assert_eq!(e.runs_out_at, Some(hour(76) + Duration::hours(15)));
         // The visible 30 points split $10 : $5 → a 20, b 10 (largest first).
         assert_eq!(e.shares[0].key, "a");
         assert!(near(e.shares[0].limit_points, 20.0));

@@ -13,6 +13,11 @@ logins. Users run it in a spare terminal, mostly on laptops.
   first, backs up both files, writes atomically, merges only `oauthAccount` into `.claude.json` as
   it is right before the write, and keeps `mcpOAuth`. Every vault change goes through
   `Vault::edit` (OS lock, re-read under it, backup, atomic writes); never write vault files elsewhere.
+  A switch is all or nothing for the seat (`vault/switch.rs`): `.credentials.json` is replaced only
+  while it holds what was saved (`store::replace_if_unchanged`), `.claude.json` through
+  `store::rewrite_merging`, which fails rather than write over a version it has not read; a failed
+  second write puts the first back. Read paths (`Ctx`, reports) use `Vault::seat_states` (no lock,
+  no write); the dashboard does the bookkeeping with `Vault::try_edit` (skipped when busy).
 - **No personal data in git**: no real home paths, user names, emails, account UUIDs or real config
   dir names in code, tests, fixtures, docs or screenshots. Tests use synthetic data; screenshots and
   GIFs come only from `swarmy demo`. Check the staged diff before every commit.
@@ -91,11 +96,15 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `keep_raw_days` (`[storage]`, default 14, `core::storage::keep_raw_days` checks it against the
   weekly window and each seat's `cleanupPeriodDays`), then `Index::compact` rolls them into the
   quarter-hour archive. Every read of a span reaching `rolled_until` goes through
-  `archive::plan`; a repricing (`price_all`), a login switch (`post_pass`) and a projects
-  recompute cover the rollups too; a file read from its start skips rolled-up records
-  (`marks.rs`), and a refresh rolls up at once whatever a newly found seat added below
-  `rolled_until`. Compaction is `Job::Compact` in the dashboard and `swarmy compact`
-  (`--dry-run`, `--verify` on a copy, `--vacuum`); prove a change with
+  `archive::plan`; a repricing (`price_all`) and a projects recompute cover the rollups too
+  (a login change never moves a rollup: it is dated when seen, and owners decide); a file read
+  from its start skips rolled-up records (`marks.rs`: whole responses, decided by their first
+  record; only what was read before or what the archive provably holds), and a refresh rolls up
+  at once whatever a newly found seat added below `rolled_until`. A `CACHE_VERSION` rebuild keeps
+  the raw rows no transcript gives back (`schema::stash_unrereadable`); nothing read is dropped
+  silently (`unreadable_files`, damaged records in `record_types`). Compaction is `Job::Compact`
+  in the dashboard and `swarmy compact` (`--dry-run`, `--verify` on a copy, `--vacuum`); prove a
+  change with
   `compact_scenarios.rs` (compacted index = never-compacted index on every surface). SQLite's
   temp files go to `<data>/tmp` (`index::use_temp_dir`), never `/tmp`.
 
@@ -108,7 +117,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
 | `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `archive.rs`: rollup columns declared once (`KEYS`, `SUMS`), read plans (a span inside the raw window reads `requests` with the old SQL; one reaching `rolled_until` reads the union with the rollups); `archive_scenarios.rs`: the proof that rolled-up spend reads the same everywhere; `compact.rs`: the compactor (raw rows older than `keep_raw_days` into the rollups, one transaction per 6-hour chunk; giving space back, the one-time `VACUUM`), proved in `compact_scenarios.rs`; `projects.rs`: the cwd → project table, recomputed over raw and rolled-up cwds, never downgraded; `storage.rs`: the index's size, daily samples, last compaction (doctor, SYSTEM); `marks.rs`: read marks, the one rule that keeps a file read again after a compaction from counting rolled-up records twice; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
 | `src/live/` | live agent states for the dashboard; `state.rs`: how an agent's state is decided (pure, table-tested) |
-| `src/vault/` | login vault and switching |
+| `src/statusline/` | `swarmy statusline`, its own front end: Claude Code's stdin (`input.rs`, the ACL), the reading file shared with the dashboard (`reading.rs`), the pure renderer (`render.rs`), the runner (`mod.rs`) |
+| `src/vault/` | login vault (`mod.rs`: `Vault`, `VaultTx`, saving), what a seat holds and following its login (`seats.rs`), switching (`switch.rs`), files, lock and checked writers (`store.rs`, private) |
 | `src/app/` | composition root `Ctx` (dirs, config, seats, prices, index), used by commands and dashboard |
 | `src/limits/` | limit analysis per account (`all_reports`): queries feeding the pure rules of `core::limits` |
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices, compact |
@@ -124,6 +134,13 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - One API response is written as several `assistant` records (one per content block) with the same
   usage: dedupe by `message.id`, merge with `max`.
 - `session-owner` records give the account per turn; subagent files inherit it from the session.
+  They decide a request's account (`index::SEAT_ACCOUNT_AT`); a seat's login history
+  (`seat_accounts`, a change dated when swarmy sees it, never at `profileFetchedAt`) only fills
+  in for sessions without one.
+- `.credentials.json`: Claude Code refreshes the access token every few hours and keeps the
+  refresh token, so a login (OAuth grant) is named by the refresh token's fingerprint. A rotated
+  refresh token (same account and plan, fresh access token) is followed as the same login
+  (`vault/seats.rs::is_rotation`), never taken for a new one.
 - `sessions/<pid>.json` holds live status (`busy`/`idle`/`waiting` + `waitingFor`), tmux pane and
   `procStart` (check it against `/proc/<pid>/stat` to ignore reused pids).
 - `.claude.json`: `cachedUsageUtilization` (limits, no network needed), `additionalModelCostsCache`
@@ -132,8 +149,12 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - Status line (optional, `swarmy setup`): Claude Code runs `statusLine.command` after each response
   with a JSON on stdin; `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at (epoch s)}`
   are exact. `swarmy statusline` must stay fast (no index, no scan): it writes
-  `<data>/statusline/<seat id>.json` (`SeatId`) and prints one line. The dashboard merges
-  these readings when newer than `.claude.json`'s. `setup` writes only `settings.json` (backup
+  `<data>/statusline/<seat id>.json` (`SeatId`) and prints one line. A reading (`v` 2) names
+  its account (the owner of the session's last response, read from the transcript's tail only
+  when the numbers moved; else the seat's `oauthAccount`) and the time its numbers were true (that
+  response's time; a repeat never moves it, an older reading never goes over a newer one). The
+  dashboard merges a reading only into the seat's account it names, when newer than
+  `.claude.json`'s. `setup` writes only `settings.json` (backup
   first, never over an older backup) and only after a yes. The status line reads the dashboard's
   `statusline/fleet.json` (`src/fleet.rs`; fresh while < `fresh_seconds` and its writer pid runs)
   and otherwise scans the session registries; segments shorten in a fixed order to `$COLUMNS`

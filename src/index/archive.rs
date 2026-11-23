@@ -154,14 +154,7 @@ pub const SUMS: &[Sum] = &[
         ddl: "INTEGER NOT NULL CHECK (requests > 0)",
         from_raw: "COUNT(*)",
         merge: "requests + excluded.requests",
-        as_raw: &[
-            ("n", "requests"),
-            (
-                "n_unpriced",
-                "CASE WHEN priced = 0 THEN requests ELSE 0 END",
-            ),
-            ("n_pending", "0"),
-        ],
+        as_raw: &[("n", "requests"), ("n_pending", "0")],
     },
     token_sum!("input"),
     token_sum!("cw5"),
@@ -178,11 +171,31 @@ pub const SUMS: &[Sum] = &[
     cost_sum!("cost_output"),
     cost_sum!("cost_web"),
     cost_sum!("cache_saved"),
+    // Whether any of the requests has a price (so `cost` is not NULL); how many have none is
+    // `n_unpriced`.
     Sum {
         col: "priced",
         ddl: "INTEGER NOT NULL CHECK (priced IN (0, 1))",
         from_raw: "MAX(priced)",
         merge: "MAX(priced, excluded.priced)",
+        as_raw: &[],
+    },
+    // Counted, never a flag: one key can hold requests with and without a price (a request
+    // without tokens is priced at $0 whatever its model).
+    Sum {
+        col: "n_unpriced",
+        ddl: "INTEGER NOT NULL DEFAULT 0 CHECK (n_unpriced >= 0)",
+        from_raw: "SUM(priced = 0)",
+        merge: "n_unpriced + excluded.n_unpriced",
+        as_raw: &[("n_unpriced", "n_unpriced")],
+    },
+    // Requests without any token: priced at $0 even when their model has no price
+    // (`PriceBook::cost_parts`), so a reprice from the sums knows how many stay priced.
+    Sum {
+        col: "n_empty",
+        ddl: "INTEGER NOT NULL DEFAULT 0 CHECK (n_empty >= 0)",
+        from_raw: "SUM(input + cw5 + cw1h + cread + output + web = 0)",
+        merge: "n_empty + excluded.n_empty",
         as_raw: &[],
     },
     // The threshold `long_ctx` was taken against, so a later price version with another one can
@@ -348,58 +361,6 @@ pub fn rollup_insert_sql(filter: &str) -> String {
     )
 }
 
-/// Moves the rollups of seat `?1` whose first request is at or after `?2` to the account the seat
-/// was logged into at that first request (`seat_accounts`, as `SEAT_ACCOUNT_AT` does for raw
-/// rows), adding into rows already there (design §3.7). Two statements, run in this order in one
-/// transaction: the insert of the rows under their new key, then the delete of the old keys. A
-/// row that straddles the switch (first request before it, last after) keeps its account.
-pub fn rekey_sql() -> (String, String) {
-    let account_at = |t: &str| {
-        format!(
-            "COALESCE((SELECT sa.account_uuid FROM seat_accounts sa WHERE sa.seat = {t}.seat AND sa.ts <= {t}.first_ts
-               ORDER BY sa.ts DESC LIMIT 1), {t}.account_uuid)"
-        )
-    };
-    let cols: Vec<&str> = KEYS
-        .iter()
-        .map(|k| k.col)
-        .chain(SUMS.iter().map(|s| s.col))
-        .collect();
-    let exprs: Vec<String> = cols
-        .iter()
-        .map(|c| {
-            if *c == "account_uuid" {
-                account_at("u")
-            } else {
-                format!("u.{c}")
-            }
-        })
-        .collect();
-    let pk: Vec<&str> = KEYS.iter().map(|k| k.col).collect();
-    let merge: Vec<String> = SUMS
-        .iter()
-        .map(|s| format!("{} = {}", s.col, s.merge))
-        .collect();
-    let moved = |t: &str| {
-        format!(
-            "{t}.seat = ?1 AND {t}.first_ts >= ?2 AND {} != {t}.account_uuid",
-            account_at(t)
-        )
-    };
-    (
-        format!(
-            "INSERT INTO usage_rollup({}) SELECT {} FROM usage_rollup u WHERE {}
-             ON CONFLICT({}) DO UPDATE SET {}",
-            cols.join(", "),
-            exprs.join(", "),
-            moved("u"),
-            pk.join(", "),
-            merge.join(", ")
-        ),
-        format!("DELETE FROM usage_rollup WHERE {}", moved("usage_rollup")),
-    )
-}
-
 /// Rewrites the `agent_rollup` rows of the agents `filter` selects (over `usage_rollup u`) from
 /// `usage_rollup`.
 pub fn agent_rollup_sql(filter: &str) -> String {
@@ -412,7 +373,7 @@ pub fn agent_rollup_sql(filter: &str) -> String {
     format!(
         "DELETE FROM agent_rollup WHERE (seat, session_id, agent_id) IN (SELECT seat, session_id, agent_id FROM usage_rollup u WHERE {filter});
          INSERT INTO agent_rollup(seat, session_id, agent_id, requests, cost, unpriced, first_ts, last_ts, first_model, last_model)
-         SELECT seat, session_id, agent_id, SUM(requests), TOTAL(cost), SUM(CASE WHEN priced = 0 THEN requests ELSE 0 END),
+         SELECT seat, session_id, agent_id, SUM(requests), TOTAL(cost), SUM(n_unpriced),
                 MIN(first_ts), MAX(last_ts), {}, {}
          FROM usage_rollup u WHERE (seat, session_id, agent_id) IN (SELECT seat, session_id, agent_id FROM usage_rollup u WHERE {filter})
          GROUP BY seat, session_id, agent_id;",

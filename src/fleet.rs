@@ -23,7 +23,7 @@ pub struct Fleet {
     pub counts: Counts,
     /// Per session id: its agents (the main thread not counted) and its spend rate.
     pub sessions: BTreeMap<SessionId, SessionCounts>,
-    /// Per seat id, the key of the status-line reading files too (`statusline::file_for`).
+    /// Per seat id, the key of the status-line reading files too (`statusline::reading::file_for`).
     pub seats: BTreeMap<SeatId, SeatLimit>,
 }
 

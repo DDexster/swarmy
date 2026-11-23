@@ -44,6 +44,9 @@ pub struct WindowReport {
     pub points_per_hour: Option<Pct>,
     #[serde(skip)]
     pub eta: Option<Duration>,
+    /// When it runs out, fixed at the limits pass (`core::limits::WindowEstimate::runs_out_at`).
+    #[serde(skip)]
+    pub runs_out_at: Option<chrono::DateTime<chrono::Utc>>,
     pub eta_seconds: Option<i64>,
     pub shares: Vec<Share>,
     /// ≈ API-equivalent dollars of a full window.
@@ -196,6 +199,7 @@ fn report_window(
         burn_usd_per_hour: e.burn_usd_per_hour,
         points_per_hour: e.points_per_hour,
         eta: e.eta,
+        runs_out_at: e.runs_out_at,
         eta_seconds: e.eta.map(|d| d.num_seconds()),
         shares: e.shares,
         window_usd: e.window_usd,
@@ -456,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_spend_follows_late_requests_reprices_and_reattribution() {
+    fn settled_spend_follows_late_requests_and_reprices() {
         // The weekly window of `a_weekly_window_by_hand`, calibrated on two readings: 10% at
         // 11-18 ($4 before it) and 30% at 11-20 ($14 before it).
         let w = World::new(&["work"]);
@@ -520,16 +524,16 @@ mod tests {
         idx.price_all(&dear).unwrap();
         assert!(close(own(&idx), 34.0 / 30.0), "{}", own(&idx));
 
-        // The seat turns out to have had acc-b logged in since 11-19 00:00: q2, q3 move to acc-b.
-        // acc-a keeps q1 + late = $6 × 2 = $12 before both readings → median(12/10, 12/30) =
-        // (36/30 + 12/30) / 2 = 24/30.
+        // The seat now shows acc-b, with a profile fetched on 11-19 00:00 (a vault switch restores
+        // a saved profile as it was). q2 and q3 name acc-a as their owner: nothing moves (review
+        // H1), and the kept sums still agree with a fresh one: 34/30.
         let swapped = SeatInfo {
             account: Some(account("acc-b", "2026-11-19T00:00:00Z")),
             utilization: None,
             ..now_seat
         };
         w.refresh(&mut idx, &[swapped], &dear);
-        assert!(close(own(&idx), 24.0 / 30.0), "{}", own(&idx));
+        assert!(close(own(&idx), 34.0 / 30.0), "{}", own(&idx));
     }
 
     #[test]

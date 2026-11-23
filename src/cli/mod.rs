@@ -199,7 +199,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 crate::diag::log("config", &format!("{e:#}"));
                 crate::config::Config::default()
             });
-            crate::claude::statusline::run(&dirs, &config.statusline, then.as_deref())
+            crate::statusline::run(&dirs, &config.statusline, then.as_deref())
         }
         Some(Command::Man) => {
             clap_mangen::Man::new(Cli::command()).render(&mut std::io::stdout())?;

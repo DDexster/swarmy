@@ -51,6 +51,7 @@ pub const RAW_TABLES: &[&str] = &[
     "api_errors",
     "compact_events",
     "record_types",
+    "unreadable_files",
 ];
 
 /// What labels the raw rows (sessions, agents, projects, Claude Code's totals): kept across a
@@ -59,7 +60,7 @@ pub const DIMENSION_TABLES: &[&str] = &["sessions", "agents", "projects", "cost_
 
 /// Version of the archive tables (`archive`); each step up has a migration in
 /// `migrate_archive`.
-pub const ARCHIVE_VERSION: u32 = 1;
+pub const ARCHIVE_VERSION: u32 = 2;
 
 /// Rollups of raw rows that are gone (`archive`): migrated, never dropped.
 pub const ARCHIVE_TABLES: &[&str] = &[
@@ -251,6 +252,14 @@ CREATE TABLE IF NOT EXISTS record_types (
   count INTEGER NOT NULL CHECK (count >= 0),
   PRIMARY KEY (path, type)
 );
+
+-- Transcripts the last refresh that tried could not read (left for the next one: their offset
+-- did not move). A successful read removes the row. Shown by `doctor` and in ATTENTION.
+CREATE TABLE IF NOT EXISTS unreadable_files (
+  path TEXT PRIMARY KEY,
+  error TEXT NOT NULL,
+  since INTEGER NOT NULL
+);
 "#
     )
 }
@@ -315,9 +324,9 @@ pub fn facts_sql() -> String {
         r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
--- Which account each seat (config dir) had logged in, and since when: from the seat's own
--- `.claude.json` (profile time, usage readings). Sessions keep writing their old owner after a
--- login is swapped under them, so for a seat with these rows the seat decides.
+-- Which account each seat (config dir) had logged in, and since when: a change is dated when
+-- swarmy first sees the seat's `.claude.json` name another account, never earlier. It only
+-- fills in for requests whose session has no `session-owner` record: the owner decides.
 CREATE TABLE IF NOT EXISTS seat_accounts (
   seat TEXT NOT NULL,
   ts INTEGER NOT NULL,
@@ -409,6 +418,7 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     migrate_archive(&tx)?;
     let version = meta(&tx, "schema_version")?;
     let rebuild = version.as_deref() != Some(CACHE_VERSION);
+    let mut stashed = false;
     if rebuild {
         // Facts and dimensions are never dropped with the raw tables, whatever the lists say.
         debug_assert!(RAW_TABLES.iter().all(|t| !FACT_TABLES.contains(t)
@@ -420,6 +430,8 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
             version.as_deref().map(str::parse::<u32>),
             Some(Ok(v)) if v >= DIMENSIONS_SINCE
         );
+        // What reading the transcripts again would not give back stays (`stash_unrereadable`).
+        stashed = !old_dimensions && stash_unrereadable(&tx)?;
         let dropped = RAW_TABLES
             .iter()
             .chain(DIMENSION_TABLES.iter().filter(|_| old_dimensions));
@@ -437,6 +449,9 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     // Tables added without a version bump (all `IF NOT EXISTS`), then the steps that reshape
     // cache tables in place, then extra indexes.
     tx.execute_batch(&cache_sql())?;
+    if stashed {
+        restore_unrereadable(&tx)?;
+    }
     let done: usize = if rebuild {
         CACHE_STEPS.len()
     } else {
@@ -451,6 +466,98 @@ pub fn migrate(conn: &Connection) -> anyhow::Result<bool> {
     tx.execute_batch(EXTRA_INDEXES)?;
     tx.commit()?;
     Ok(rebuild)
+}
+
+/// Raw tables whose rows a rebuild may not get back from the transcripts: (table, whether its rows
+/// belong to an agent (else to a session's main transcript), whether the compactor rolls it up
+/// by `ts`).
+const KEPT_ON_REBUILD: &[(&str, bool, bool)] = &[
+    ("requests", true, true),
+    ("tool_calls", true, true),
+    ("api_errors", true, true),
+    ("prompts", false, true),
+    ("owners", false, false),
+    ("compact_events", false, false),
+];
+
+/// Before a rebuild drops the raw tables, copies into temp tables the rows that reading the
+/// transcripts again would not give back (design §3.1 assumed none): rows of an agent whose
+/// transcript is gone (a seat dir removed or moved, a retention shorter than the raw window),
+/// and rows older than `rolled_until` that are still raw (old records found after a
+/// compaction: the re-read skips them as rolled up). `restore_unrereadable` puts them back into
+/// the new tables. Returns whether anything was stashed.
+fn stash_unrereadable(tx: &Connection) -> anyhow::Result<bool> {
+    let need = ["path", "seat", "session_id", "agent_id"];
+    let files = columns(tx, "files")?;
+    if !need.iter().all(|c| files.iter().any(|f| f == c)) {
+        return Ok(false);
+    }
+    let rolled_until: i64 = match meta(tx, "rolled_until")? {
+        Some(v) => v.parse()?,
+        None => 0,
+    };
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS temp.readable;
+         CREATE TEMP TABLE readable (seat TEXT, session_id TEXT, agent_id TEXT,
+           PRIMARY KEY (seat, session_id, agent_id));",
+    )?;
+    {
+        let mut all = tx.prepare("SELECT path, seat, session_id, agent_id FROM files")?;
+        let rows: Vec<(String, String, String, String)> = all
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<Result<_, _>>()?;
+        let mut add = tx.prepare("INSERT OR IGNORE INTO temp.readable VALUES (?1, ?2, ?3)")?;
+        for (path, seat, session, agent) in rows {
+            if std::path::Path::new(&path).exists() {
+                add.execute(params![seat, session, agent])?;
+            }
+        }
+    }
+    for (t, per_agent, rolled) in KEPT_ON_REBUILD {
+        if !table_exists(tx, t)? {
+            continue;
+        }
+        let agent = if *per_agent { "x.agent_id" } else { "''" };
+        let old = if *rolled {
+            format!("x.ts < {rolled_until} OR ")
+        } else {
+            String::new()
+        };
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS temp.keep_{t};
+             CREATE TEMP TABLE keep_{t} AS SELECT * FROM {t} x WHERE {old}NOT EXISTS (
+               SELECT 1 FROM temp.readable r WHERE r.seat = x.seat AND r.session_id = x.session_id
+                 AND r.agent_id = {agent});"
+        ))?;
+    }
+    tx.execute_batch("DROP TABLE temp.readable;")?;
+    Ok(true)
+}
+
+/// Puts the rows `stash_unrereadable` kept into the rebuilt tables (the columns both have; a
+/// row the new rules refuse is left out) and drops the temp tables.
+fn restore_unrereadable(tx: &Connection) -> anyhow::Result<()> {
+    for (t, ..) in KEPT_ON_REBUILD {
+        let kept: Vec<String> = tx
+            .prepare("SELECT name FROM pragma_table_info(?1, 'temp')")?
+            .query_map([format!("keep_{t}")], |r| r.get(0))?
+            .collect::<Result<_, _>>()?;
+        if kept.is_empty() {
+            continue;
+        }
+        let now = columns(tx, t)?;
+        let cols: Vec<&String> = now.iter().filter(|c| kept.contains(c)).collect();
+        let cols = cols
+            .iter()
+            .map(|c| c.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tx.execute_batch(&format!(
+            "INSERT OR IGNORE INTO main.{t}({cols}) SELECT {cols} FROM temp.keep_{t};
+             DROP TABLE temp.keep_{t};"
+        ))?;
+    }
+    Ok(())
 }
 
 /// Steps that bring the cache tables of an older database to the shape of `cache_sql` in place,
@@ -549,9 +656,38 @@ fn migrate_archive(conn: &Connection) -> anyhow::Result<()> {
         .into());
     }
     // 0 → 1: the rollup tables, empty; nothing is rolled up yet.
+    let had_rollups = table_exists(conn, "usage_rollup")?;
     conn.execute_batch(&super::archive::archive_sql())?;
     if version < 1 {
         set_meta(conn, "rolled_until", "0")?;
+    }
+    // 1 → 2: how many requests of a rollup row had no price (and how many had no tokens), as
+    // counts instead of one flag. Rows rolled up before keep what the flag said: all of the
+    // row's requests unpriced, or none.
+    if version < 2 && had_rollups {
+        let have = columns(conn, "usage_rollup")?;
+        for (col, fill) in [
+            (
+                "n_unpriced",
+                "CASE WHEN priced = 0 THEN requests ELSE 0 END",
+            ),
+            (
+                "n_empty",
+                "CASE WHEN input + cw5 + cw1h + cread + output + web = 0 THEN requests ELSE 0 END",
+            ),
+        ] {
+            if have.iter().any(|h| h == col) {
+                continue;
+            }
+            let Some(sum) = super::archive::SUMS.iter().find(|s| s.col == col) else {
+                anyhow::bail!("no rollup column {col}");
+            };
+            conn.execute_batch(&format!(
+                "ALTER TABLE usage_rollup ADD COLUMN {col} {};
+                 UPDATE usage_rollup SET {col} = {fill};",
+                sum.ddl
+            ))?;
+        }
     }
     set_meta(conn, "archive_version", &ARCHIVE_VERSION.to_string())?;
     Ok(())
@@ -909,6 +1045,45 @@ mod tests {
     }
 
     #[test]
+    fn archive_version_1_counts_its_unpriced_requests() {
+        // Rollups written with the `priced` flag only: the counts are added, filled from it.
+        let c = Connection::open_in_memory().unwrap();
+        let v1: String = super::super::archive::archive_sql()
+            .lines()
+            .filter(|l| !l.contains("n_unpriced") && !l.contains("n_empty"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        c.execute_batch(&format!(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('archive_version', '1'), ('rolled_until', '0');
+             {v1}"
+        ))
+        .unwrap();
+        let row = |bucket: i64, tokens: i64, priced: i64, cost: &str| {
+            format!(
+                "INSERT INTO usage_rollup(bucket, seat, session_id, agent_id, model, fast, long_ctx, requests,
+                   input, cw5, cw1h, cread, output, thinking, web, tools, cost, priced, first_ts, last_ts)
+                 VALUES ({bucket}, 's', 'x', '', 'm', 0, 0, 3, {tokens}, 0, 0, 0, 0, 0, 0, 0, {cost}, {priced},
+                   {bucket} * 900000, {bucket} * 900000)"
+            )
+        };
+        for sql in [row(1, 5, 0, "NULL"), row(2, 5, 1, "0.5"), row(3, 0, 1, "0")] {
+            c.execute(&sql, []).unwrap();
+        }
+        migrate(&c).unwrap();
+        let counts: Vec<(i64, i64)> = c
+            .prepare("SELECT n_unpriced, n_empty FROM usage_rollup ORDER BY bucket")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(counts, [(3, 0), (0, 0), (0, 3)]);
+        assert_eq!(meta(&c, "archive_version").unwrap().as_deref(), Some("2"));
+        assert!(!migrate(&c).unwrap());
+    }
+
+    #[test]
     fn a_cache_version_bump_keeps_every_dimension_table() {
         // Agent types, session titles, projects and Claude Code's totals outlive the transcripts
         // (deleted after 30 days): a bump drops only the raw rows.
@@ -934,7 +1109,11 @@ mod tests {
         let other = (CACHE_VERSION.parse::<u32>().unwrap() + 1).to_string();
         fill(&c, &other);
         assert!(migrate(&c).unwrap(), "the raw tables are rebuilt");
-        assert_eq!(n(&c, "prompts"), 0);
+        assert_eq!(
+            n(&c, "prompts"),
+            1,
+            "no transcript gives the prompt back: it stays"
+        );
         assert_eq!(
             dims(&c),
             vec![1, 1, 1, 1],

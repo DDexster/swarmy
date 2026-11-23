@@ -1,812 +1,886 @@
 # Backend Architecture Review
 
-> Analyzed on: 2026-11-22
+> Analyzed on: 2026-11-23 (third review, at `44c2b8e`)
 > Project: swarmy (repository root)
-> Stack: Rust 2024, single binary crate; clap CLI + ratatui TUI; SQLite via rusqlite (WAL); JSON files (vault, status line, Claude Code's own files)
-> Modules analyzed: 12 (`core`, `claude`, `index`, `live`, `vault`, `cli`, `tui`, `ui`, `fleet`, `config`, `demo`, `power`) · Findings: 21 (High 5, Medium 11, Low 5)
+> Stack: Rust 2024, one library crate plus a thin binary; clap CLI and ratatui TUI; SQLite through rusqlite (WAL); JSON files (vault, status-line readings, fleet summary, Claude Code's own files)
+> Modules analyzed: 17 top-level modules (`app`, `claude`, `cli`, `config`, `core`, `demo`, `diag`, `errors`, `fleet`, `fsutil`, `index`, `limits`, `live`, `power`, `tui`, `ui`, `vault`) · Findings: 23 (High 4, Medium 12, Low 7)
 
 ## Summary
 
-The domain kernel is the best part of the codebase: `src/core` is pure, its enums are closed, and its money and limit rules are tested with numbers computed by hand in comments. The problems sit around it. The highest-risk one is the vault. It promises never to lose a token, but only `switch` takes the lock. Two threads of the same dashboard, and every other `swarmy` process, do unlocked read-modify-write of `logins.json` and `secrets.json`, and threads of one process share a temp file name. Next comes integrity of the index: facts that cannot be rebuilt are dropped on every schema bump, and a `-1` cost sentinel is silently summed as $0. Structurally, the limit estimation that the dashboard, the CLI and the status line all depend on lives in `src/cli/limits.rs` and has no tests. That gives a `tui ↔ cli` cycle, and its rules are copied, with drift, into the views. Nothing is enforced by tooling: there is no CI, no lint configuration, and `cargo clippy` already reports 40 warnings.
+The biggest correctness risk is now **who pays**. Two paths write permanent account attributions from timestamps that do not say when a login entered a seat. Tests confirm both:
+
+- After a vault switch, the saved `oauthAccount`'s old `profileFetchedAt` is taken as the switch time. That moves days of the previous account's requests to the new account, overriding the transcripts' own `session-owner` records (H1).
+- A status-line reading stores no account. The next refresh books it, and the requests since it was taken, to whatever account the seat holds now (H2).
+
+Both end up in fact tables that are never rebuilt. Since the last review, the rollup re-key carries H1 into the archive as well.
+
+The new storage tier mostly holds its promise that a compacted index reads the same as one never compacted. It breaks in four ways, all confirmed by tests:
+
+- A response whose content blocks straddle `rolled_until` is counted twice when its file is read again (H3).
+- The settled-sum cache cuts off the newest minutes of the limit curve (M1).
+- The rollup re-key can double count.
+- `MAX(priced)` hides unpriced requests (both M2).
+
+The vault's single lock works. However, a switch that fails between the credentials write and the `.claude.json` write leaves the seat and the vault out of step, so the shared-grant guard can be bypassed (H4).
+
+Structurally the codebase is much better than two reviews ago:
+
+- `core` is pure and guarded by a test.
+- Module edges, fallbacks, unwraps and wildcards are ratcheted.
+- The schema carries generated `CHECK`s.
+- Every cadence lives in one job table.
+
+What remains: a strict-lint gap of 2,157 warnings, mostly casts and indexing in the TUI. Value objects are half adopted (28 raw account strings next to `AccountId`). The status line, 932 lines that render, execute and read the fleet summary, still sits inside the reader layer.
 
 ## System map
 
-| Area | Role (layer) | Size (lines) | Notes |
+| Area | Role (layer) | Lines (prod + tests) | Notes |
 |---|---|---|---|
-| `core/` | domain kernel: usage, pricing, periods, limits math | 1 107 | pure; reads `Local` time zone only |
-| `claude/` | anti-corruption layer: readers of Claude Code files; also the status line renderer/writer | 3 297 | `statusline.rs` (928) renders ANSI and writes files |
-| `index/` | persistence: SQLite cache, incremental refresh, queries, insights | 1 975 | `pub conn` |
-| `live/` | live agent states (application/read model) | 996 | 20 raw SQL `SELECT`s on index tables |
-| `vault/` | login vault: the only writer into Claude Code dirs | 1 015 | |
-| `cli/` | commands **and** shared application services (`Ctx`, limits analysis) | 2 887 | |
-| `tui/` | worker thread (use cases) + UI | 7 827 | 38% of the code |
-| `ui/` | text formatting, tables, ANSI | 512 | |
-| `fleet.rs`, `config.rs`, `demo.rs`, `power.rs` | status-line contract, config, demo world, battery | 901 | |
+| `core/` | domain kernel: usage, pricing (dated), periods, limits math, storage rules, ids, units | 3 266 | pure (`tests/architecture.rs::core_is_pure`) |
+| `claude/` | anti-corruption layer over Claude Code's files; **also** the status-line command (renders ANSI, runs the user's previous command, reads `fleet.json`) | 3 459 | `statusline.rs` 932 |
+| `index/` | persistence: SQLite cache, incremental refresh, read marks, compactor, archive, settled parts, queries, insights | 9 721 (3 119 of them scenario tests) | private connection; SQL only here (architecture test) |
+| `limits/` | limit analysis per account (queries feeding `core::limits`) | 682 | depends on `app::Ctx` |
+| `live/` | live agent read model (`state.rs` pure) | 1 172 | per-agent reads kept between ticks |
+| `vault/` | login vault: the only writer into Claude Code dirs | 1 919 | one OS lock per change (`Vault::edit`) |
+| `app/` | composition root `Ctx` | 581 | takes the vault lock on every load |
+| `cli/` | commands | 3 009 | |
+| `tui/` | worker, job table, analytics, alerts, view | 9 500 | 26% of the code |
+| `fleet.rs`, `fsutil.rs`, `errors.rs`, `diag.rs`, `config.rs`, `power.rs`, `ui/`, `demo.rs` | contract for the status line, atomic writes, error catalogue, debug channel, config, battery, formatting, demo world | 2 288 | |
 
-There is no HTTP layer. The entry points are the clap subcommands in `cli/mod.rs`, plus the dashboard worker loop (`tui/mod.rs::worker`, 368 lines) and the `statusline` command that Claude Code runs after each response.
+Entry points: the clap subcommands (`cli/mod.rs`), the dashboard worker loop (`tui/worker.rs::worker`), and `swarmy statusline`, which Claude Code runs after every response and on `refreshInterval`.
 
-**Dependency matrix** (row imports column; counts of `crate::` references, measured with `grep -oE 'crate::[a-z_]+'`):
+**Dependency matrix** (row imports column; `crate::<module>` references in production code, measured):
 
-| from \ to | core | claude | index | live | vault | cli | tui | ui | fleet | config | demo |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| core | | | | | | | | | | | |
-| claude | 3 | | | | | | | | **6** | **3** | |
-| index | 7 | 5 | | | | | | | | | |
-| live | 2 | 5 | 1 | | | | | **2** | | | |
-| vault | | 5 | | | | | | | | | |
-| cli | 11 | 21 | 7 | | 4 | | 3 | 22 | 2 | 6 | 1 |
-| tui | 10 | 13 | 6 | 10 | 6 | **6** | | 10 | 6 | | |
-| ui | 1 | | | | | | | | | | |
-| config | 1 | **1** | | | | | | | | | |
-| demo | | 2 | | | | | **1** | | | | |
+| from \ to | app | claude | cli | config | core | diag | errors | fleet | fsutil | index | limits | live | tui | ui | vault |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| app | | 7 | | 1 | 8 | 3 | 1 | | | 3 | | | | 3 | 2 |
+| claude | | | | **2** | 7 | 1 | | **3** | 2 | | | | | | |
+| cli | 11 | 14 | | 6 | 12 | 1 | 1 | 2 | 2 | 11 | 3 | | 3 | 23 | 3 |
+| config | | **1** | | | 2 | | 1 | | | | | | | | |
+| fleet | | | | | 1 | | | | 2 | | | | | | |
+| index | | 13 | | | 28 | | 2 | | | | | | | | |
+| limits | **1** | | | | 4 | | | | | 2 | | | | | |
+| live | | 6 | | | 4 | | | | | 6 | | | | | |
+| tui | 3 | 13 | | 1 | 29 | 1 | | 6 | | 11 | 5 | 13 | | 23 | 8 |
+| vault | | 4 | | | | 3 | 3 | | 2 | | | | | | |
 
-Forbidden edges (bold): `tui → cli` closes the cycle `cli ↔ tui` (and `cli → demo → tui → cli`). `claude ↔ config` is a second cycle. The reader layer also points upward: `claude → fleet` and `claude → config`. `live → ui` puts presentation into a read model, and `demo → tui` exists only to borrow a hash function.
+Forbidden or questionable edges are in bold:
+
+- `claude ↔ config` is still a cycle: `config.rs` names `claude::project::Alias`, and `claude/statusline.rs` names `config::Dirs` and `StatuslineConf`.
+- `claude → fleet`: the reader layer depends on a contract written by the dashboard.
+- `limits → app`: a domain analysis depends on the composition root, and masks paths for display.
+
+The `tui → cli` cycle and `live → ui` from the first review are gone. `tests/arch/edges.txt` records every remaining edge with a reason.
+
+**Context map**:
+
+- Claude Code → `claude/`: an anti-corruption layer, conformist to Claude Code's undocumented formats. Format drift is counted (`record_types`) and shown by `doctor`.
+- `index`, `live`, `limits` and `vault` read through `claude/` types: a customer–supplier relationship.
+- dashboard → status line: an open host service. `fleet.json` is versioned (`v: 2`) and checked on read.
+- status line → dashboard: `statusline/<seat>.json` (`LiveLimits`) is a published language with **no version field and no account**. That is the root of H2.
+
+**Subdomains**:
+
+- Core: spend at API prices and weekly-limit attribution (`core::pricing`, `core::limits`, `index`, `limits`).
+- Supporting: live swarm view, vault, status line.
+- Generic: storage compaction, atomic files, process table, themes.
 
 ## Scorecard
 
 | Requirement | Score (1-5) | Evidence |
 |---|---|---|
-| Cohesion and coupling | 2 | two cycles; limits domain logic in `cli/`; limit rules copied into 5 files (H4, M1) |
-| Modularity | 3 | areas grouped by concept; but binary-only crate, no facades, `pub` everywhere |
-| Layers and ownership | 2 | reader layer renders and writes; read model formats money; no ownership data (L2) |
-| DDD (boundaries, language, pure domain, thin use cases) | 3 | pure `core`, ACL in `claude/`; "mana" vs "limits" drift; fat worker and `analyze` (M2, M10, L1) |
-| Value objects | 2 | 99 id-like `String`/`&str` fields and params, 23 money `f64` fields, ambiguous account keys (M6) |
-| Invariants and failure modes | 2 | `-1` sentinel, no `CHECK`s, 233 silent-fallback sites in non-test code (H3, H5, M8) |
-| API surface and integrity | 3 | SQL fragments are all static and every value is bound; but `pub conn`, `count(&str)` (M4, L4) |
-| State-change pipeline | 2 | vault writes unlocked except `switch`; reprice split across two transactions (H1, H3) |
-| Declarations and duplication | 2 | rate defaults ×3, window roll-forward ×3, "today" ×3, atomic write ×4, tool names ×3 (M1, M5, M7, L5) |
-| Tests as specification | 2 | 54 tests; `core` exemplary; 0 tests for index refresh, limits analysis, attention, vault concurrency (M9) |
-| Enforcement by mechanism | 1 | no CI, no `[lints]`, 40 clippy warnings, no dependency check (M11) |
-| **Overall** | **2** | strong kernel, weak guarantees around it |
+| Cohesion and coupling | 3 | no cross-feature cycles left except `claude ↔ config`; edges ratcheted (`tests/arch/edges.txt`); but `claude/statusline.rs` mixes reading, rendering, process spawning and the fleet contract, and `limits → app` (M10) |
+| Modularity | 3 | areas grouped by concept (`index/compact.rs`, `index/marks.rs`, `tui/view/panels/*`); every module `pub`, with 465 `pub fn` against 70 restricted ones (L5) |
+| Layers and ownership | 3 | table classes are data (`RAW_TABLES`, `DIMENSION_TABLES`, `ARCHIVE_TABLES`, `FACT_TABLES`) and SQL stays in `index/` by test; reader layer still points up (M10); file ownership only in the `CLAUDE.md` layout table |
+| Strategic DDD (contexts, subdomains, ubiquitous language, ACL) | 3 | seat / login / account defined and the "mana" test enforces one word; ACL over Claude Code; but "the seat's account at time t" is inferred from timestamps that mean something else (H1, H2); status-line file unversioned; `Pct` vs `points` (L6) |
+| Tactical DDD (aggregates, pure domain, thin use cases) | 3 | pure `core` with a test; the vault is a real aggregate with one transaction; but `worker` is 352 lines, `post_pass` mixes attribution, projects and pricing, and `switch` saves halfway (M11, H4) |
+| Value objects (zero-cost) | 3 | `SeatId`, `SessionId`, `AccountId`, `Usd`, `Pct`, `UsdPerPct` exist, `repr(transparent)`, with a compile-fail doctest; but `SeatId::default()` and `from_stored(label)` make invalid ids, 28 account fields are still `String`, and 18 money fields are `f64` (M9) |
+| Static typing and analysis | 3 | `[lints]` denies unwrap/expect/panic, unsafe, dead code and reasonless allows; clippy clean under the project config; strict run: 2 157 warnings (445 `as_conversions`, 394 `indexing_slicing`, 258 `float_arithmetic`, 239 lossy casts) (M8) |
+| Domain invariants and failure modes | 2 | `CHECK`s generated from enums; facts survive bumps; but attribution (H1, H2), count-once across raw and archive (H3, M2), one-grant-one-seat (H4) and settled = fresh (M1) are each broken on a path, and records can be lost silently (M3, M4) |
+| API surface and integrity | 3 | private connection, typed reads for `live`, every SQL value bound; `Index::count(&str)` and `pub mod vault::store` (raw writers that bypass `Vault::edit`) remain (L5); every command takes the vault write lock (L4) |
+| State-change pipeline | 3 | `Vault::edit` (lock, re-read, save on change, backups) and immediate index transactions; the error catalogue has stable codes; but `switch` is not atomic and the index errors are untyped (H4, M12) |
+| Declarations and duplication | 4 | `KEYS`/`SUMS` derive the rollup DDL and its merge and re-key SQL; `ToolClass`, `FileKind::TAGS` and `WindowKind` generate `CHECK` lists; job table; limit thresholds once, guarded by a ratchet |
+| Tests as specification | 3 | 186 tests; scenario tests on synthetic seats with money computed by hand; "compacted = never compacted" proved on every surface; but the fixtures write one record per response (H3 slipped through), no property tests, and the vault concurrency test flaked once in six runs (L4) |
+| Enforcement by mechanism | 3 | `tests/architecture.rs` (edges, six ratchets, purity, SQL placement, renames, vocabulary, id slicing), `tools/check.sh`, `tools/perf.sh`; no CI and no installed hook, so all of it runs only when someone remembers |
+| **Overall** | **3** | solid guardrails and kernel; the new storage and attribution paths carry the remaining correctness bugs |
 
 ## Findings
 
-### H1: Vault writes are not serialized; only `switch` holds the lock
+### H1: A vault switch re-attributes days of the previous account's requests to the new login
 
 **Severity**: High
-**Requirement**: 9. One pipeline for every state change (also 4: capabilities by type)
-**Location**: `src/vault/mod.rs:135` (`save`) and `:383`, `:440-452`, `:266-267` (+ unlocked writers: `sync`, `put`, `capture`, `observe`, `rename`, `remove`). Callers: `src/tui/mod.rs:863-864` (worker thread, every analytics pass), `src/tui/mod.rs:437-444` (worker, on every login-file change and every 20 s), `src/tui/vault_ui.rs:70,145,189,358,403,446` and `src/tui/app.rs:1378` (UI thread), `src/cli/context.rs:87-103` (every CLI command). `src/vault/store.rs:47-59,70`.
+**Requirement**: 3. Invariants (a request is attributed to the account that made it)
+**Location**: `src/index/mod.rs:700-748` (event from `profile_fetched_at`, the `UPDATE … SET account_uuid = SEAT_ACCOUNT_AT`, the rollup re-key); `src/index/mod.rs:48` (`SEAT_ACCOUNT_AT` prefers `seat_accounts` over the owner-derived account); `src/vault/mod.rs:693-698` (the saved `oauthAccount` is written back verbatim, `profileFetchedAt` included)
 
-`Vault::open` loads `logins.json` into memory, and every `save()` writes that whole copy back. The only `Lock::acquire` call is in `switch`. In the dashboard, the worker thread reloads seat info as soon as a login file changes. It does exactly that while the UI thread is in the middle of a switch (the credentials file was written in step 3, the bookkeeping is saved in step 5). The worker then saves its stale copy, which undoes the switch's `mounted` bookkeeping or drops the auto-saved login. `FileStore::put` is also an unlocked load-modify-write of `secrets.json`, so two writers can drop each other's secret. Both threads write through the same temp path (`.{name}.swarmy-{pid}.tmp`, with `truncate(true)`), so concurrent writes can interleave bytes and leave `secrets.json` unparseable. Nothing backs up the vault's own files, so a damaged `secrets.json` loses every saved token.
+`post_pass` treats `oauthAccount.profileFetchedAt` as "the seat has had this account since". A vault switch restores a saved `oauthAccount` verbatim, so `profileFetchedAt` is the capture time, possibly days earlier and in another seat.
+
+The next refresh inserts `seat_accounts(seat, capture time, new account)`. It then rewrites every request of the seat since that time. That includes requests whose transcripts carry a `session-owner` record naming the old account: `SEAT_ACCOUNT_AT` wins over it.
+
+When the capture time is older than `rolled_until`, `archive::rekey_sql` moves the rollups too. There the original attribution cannot be recovered.
+
+Confirmed with a scenario test in a scratch copy:
+
+- Seat on acc-a (profile read 11-08), requests r1 on 11-09 and r2 on 11-10, both owned by acc-a.
+- Switch to acc-b, whose saved profile is from 11-09.
+- Result: `["r1|acc-b", "r2|acc-b"]`; `seat_accounts = [11-08 acc-a, 11-09 acc-b]`.
+
+The limit calibration, per-account spend and "% of week" per project for both accounts are then wrong, and the result is stored as a fact.
 
 #### Current
 
 ```rust
-// src/tui/mod.rs:863 — worker thread, no lock; seat_states → sync/observe → save()
-if let Ok(mut v) = Vault::open(&ctx.dirs.vault_dir()) {
-    states = v.seat_states(&ctx.seats).unwrap_or_default();
-    vault_logins = v.logins().to_vec();
+// src/index/mod.rs:702-711
+let mut events: Vec<(i64, &str)> = Vec::new();
+if let Some(t) = a.profile_fetched_at {
+    events.push((ms(t), a.account_uuid.as_str()));
 }
-// src/vault/store.rs:47 — read-modify-write of every secret, unlocked
-fn put(&self, id: &str, secret: &Secret) -> anyhow::Result<()> {
-    let mut m = self.load()?;
-    m.insert(id.to_string(), secret.expose().clone());
-    atomic_write(&self.path, serde_json::to_string(&m)?.as_bytes())
+if let Some(u) = si.utilization.as_ref().filter(|u| u.account_uuid == a.account_uuid) {
+    events.push((ms(u.fetched_at), u.account_uuid.as_str()));
 }
-// src/vault/store.rs:70 — same temp name for every thread of the process
-let tmp = dir.join(format!(".{name}.swarmy-{}.tmp", std::process::id()));
+// … later, for each new event:
+tx.execute(&format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"), …)?;
 ```
 
 #### Recommended
 
 ```rust
-/// The only way to change the vault: lock, re-read under the lock, change, save, unlock.
-pub fn edit<T>(dir: &Path, f: impl FnOnce(&mut VaultTx<'_>) -> anyhow::Result<T>) -> anyhow::Result<T> {
-    let lock = std::fs::File::create(dir.join("lock"))?;
-    lock.lock()?;                                  // std flock (Rust 1.89): released by the kernel on death
-    let mut v = Vault::open_unlocked(dir)?;        // never a copy read before the lock
-    let out = f(&mut VaultTx { v: &mut v, _lock: &lock })?;
-    v.backup_own_files()?;                         // keep the last N logins/secrets.json
-    v.save()?;
-    Ok(out)
+// A seat's login change is an event with provenance, never a timestamp borrowed from a profile.
+pub enum LoginSeen {
+    /// The vault switched the seat at this instant (journal / logins.json `switched_at`).
+    Switched { at: DateTime<Utc>, account: AccountId },
+    /// First time swarmy sees this account in the seat: valid from now, not from the profile.
+    Observed { at: DateTime<Utc>, account: AccountId },
 }
-// `sync`, `put`, `capture`, `switch`, `rename`, `remove`, `observe` move to `impl VaultTx`;
-// `Vault` itself keeps only reads. Temp names: `.{name}.{pid}.{seq}.tmp` with an AtomicU64 seq.
+// post_pass: events come only from LoginSeen; `profile_fetched_at` is used only when it is newer
+// than the seat's last recorded change. Requests whose transcript names an owner keep it:
+const SEAT_ACCOUNT_AT: &str = "COALESCE(requests.owner_account, (SELECT sa.account_uuid …), requests.account_uuid)";
 ```
 
-**Lock it in**: the type system. Every write method lives on `VaultTx`, which only `edit` can construct (private field). Add a test that runs `capture`/`sync` from 8 threads for 500 iterations against temp seats and asserts that `logins.json` and `secrets.json` parse and that every login has its secret.
+**Lock it in**: a scenario test in `index/seat_scenarios.rs` where a vault switch restores a login captured earlier. The old account's requests and rollups must keep their account. A second test: requests with a `session-owner` record are never re-keyed by seat inference. Also a `CHECK`-like guard that rejects a `seat_accounts` row older than the seat's newest one unless its source is `Switched`.
 
 ---
 
-### H2: Facts that cannot be rebuilt are dropped on every schema bump
+### H2: A status-line reading is booked to whatever account the seat holds now
 
 **Severity**: High
-**Requirement**: 1. Committed facts are never rewritten (also 3: invariants)
-**Location**: `src/index/schema.rs:174-188` (`TABLES`), `src/index/mod.rs:130-137`; facts fed only from live snapshots at `src/index/mod.rs:396-452`.
+**Requirement**: 2. Value objects (a reading without its account), 3. Invariants
+**Location**: `src/claude/statusline.rs:24-35` (`LiveLimits` has no account), `src/claude/statusline.rs:172-212` (`merge`), `src/app/context.rs:539-542`, `src/index/mod.rs:678-694` and `:707-711`
 
-According to `schema.rs`, the index is "a cache of what the transcripts say". But `seat_accounts`, which records which account each seat held and since when, is observed only from the current `.claude.json` and cannot be rebuilt from transcripts. The same holds for `accounts` (emails and tiers of parked logins). Both are in `TABLES` and are dropped when `VERSION` changes. After the next bump, every request made before a login swap falls back to the stale `session-owner` records. Those records are wrong after a swap, by the project's own CLAUDE.md. Past spend therefore moves to the wrong account, and the per-account `$/point` calibration and the limit attribution change with it. `readings` was correctly kept out of `TABLES`, which shows the rule is known but only kept by hand.
+`swarmy statusline` stores `{at, config_dir, five_hour, seven_day}`. `seat_info_of` hands it to `merge` together with the seat's *current* account, and `merge` relabels the reading with that account.
+
+Example: the seat ran acc-a when the status line wrote 80% at 09:00, and was switched to acc-b at 12:00. Claude Code's cached reading is older (still acc-a's). Then:
+
+- the merged reading says "acc-b, 80%, 09:00";
+- `post_pass` stores it in `readings`, a fact table;
+- `post_pass` adds `seat_accounts(seat, 09:00, acc-b)`, which moves acc-a's requests from 09:00 to 12:00 to acc-b.
+
+Confirmed by two independent scenario tests. One gives `requests = ["r1|acc-a", "r2|acc-b"]` and `readings = ["acc-b|80"]`. This lasts until acc-b's first response runs the status line again.
 
 #### Current
 
 ```rust
-// src/index/schema.rs:174
-pub const TABLES: &[&str] = &[
-    "files", "requests", "tool_calls", "sessions", "agents", "owners",
-    "seat_accounts", "projects", "accounts", "prompts", "api_errors", "cost_states", "record_types",
-];
-// src/index/mod.rs:130
-if idx.meta("schema_version")?.as_deref() != Some(schema::VERSION) {
-    for t in schema::TABLES {
-        idx.conn.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?;
+// src/claude/statusline.rs:24-35, 206-208
+pub struct LiveLimits {
+    pub at: DateTime<Utc>,
+    pub config_dir: String,
+    pub session_id: Option<String>,
+    pub five_hour: Option<(f64, DateTime<Utc>)>,
+    pub seven_day: Option<(f64, DateTime<Utc>)>,
+}
+// merge(…)
+Some(Utilization { account_uuid: account.to_string(), fetched_at: live.at, readings, … })
+```
+
+#### Recommended
+
+```rust
+#[derive(Serialize, Deserialize)]
+pub struct LiveLimits {
+    pub v: u32,                       // published language: versioned like fleet.json
+    pub at: DateTime<Utc>,
+    pub account: Option<AccountId>,   // oauthAccount.accountUuid read when the line ran
+    pub session_id: Option<SessionId>,
+    pub five_hour: Option<(Pct, DateTime<Utc>)>,
+    pub seven_day: Option<(Pct, DateTime<Utc>)>,
+}
+pub fn merge(cached: Option<Utilization>, account: &AccountId, live: Option<LiveLimits>) -> Option<Utilization> {
+    let live = live.filter(|l| l.account.as_ref() == Some(account)); // another account's reading is not ours
+    …
+}
+```
+
+**Lock it in**: the account is a required field of the type, so a reading cannot be built without one. Add a scenario test that switches a seat between a status-line write and the next refresh, and one that checks a reading from another account is ignored. Make `merge` take `&AccountId`, so the label cannot come from elsewhere.
+
+---
+
+### H3: A response whose blocks straddle `rolled_until` is counted twice when its file is read again
+
+**Severity**: High
+**Requirement**: 3. Invariants (each API response is counted once; compacted = never compacted)
+**Location**: `src/index/write.rs:106-128` (per-record skip), `src/index/marks.rs:74-76` (`rolled_up`); introduced by 7949013 (read marks) on top of ba90725 (compactor)
+
+Claude Code writes one response as several `assistant` records, one per content block, each with its own timestamp. The raw row keeps the first block's time, so the compactor rolls the whole response up when that time is older than the cut.
+
+When the file is later read from its start, the skip is decided per record:
+
+- the first block (older than `rolled_until`) is skipped;
+- a later block of the same response, at or after `rolled_until`, is inserted as a new raw row;
+- its `msg_id` is no longer in `requests`, so nothing deduplicates it;
+- its tool calls are inserted again.
+
+Files are read from the start on every `CACHE_VERSION` bump, a replaced or truncated transcript, and a fork. With 15–20 agents, a few responses are always mid-stream at a cut. Confirmed by test: request rows 3 → 3 after compaction → 4 after the re-read, cost 0.0031 → 0.0056.
+
+#### Current
+
+```rust
+// src/index/write.rs:106-128
+Event::Request(r) => {
+    let t = ms(r.ts);
+    …
+    if rolled(t) {
+        skipped += 1;
+        continue;
     }
+    late |= t < at.settled_before;
+    *rowid += 1;
+    ins_req.execute(params![r.msg_id, f.seat, f.session_id, f.agent_id, …, t, …])?;
 ```
 
 #### Recommended
 
 ```rust
-/// Derived from transcripts: dropped and rebuilt on a schema bump.
-pub const CACHE_TABLES: &[&str] = &["files", "requests", "tool_calls", "sessions", "agents",
-    "owners", "projects", "prompts", "api_errors", "cost_states", "record_types"];
-/// Observed over time from `.claude.json`: migrated with `ALTER TABLE`, never dropped.
-pub const FACT_TABLES: &[&str] = &["meta", "readings", "seat_accounts", "accounts"];
+// Decide once per response, by the time the raw row would carry (its first block):
+let first_ts = *first_seen.entry(r.msg_id.clone()).or_insert(t);
+if rolled(first_ts) {
+    skipped += 1;
+    continue;
+}
+// …and across chunks: a msg_id already rolled up is looked up in the archive's msg set, or the
+// compactor keeps a `rolled_msgs(msg_id)` table for the last two days of the cut.
 ```
 
-**Lock it in**: a test that parses every `CREATE TABLE` name in `schema::SQL` and asserts that each one is in exactly one of the two lists. A second test fills `seat_accounts`, opens the index with a different `VERSION`, and asserts the rows survive.
+**Lock it in**: give the scenario fixture (`index/scenarios.rs::assistant`) a multi-block form, as Claude Code really writes it. In `compact_scenarios.rs`, add a response straddling the cut, re-read from the start, and assert every surface still reads the same. A property test over random block splits and cut times would catch the whole class.
 
 ---
 
-### H3: The `cost = -1` sentinel is summed as $0, unflagged, and memoized for the life of the process
+### H4: A switch that fails halfway leaves the seat on the new login while the vault records the old one
 
 **Severity**: High
-**Requirement**: 3. Invariants; nothing fails silently
-**Location**: `src/index/schema.rs:43`, `src/index/mod.rs:592-596` (reset outside the pricing transaction), `src/index/query.rs:186-187` (`SUM(MAX(r.cost, 0))`, + 9 copies at `query.rs:305,422` and `live/mod.rs:283,292,530,554,584,599,673`), `src/cli/limits.rs:87-114` (memo).
+**Requirement**: 9. One pipeline (the transaction is all or nothing), 3. Invariants (one grant is never in two seats)
+**Location**: `src/vault/mod.rs:648-721`; the `edit` doc (`src/vault/mod.rs:186-206`) promises that nothing staged is saved when the closure fails
 
-`price_all` sets every row to `-1` in an autocommit statement and reprices in a later transaction. Until that commit, any other process (the dashboard, `swarmy report`) sums the unpriced rows as $0. `priced` stays `1` during that time, so the "unpriced" counter does not show the gap. The dashboard memoizes "settled" spans in `total_cached`. A partial total read during a reprice therefore becomes a `$/point` calibration sample for the rest of the session. The memo key also ignores the price fingerprint, so a legitimate reprice never reaches it.
+`switch` calls `self.save()` in step 1, then writes `.credentials.json` in step 3, then `.claude.json` in step 4, and records `mounted` only in step 5.
+
+If step 4 fails (disk full, or `$HOME` not writable for the default seat), the error is reported. But:
+
+- the seat now holds login B's refresh token while `.claude.json` names A;
+- the vault still says A is mounted there and B is free.
+
+`sync` never re-mounts a login just because its fingerprint matches, so B is offered for other seats. A second `switch(other, "B")` then succeeds without `--share`, which is exactly the state `SharedGrant` exists to prevent. Confirmed by test in a scratch copy, with the default seat's dir set to 0500. No token is lost (step 1 saved the old one).
 
 #### Current
 
 ```rust
-// src/index/mod.rs:592
-pub fn price_all(&mut self, prices: &PriceBook) -> anyhow::Result<()> {
-    let fp = prices.fingerprint();
-    if self.meta("price_fp")?.as_deref() != Some(fp.as_str()) {
-        self.conn.execute("UPDATE requests SET cost = -1", [])?;   // committed on its own
+// src/vault/mod.rs:674-699
+self.save()?;                                   // 1. persisted
+…
+atomic_write(&seat.credentials_file(), new_creds.as_bytes())?;   // 3. seat changed
+if let Some(acct) = &target.oauth_account {
+    store::rewrite_merging(&seat.claude_json, |t| config_json::with_oauth_account(t, Some(acct)))?; // 4. may fail
+}
+// 5. Bookkeeping (lost when 4 fails)
+```
+
+#### Recommended
+
+```rust
+// Stage both seat files first, then commit them; on any failure put the backups back.
+let creds = fsutil::stage(&seat.credentials_file(), new_creds.as_bytes(), Mode::Private)?;
+let cj = store::stage_merging(&seat.claude_json, |t| config_json::with_oauth_account(t, Some(acct)))?;
+creds.commit(&seat.credentials_file())?;
+if let Err(e) = cj.commit(&seat.claude_json) {
+    restore_backup(&bdir, seat)?;               // the seat is as it was before the switch
+    return Err(e);
+}
+// and in `sync`: a seat whose fingerprint equals a saved login's marks that login mounted there.
+```
+
+**Lock it in**: a vault test that makes the `.claude.json` write fail and asserts the seat's files equal the backup and the vault still says A is mounted. A `sync` test: a seat holding B's fingerprint makes B `mounted` there, so `SharedGrant` fires.
+
+---
+
+### M1: The settled-sum cache cuts the newest minutes off the limit curve
+
+**Severity**: Medium
+**Requirement**: 3. Invariants (a kept part plus a fresh part equals a fresh sum)
+**Location**: `src/index/query.rs:532-556` (`spend_series`); introduced by 6ea15cb ("settled parts of long sums kept")
+
+`n` (the number of buckets) depends on `span.end`, but the kept part's key is `series|{bucket}|{filter}` plus the span start. `limits::load_window` calls it with a fixed window start, 1-minute steps over a 5-hour window, and `end = now + 1s`.
+
+Within one settled horizon (up to 15 minutes), the kept vector stays at the first call's length, and `zip` cuts the sum to it. So the curve and its projection lose up to about 14 minutes. Confirmed by test: lengths 180, then 180 again five minutes later (185 expected), 185 on a fresh index.
+
+#### Current
+
+```rust
+let n = (((ms(span.end) - origin) as f64) / bucket as f64).ceil().max(1.0) as usize;
+let parts = self.settled_read(&format!("series|{bucket}|{f:?}"), span, |c, s| series_on(c, s, origin, bucket, n, f))?;
+Ok(match parts {
+    (Some(mut a), b) => { for (x, y) in a.iter_mut().zip(b) { *x += y; } a }
+    (None, b) => b,
+})
+```
+
+#### Recommended
+
+```rust
+Ok(match parts {
+    (Some(a), b) => {
+        let mut out = vec![0.0; n];                        // length from this call's span
+        for (o, x) in out.iter_mut().zip(a.iter().chain(std::iter::repeat(&0.0))) { *o += x; }
+        for (o, y) in out.iter_mut().zip(b) { *o += y; }
+        out
     }
-    let tx = self.conn.transaction()?;
-// src/index/query.rs:186
-const SUMS: &str = "COUNT(*), SUM(r.input), ..., SUM(MAX(r.cost, 0)), SUM(1 - r.priced)";
+    (None, b) => b,
+})
 ```
 
-#### Recommended
-
-```rust
-// schema: NULL = not priced yet; the database refuses anything else below zero
-// cost REAL CHECK (cost IS NULL OR cost >= 0),
-const SUMS: &str = "COUNT(*), ..., SUM(r.cost), SUM(1 - r.priced), SUM(r.cost IS NULL)";
-
-pub fn price_all(&mut self, prices: &PriceBook) -> anyhow::Result<()> {
-    let fp = prices.fingerprint();
-    let tx = self.conn.transaction()?;                 // reset + reprice + fp: one commit
-    if meta_in(&tx, "price_fp")?.as_deref() != Some(fp.as_str()) {
-        tx.execute("UPDATE requests SET cost = NULL", [])?;
-    }
-    /* price rows WHERE cost IS NULL */
-    set_meta_in(&tx, "price_fp", &fp)?;
-    tx.commit()?;
-    Ok(())
-}
-```
-
-Key the `total_cached` memo by `(price_fp, account, span)`, or drop it, and show `pending > 0` in the totals as "≈ repricing".
-
-**Lock it in**: the `CHECK` constraint, plus a test that opens two connections to one file, reprices on one, and asserts the other never sees a total below the last committed total.
+**Lock it in**: a `settled.rs` test that calls each kept sum at t and at t + 5 min and compares it with a fresh index (lengths and values). Generalise it: every `settled_read` caller is checked "kept + fresh = fresh" at two instants.
 
 ---
 
-### H4: Limit estimation lives in the CLI, and the dashboard depends on it (cycle `tui ↔ cli`)
-
-**Severity**: High
-**Requirement**: 5. Maximum cohesion, minimum coupling (also 7: layers)
-**Location**: `src/tui/mod.rs:27-28,442`, `src/tui/view/panels.rs:220,1010,2102` (+ `cli/mod.rs:189,228,230,245` for the other direction; `demo.rs:20 → tui::boot::hash`; `config.rs:11 ↔ claude/statusline.rs:664-685`).
-
-`cli/limits.rs` holds the core of the product's "where did my week go": the reference account per tier, visible vs elsewhere points, burn, ETA, and the window curve. `cli/context.rs` holds the composition root `Ctx`. The TUI imports both, plus `cli::doctor::human_bytes`, while `cli` imports `tui` to launch it. A change to how a command prints can now break the dashboard, and the estimation cannot be reused or tested without the presentation module.
-
-#### Current
-
-```rust
-// src/tui/mod.rs:27
-use crate::cli::context::Ctx;
-use crate::cli::limits::{self, AccountReport};
-// src/tui/view/panels.rs:1010
-let wins: Vec<(usize, &crate::cli::limits::WindowReport)> = app
-// src/tui/view/panels.rs:220
-crate::cli::doctor::human_bytes(a.memory)
-```
-
-#### Recommended
-
-```text
-src/app/context.rs      Ctx (composition root; used by cli and tui)
-src/limits/report.rs    AccountReport, WindowReport, all_reports(), analyze()   (index + core::limits)
-src/core/limits.rs      + the pure decisions now inside analyze() (see M2)
-src/cli/limits.rs       print_window() and run() only
-src/ui/fmt.rs           + human_bytes
-```
-
-```rust
-// src/tui/mod.rs
-use crate::app::context::Ctx;
-use crate::limits::report::{self, AccountReport};
-```
-
-**Lock it in**: a test (`tests/deps.rs` once there is a lib target, or a `#[test]` that scans `src/`) that reads every `crate::<area>` reference and fails on any edge outside the allowed matrix. In particular: `tui`/`cli` may not import each other, `core` and `claude` import nothing above them, and `live` does not import `ui`. Start with today's edges as a ratchet.
-
----
-
-### H5: Silent fallbacks on the account and limit path turn errors into wrong attribution
-
-**Severity**: High
-**Requirement**: 3. Nothing fails silently
-**Location**: 233 sites in non-test code: 80 `unwrap_or_default()`, 51 `.ok()`, 36 `let _ =`, 66 `unwrap_or(0…/false)`. By area: `tui` 60, `claude` 56, `live` 27, `index` 26, `cli` 24, `vault` 16, `ui` 3, `core` 2. Worst: `src/cli/context.rs:87,103,128,306`, `src/vault/mod.rs:106,383`, `src/index/mod.rs:433-438,463-470,502`, `src/tui/mod.rs:864`.
-
-These are not cosmetic fallbacks. If the vault cannot be opened, `drop_unconfirmed` returns without dropping the stale profile of an unconfirmed seat. The seat is then merged into the wrong account and borrows its limit reading, which is the exact case the function exists to prevent. A damaged `.claude.json` becomes an empty one, which silently removes the seat's account, readings and Claude Code prices. In `post_pass`, `.ok()` treats any SQL error as "no previous account" and inserts a login change, which then re-attributes requests.
-
-#### Current
-
-```rust
-// src/cli/context.rs:86
-pub fn drop_unconfirmed(&mut self) {
-    let Ok(mut v) = crate::vault::Vault::open(&self.dirs.vault_dir()) else {
-        return;
-    };
-    // ...
-    let Ok(states) = v.seat_states(&self.seats) else {
-        return;
-    };
-// src/index/mod.rs:433
-let before: Option<String> = tx
-    .query_row("SELECT account_uuid FROM seat_accounts WHERE seat = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1",
-        params![si.label, ts], |r| r.get(0))
-    .ok();
-```
-
-#### Recommended
-
-```rust
-pub fn drop_unconfirmed(&mut self) -> anyhow::Result<()> {
-    let mut v = crate::vault::Vault::open(&self.dirs.vault_dir())
-        .context("cannot read the vault: seats with a new login cannot be confirmed")?;
-    let states = v.seat_states(&self.seats)?;
-    // ...
-    Ok(())
-}
-// index: `.optional()?` keeps "no row" apart from "SQL failed"
-let before: Option<String> = tx.query_row(SQL_SEAT_ACCOUNT_AT, params![si.label, ts], |r| r.get(0))
-    .optional()?;
-```
-
-The dashboard shows a failed read as an ATTENTION line ("vault unreadable"), and the CLI reports it in `doctor`. It never falls back to an empty value.
-
-**Lock it in**: workspace lints `clippy::unwrap_used`, `clippy::let_underscore_must_use`, `clippy::map_unwrap_or`, plus a counted ratchet for `unwrap_or_default()`/`.ok()` in `src/{index,vault,cli,limits}` that may only go down. Each remaining site carries `#[expect(..., reason = "...")]` or a comment saying why the default is correct.
-
----
-
-### M1: Limit rules are copied, with drift, into five files
+### M2: Two archive merge rules disagree with the raw path
 
 **Severity**: Medium
-**Requirement**: 5. One business rule = one place (also 8)
-**Location**: "limit reached" (`>= 100.0`) ×6: `core/limits.rs:177`, `cli/limits.rs` via `eta`, `tui/app.rs:527`, `tui/view/panels.rs:819,1175`, `tui/view/mod.rs:354`, `claude/statusline.rs:443`. Utilization level 85/60 ×3: `ui/style.rs:40-48`, `tui/theme.rs:189-197`, `claude/statusline.rs:270-278` (+ `panels.rs:779`). Window roll-forward ×3: `cli/limits.rs:73-82`, `cli/context.rs:273-280`, `cli/accounts.rs:111-116`. Reset detection ×2: `core/limits.rs:88-112` and `tui/app.rs:879`. Projection to reset only in the view: `panels.rs:1045-1052`.
+**Requirement**: 3. Invariants (compacted = never compacted), 8. Declare once
+**Location**: `src/index/archive.rs:378-400` (`rekey_sql`), `src/index/archive.rs:181-187` (`priced` as `MAX`); introduced by 4c40df7 and cf1dd50
 
-The copies already disagree. `core::limits::effective_start` calls a fall of more than 2 points a reset, while the event log calls it a reset only when the reading goes from ≥50% to <5%, so a reset from 40% is never logged. `swarmy accounts` shows the last raw reading (`accounts.rs::weekly`), but the dashboard and the status line show the estimate. The "≈X at reset" projection exists only in the chart.
+- **Re-key double count.** The `DELETE` re-evaluates `account_at(first_ts)` after the `INSERT … ON CONFLICT` has merged rows and lowered their `first_ts` (`MIN`). A row that was itself a target no longer matches and stays. Two login changes in one quarter hour older than `rolled_until` gave Z = 11, W = 10 (21) instead of 11. Confirmed by test.
+- **Unpriced hidden.** A zero-token request of an unknown model is priced at $0 (`priced = 1`); one with tokens is not (`priced = 0`). In one rollup key, `MAX` gives 1, so `n_unpriced` goes from 1 to 0 after compaction. Confirmed by test.
 
 #### Current
 
 ```rust
-// src/claude/statusline.rs:270            // src/tui/theme.rs:189
-fn level(pct: f64) -> &'static str {        pub fn utilization(&self, pct: f64) -> Color {
-    if pct >= 85.0 { "1;31" }                   if pct >= 85.0 { self.bad }
-    else if pct >= 60.0 { "33" }                else if pct >= 60.0 { self.warn }
-    else { "32" }                               else { self.good }
-}                                           }
-// src/tui/app.rs:879 — a second, different reset rule
-if p >= 50.0 && w.estimate_now < 5.0 {
-    self.log_event("◆", format!("LIMIT RESET · {} {}", rep.name, w.reading.kind.label()), Tone::Good);
+Sum { col: "priced", ddl: "INTEGER NOT NULL CHECK (priced IN (0, 1))",
+      from_raw: "MAX(priced)", merge: "MAX(priced, excluded.priced)", as_raw: &[] },
+…
+format!("DELETE FROM usage_rollup WHERE {}", moved("usage_rollup")),
 ```
 
 #### Recommended
 
 ```rust
-// src/core/limits.rs — declared once, mapped to colours by each front end
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Level { Ok, Warn, Bad, Reached }
-impl Level {
-    pub fn of(pct: f64) -> Level {
-        match pct { p if p >= 100.0 => Level::Reached, p if p >= 85.0 => Level::Bad,
-                    p if p >= 60.0 => Level::Warn, _ => Level::Ok }
-    }
-}
-pub fn current_window(r: &Reading, now: DateTime<Utc>) -> Span { /* the one roll-forward */ }
-pub fn projection_at_reset(w: &WindowReport, now: DateTime<Utc>) -> Option<f64> { /* ... */ }
-// tui/app.rs: a reset is `WindowReport::manual_reset` changing, not a second threshold.
+// Count, don't flag: the archive keeps how many requests had no price.
+Sum { col: "n_unpriced", ddl: "INTEGER NOT NULL CHECK (n_unpriced >= 0)",
+      from_raw: "SUM(priced = 0)", merge: "n_unpriced + excluded.n_unpriced", as_raw: &[] },
+// Re-key: select the rows to move into a temp table first, then insert from it and delete exactly
+// those keys (rowid list), so the merge cannot change which rows the delete sees.
 ```
 
-**Lock it in**: a duplicate-predicate check in the test suite: `grep -rE '>= ?(85|60|100)\.0'` outside `core/limits.rs` must return nothing (with a ratchet), plus hand-computed tests for `Level::of` boundaries.
+**Lock it in**: a property test over random worlds (models with and without prices, login changes at random times, random cuts) asserting `total`, `n_unpriced` and `spend_by(Account)` are equal before and after `compact` and after a re-key.
 
 ---
 
-### M2: `analyze` interleaves six queries with untested estimation rules
+### M3: Records are dropped silently: unreadable chunks and never-indexed sessions in a compacted seat
 
 **Severity**: Medium
-**Requirement**: 1. Domain logic is pure; use cases are thin (also 10)
-**Location**: `src/cli/limits.rs:157-314` (159 lines; + `own_usd_per_point` `:116-150`, `total_cached` `:87-114` reading `Utc::now()`, masking applied inside attribution at `:240-244`).
+**Requirement**: 3. Invariants (nothing fails silently)
+**Location**: `src/index/mod.rs:600` (`let Ok(chunk) = chunk else { continue };`), `src/index/marks.rs:64-69` (rules 2 and 3); rule 3 introduced by 7949013
 
-The tier reference rule (another account counts as the reference only if its ratio is more than 1.2 times this account's own), the visible/outside split, the ETA cut-off at the window end and the curve scaling are all business decisions. They sit between `idx.total(...)` calls, so the only way to test them is with a full index, and none of them is tested. `readings(account, kind)` is loaded three times per window. Masking (`ctx.show_path`) changes the attribution keys, so two projects with the same last path component merge into one share when `--mask` is on.
+A chunk that fails to parse is dropped with no count, no `diag::log` and no `problems` entry.
+
+The read-mark rules then make such losses permanent. In a seat that has been compacted, *any* file of a session swarmy has never indexed is read with its records older than `rolled_until` skipped. That covers:
+
+- a transcript synced from another machine;
+- a file whose last read failed;
+- a subagent file of a known session that was never read.
+
+Only `skipped_records` shows the difference, and nobody reads it. The rule query also ignores the seat (`WHERE session_id = ?1`).
 
 #### Current
 
 ```rust
-// src/cli/limits.rs:181
-let own = own_usd_per_point(idx, account, r)?;
-let reference = tier
-    .as_ref()
-    .and_then(|t| refs.get(&(t.clone(), r.kind)))
-    .filter(|x| x.account != account && own.is_none_or(|o| x.usd_per_point > o * 1.2));
-let usd_per_point = reference.map(|x| x.usd_per_point).or(own);
-let (base, since) = if reset_passed { (0.0, window.start) } else { (r.utilization, r.fetched_at) };
-let spent_since = idx.total(Span { start: since, end: now_end }, &filter)?.cost;
-let estimate_now = limits::estimate_now(base, spent_since, usd_per_point);
+// src/index/marks.rs:64-69
+if self.rolled_seats.contains(&file.seat) {
+    return Ok(true);
+}
+conn.prepare_cached("SELECT 1 FROM agents WHERE session_id = ?1 LIMIT 1")?
+    .exists([&file.session_id])
 ```
 
 #### Recommended
 
 ```rust
-// src/limits/report.rs — loader: queries only
-let inputs = WindowInputs::load(idx, account, r, ctx.now)?;   // history, spend since, in window, burn, by project
-// src/core/limits.rs — decision: pure, testable with numbers
-pub fn window_estimate(i: &WindowInputs, reference: Option<&Reference>, now: DateTime<Utc>) -> WindowEstimate {
-    let usd_per_point = choose_ratio(i.own_usd_per_point, reference);   // the 1.2 rule, named
-    let estimate_now = estimate_now(i.base(), i.spent_since, usd_per_point);
-    /* visible / outside / eta / shares */
-}
-// masking happens when printing, never on attribution keys
+// Skip only what the archive provably holds: records of this (seat, session, agent).
+conn.prepare_cached(
+    "SELECT 1 FROM agent_rollup WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 LIMIT 1",
+)?
+.exists(params![file.seat, file.session_id, file.agent_id])
+// mod.rs: a failed parse is a counted, reported problem, never a silent `continue`
+let chunk = match chunk { Ok(c) => c, Err(e) => { stats.unreadable.push((w.file.path.clone(), e)); continue } };
 ```
 
-**Lock it in**: hand-computed tests for `choose_ratio` (own only, reference wins, reference within 20% loses) and for `window_estimate` (reset passed, manual reset, nothing spent). Add a purity check that `core/` contains no `Utc::now`, `Local::now`, `std::fs` or `rusqlite`.
+**Lock it in**: a compact scenario that adds a never-seen session with old records to a compacted seat and expects them in the archive. Add `unreadable` to `RefreshStats`, shown in `doctor` and ATTENTION, with a test that a corrupt chunk is reported.
 
 ---
 
-### M3: `panels.rs` (2 772 lines) and `app.rs` (1 396) mix drawing, state and business rules
+### M4: A cache bump assumes every raw day's transcript is still on disk
 
 **Severity**: Medium
-**Requirement**: 5. Cohesion (also 6: modularity)
-**Location**: `src/tui/view/panels.rs` (26 functions; `swarm` 358 lines, `mana` 304, `efficiency_sections` 289, `history` 227, `agent` 210, `models` 203, `mana_curve` 198), `src/tui/app.rs` (`App` with 36 `pub` fields; `attention` 178 lines at `:454-631`, `limit_alerts` `:851-894`).
+**Requirement**: 3. Invariants, Step 12 data lifecycle
+**Location**: `src/index/schema.rs:411-437` (raw tables dropped), `src/index/mod.rs:451-455` (`roll_late` only when a file was read from its start), `src/claude/seats.rs:68-74` (`cleanup_period_days` returns `None` on any read or parse error)
 
-One file holds ten unrelated panels, and every panel takes `&mut App`. `App::attention` decides severities, thresholds (6 h, 85%), parked-login exceptions and texts, and it is not tested. When the alert rules change, the person changing them has to work inside the key-handling god object.
+Raw rows newer than `rolled_until` are the only record once their transcript is gone. A `CACHE_VERSION` bump drops them, relying on `keep_raw_days ≤ retention − 2` (`core::storage`). Three paths break that assumption:
+
+- A seat whose dir was removed or moved loses its last 14 days on the next bump.
+- An unreadable `settings.json` silently counts as the 30-day default. A seat set to `cleanupPeriodDays: 7` with a damaged file passes the check.
+- Old records appended to a known file (a clock far behind) stay raw below `rolled_until` until the next compaction. A bump in between skips them as rolled up. `docs/design/storage.md` admits this gap.
 
 #### Current
 
 ```rust
-// src/tui/app.rs:527
-if w.estimate_now >= 100.0 && !w.reset_passed {
-    out.push(Attn { severity: if parked { 8 } else { 1 }, glyph: "⊘",
-        tone: if parked { Tone::Info } else { Tone::Bad }, /* text … */ });
-} else if let Some(eta) = w.eta.filter(|d| d.num_hours() < 6) {
-    out.push(Attn { severity: 1, glyph: "⊘", tone: Tone::Warn, /* … */ });
-} else if w.estimate_now >= 85.0 {
-    out.push(Attn { severity: 6, glyph: "⊘", tone: Tone::Warn, /* … */ });
+pub fn cleanup_period_days(&self) -> Option<u32> {
+    let text = std::fs::read_to_string(self.dir.join("settings.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let days = v.get("cleanupPeriodDays")?.as_f64()?;
+    …
 }
 ```
 
 #### Recommended
 
-```text
-src/alerts.rs                     pub fn alerts(a: &Analytics, seats: &[SeatRow], now) -> Vec<Alert>  (pure, tested)
-src/tui/view/panels/mod.rs        dispatch only
-src/tui/view/panels/{swarm,limits,burn,attention,agent,projects,models,history,efficiency,system}.rs
-src/tui/app/{state,keys,mouse}.rs
-```
-
 ```rust
-pub fn attention(&self) -> Vec<Attn> {
-    crate::alerts::alerts(&self.analytics, &self.analytics.seats, self.now).into_iter().map(Attn::from).collect()
+// Before dropping raw tables: roll up every raw row whose transcript is not on disk.
+if rebuild {
+    compact::roll_orphans(&tx, prices)?;   // rows whose `files.path` no longer exists, and rows below rolled_until
+    for t in RAW_TABLES { tx.execute_batch(&format!("DROP TABLE IF EXISTS {t};"))?; }
 }
+pub fn cleanup_period_days(&self) -> Result<Option<u32>, SettingsError> { … } // damaged ≠ unset
 ```
 
-**Lock it in**: a file-size test (no `.rs` over 900 lines, with today's offenders listed as a ratchet) and table tests for `alerts()` with hand-written readings.
+**Lock it in**: a scenario that removes a seat dir, bumps `CACHE_VERSION`, and expects the same totals. A test that a damaged `settings.json` makes the `keep_raw_days` check fail with a coded error.
 
 ---
 
-### M4: The index leaks its connection; `live` queries index tables directly
+### M5: The status line restamps stale numbers as fresh
 
 **Severity**: Medium
-**Requirement**: 4. Minimal API surface; reads cannot write
-**Location**: `src/index/mod.rs:35` (`pub conn: Connection`); `src/live/mod.rs` (20 SQL literals, 5 `.conn` uses; `build` is 472 lines at `:190`).
+**Requirement**: 3. Invariants (a reading's time is when its numbers were true)
+**Location**: `src/claude/statusline.rs:672-686`
 
-Any module can `execute` on the cache through `idx.conn`, and the index schema is known by two modules. In `live::build`, the agent-state rule (main thread Gone/NeedsYou/Tool/Thinking/Idle; subagent Done/Stalled/Tool/Thinking) is buried among SQL. It is the most user-visible rule of the dashboard, and it has no direct test.
+`live_from(&input, &dir, now)` sets `at = now`, and the file is rewritten whenever the numbers differ or five minutes have passed. `swarmy setup` adds `refreshInterval`, so idle sessions run the line every few seconds. Their `rate_limits` come from the process's last response, which can be hours old.
+
+- **One idle session:** its old numbers become a "fresh" reading every five minutes. `merge` then prefers them over Claude Code's newer cached fetch, and `post_pass` stores them.
+- **Two sessions on one seat (one idle at 40%, one active at 55%):** they overwrite each other's file. The stored readings alternate, so the week estimate and calibration jump, and `limit_events` can announce a crossing again on each upward flip.
 
 #### Current
 
 ```rust
-// src/index/mod.rs:34
-pub struct Index {
-    pub conn: Connection,
-// src/live/mod.rs:202
-let conn = &idx.conn;
-// ...
-let mut st = conn.prepare("SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, ... FROM agents a LEFT JOIN sessions s ...")?;
+let now = Utc::now();
+if let Some(live) = live_from(&input, &dir, now) {
+    let old = read(&file);
+    if old.as_ref().is_none_or(|o| o.five_hour != live.five_hour
+        || o.seven_day != live.seven_day || (now - o.at).num_minutes() >= 5) && let Err(e) = write(&file, &live)
 ```
 
 #### Recommended
 
 ```rust
-pub struct Index { conn: Connection, /* … */ }
-impl Index {
-    /// Rows the live view needs, typed; the SQL stays in `index/`.
-    pub fn live_agents(&self, since: DateTime<Utc>) -> anyhow::Result<Vec<AgentRow>> { /* … */ }
-}
-// src/live/state.rs — pure
-pub fn agent_state(row: &AgentRow, session: Option<&LiveSession>, tool: Option<&ToolRow>,
-                   now: DateTime<Utc>, opts: &Options) -> (State, DateTime<Utc>) { /* … */ }
+// Keep the time the numbers were first seen; a repeat never moves `at` forward, and a reading
+// older than the file's newest is never written back over it.
+let at = match &old { Some(o) if o.same_numbers(&live) => o.at, _ => now };
+if old.as_ref().is_some_and(|o| o.at > at) { return; }
+// and keep per-session files (`<seat>/<session>.json`); the dashboard takes the newest per account.
 ```
 
-**Lock it in**: make `conn` private (the compiler enforces the rest), add a test that `"SELECT "` appears only under `src/index/`, and add table tests for `agent_state`.
+**Lock it in**: tests on `run`'s pure core. Two sessions with different numbers must leave the newest reading. A repeat must not change `at`.
 
 ---
 
-### M5: Prices are "versioned data" only on paper: every built-in and cached price is backdated to 2023
+### M6: A login's identity is the hash of a token the code itself says rotates
+
+**Severity**: Medium (High if Claude Code rotates refresh tokens)
+**Requirement**: 2. Value objects (identity), 1. Ubiquitous language
+**Location**: `src/claude/credentials.rs:57-81` (fingerprint = SHA-256 of `refreshToken`), `src/vault/mod.rs:603-612` (`sync`), vs `src/vault/mod.rs:3-5` and `src/errors.rs:24-28` ("Claude Code rotates the refresh token when it refreshes")
+
+`sync` treats a new fingerprint in a seat as "another login now lives here". It unmounts the saved login and keeps its old tokens. If refresh tokens rotate, as the module doc and `SharedGrant` say, every refresh does three things:
+
+- unmounts the login;
+- marks the seat unverified, so the dashboard drops its account and limit reading (`drop_unconfirmed`);
+- makes the next switch auto-save a duplicate login without an account, and lets a later switch back write a dead token.
+
+A scratch-copy test reproduces this given that premise. The code holds two contradictory models of one concept. One of them is wrong, and the owner needs to settle which.
+
+#### Current
+
+```rust
+// src/vault/mod.rs:603-612
+Some(_) => {
+    // Another login now lives in that seat; ours keeps its own tokens.
+    if let Some(l) = self.index.find_mut(&mounted.id) { l.mounted = None; }
+```
+
+#### Recommended
+
+```rust
+// Grant identity = what does not change on refresh: the account plus the grant's issue time
+// (refresh_expires_at − lifetime), or the access token's `sub`/`jti` if present.
+pub struct GrantId { account: AccountId, issued: DateTime<Utc> }
+Some(sec) if sec.grant_id() == mounted.grant_id => { /* same grant, rotated: keep the copy current */ }
+```
+
+**Lock it in**: a vault test "a rotated refresh token with the same account keeps the login mounted and current". A short note in `CLAUDE.md`'s format notes recording the verified rotation behaviour of the Claude Code version.
+
+---
+
+### M7: `.credentials.json` is overwritten without a concurrent-write check
 
 **Severity**: Medium
-**Requirement**: 1. Rules that change over time are dated data (also 8)
-**Location**: `src/core/pricing.rs:80,86-141,156-191`; defaults `input × 1.25 / × 2.0 / × 0.1`, `0.01` and the date `2023-01-01` repeated in `pricing.rs:124-127,169-172` and `config.rs:131-140`.
+**Requirement**: 9. Pipeline (one mechanism for writing a file another program also writes)
+**Location**: `src/vault/mod.rs:679` and `:691-692` (plain `atomic_write`), `src/vault/store.rs:58-81` (`rewrite_merging`: `change(&text)?` aborts on a torn read; the 8th attempt writes anyway)
 
-`BUILTIN` has no `from` column, and `merge_claude_code_cache` stamps the cache with `EPOCH`. When Anthropic changes a price, Claude Code's cache updates, the fingerprint changes, and every historical request is repriced at today's rate, including past limit windows and their calibration. The derived-rate defaults are written three times. The user-override copy forgets `fast_multiplier` and `long_context` (see Defects).
+Only `.claude.json` gets the stamp-and-retry loop. `.credentials.json` is read at step 2 and replaced at step 3, after several fsyncs (vault save, backups). A token refresh by Claude Code inside that window (claude.ai or `mcpOAuth`) is overwritten. The newer token survives only in the step-2 backup.
+
+The CLI refuses to switch while sessions run unless given `--force`. The TUI's `do_switch` (`src/tui/vault_ui.rs:154-164`) only warns in its confirmation text.
 
 #### Current
 
 ```rust
-// src/core/pricing.rs:185
-self.entries.push(PriceEntry { model: model.clone(), from: EPOCH, rates, source });
-// src/config.rs:135
-cache_write_5m: p.cache_write_5m.unwrap_or(p.input * 1.25),
-cache_write_1h: p.cache_write_1h.unwrap_or(p.input * 2.0),
-cache_read: p.cache_read.unwrap_or(p.input * 0.1),
-web_search: p.web_search.unwrap_or(0.01),
-fast_multiplier: p.fast_multiplier,
-long_context: None,
+let cred_text = store::read_optional(&seat.credentials_file())?;
+…  // backups, fsyncs
+let new_creds = credentials::with_login(cred_text.as_deref(), &secret)?;
+atomic_write(&seat.credentials_file(), new_creds.as_bytes())?;
 ```
 
 #### Recommended
 
 ```rust
-impl Rates {
-    /// The one place the derived rates are defined; anything not given inherits from `base`.
-    pub fn derive(input: f64, output: f64, over: RateOverrides, base: Option<&Rates>) -> Rates { /* … */ }
-}
-// Claude Code's cache: store each distinct (model, rates) in the index's FACT tables with the
-// date it was first seen, and price a request with the version in force on its day.
-const BUILTIN: &[(&str, NaiveDate, f64, f64, f64, Option<f64>)] = &[ /* model, from, … */ ];
+store::rewrite_merging(&seat.credentials_file(), |t| credentials::with_login(Some(t), &secret))?;
+// rewrite_merging: a parse error retries from the newer text; after ATTEMPTS it fails
+// (`VaultError::SeatBusy`) instead of writing over the newest version.
 ```
 
-**Lock it in**: a test where a cache price changes "today" and requests from yesterday keep their cost, plus a test that a user override of `claude-opus-5-5` with only `input`/`output` still doubles in fast mode.
+**Lock it in**: one helper for "files Claude Code also writes", plus an architecture test that `credentials_file()` and `claude_json` are written only through it. The vault concurrency test can then rewrite `.credentials.json` as well.
 
 ---
 
-### M6: Primitive obsession: ids, account keys and money are raw `String`/`f64`
+### M8: The strict lint baseline is still 2,157 warnings away
+
+**Severity**: Medium
+**Requirement**: Static typing and analysis
+**Location**: `Cargo.toml` `[lints]`; worst files `src/tui/boot.rs` (202), `src/demo.rs` (137), `src/tui/view/mod.rs` (84), `src/core/limits.rs` (64), `src/tui/view/panels/limits.rs` (61), `src/index/insights.rs` (60)
+
+`[lints]` already denies `unwrap_used`, `expect_used`, `panic`, `unsafe_code`, `dead_code` and `allow_attributes_without_reason`, and `cargo clippy --all-targets -D warnings` is clean. The Step 11 strict run (`-W clippy::pedantic` plus the restriction lints) reports 2,157 distinct warnings, 140 of them in test files. Counted from `--message-format=json`; the short format prints the lint name only once per lint, so grepping it gives 2 of each.
+
+| Lint | Count | Lint | Count |
+|---|---|---|---|
+| `as_conversions` | 445 | `cast_lossless` | 41 |
+| `indexing_slicing` | 394 | `default_trait_access` | 33 |
+| `float_arithmetic` | 258 | `let_underscore_must_use` | 28 |
+| `must_use_candidate` | 184 | `wildcard_enum_match_arm` | 25 |
+| `missing_errors_doc` | 133 | `many_single_char_names` | 17 |
+| `cast_precision_loss` | 103 | `redundant_closure_for_method_calls` | 16 |
+| `cast_sign_loss` | 100 | `needless_pass_by_value`, `single_match_else`, `wildcard_imports` | 14 each |
+| `cast_possible_truncation` | 92 | `assert_is_empty` | 11 |
+| `map_unwrap_or` | 55 | others (26 lints) | 117 |
+| `cast_possible_wrap` | 47 | `too_many_lines` | 46 |
+
+By module (`as_conversions` / `indexing_slicing` / lossy casts):
+
+| Module | as / index / casts |
+|---|---|
+| `tui` | 230 / 163 / 138 |
+| `index` | 90 / 12 / 89 |
+| `demo` | 49 / 24 / 38 |
+| `core` | 21 / 22 / 23 |
+| `ui` | 9 / 9 / 11 |
+| `cli` | 14 / 12 / 15 |
+| `live` | 8 / 11 / 11 |
+| `limits` | 0 / 13 / 0 |
+| `vault` | 0 / 4 / 0 |
+| `claude` | 5 / 43 / 3 |
+
+No wrong-data path from a cast was found in `index`: tokens are far below `i64::MAX`, and the columns have `CHECK >= 0`. One exception: a transcript with a usage value above `i64::MAX` wraps to a negative (`write.rs:140-146`), fails the `CHECK` and aborts that refresh batch on every run. The fallback ratchet covers only `index|vault|app|cli|limits`. `claude` (100 fallback sites), `live` (37) and `tui` (141) are not counted.
+
+#### Current
+
+```toml
+[lints.clippy]
+allow_attributes_without_reason = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+```
+
+#### Recommended
+
+```toml
+[lints.clippy]
+# … the above, plus lints that are cheap now:
+let_underscore_must_use = "deny"       # 28: config.rs dir move, demo, terminal mouse capture
+wildcard_enum_match_arm = "deny"       # 25: mostly crossterm KeyCode (allow there with a reason)
+cast_possible_wrap = "deny"            # 47: u64 → i64 binds become i64::try_from
+# ratcheted (count in tests/arch/ratchets.txt per module): as_conversions, indexing_slicing,
+# cast_sign_loss, cast_possible_truncation, cast_precision_loss
+```
+
+**Lock it in**: a `clippy_counts` ratchet in `tests/arch/ratchets.txt`, fed from `cargo clippy --message-format=json` in `tools/check.sh`. Extend the fallback ratchet to `claude`, `live` and `tui`. Install `tools/check.sh` as the pre-push hook. It exists but is not installed.
+
+---
+
+### M9: Ids and money are half-adopted value objects
 
 **Severity**: Medium
 **Requirement**: 2. Value objects
-**Location**: 99 id-like `String`/`&str` fields and parameters (`account_uuid`, `seat`, `session_id`, `agent_id`, `login`, `id`, `label`; worst: `claude/transcript.rs` 13, `vault/mod.rs` 11, `live/mod.rs` 10, `cli/accounts.rs` 9). 23 money `f64` fields (`live/mod.rs` 6, `cli/limits.rs` 6, `core/limits.rs` 3). 15 percent/points `f64` fields. 44 stringly `kind/tier/plan/effort/model/theme` fields. Ambiguous keys: `src/index/query.rs:161-169`, `src/vault/mod.rs:146-151`, `config.rs` (`subscription` "by account label or uuid").
+**Location**: `src/core/ids.rs:15-50` (`SeatId: Default`, `from_stored` accepts any text, `Deserialize` bypasses both); 28 account-uuid fields and parameters typed `String`/`&str` (`limits/mod.rs:82,96,174,208`, `app/context.rs:33-34,299,329`, `index/query.rs:347,417,431`, `claude/config_json.rs:23,62`, `vault/mod.rs:37,58`, `live/mod.rs:49`, `index/live.rs:55`, `tui/mod.rs:102`, …); 18 money fields typed `f64` (`live/mod.rs` 8, `index/live.rs` 3, `index/insights.rs` 2, `claude/transcript.rs` 2, `index/query.rs:138`, `fleet.rs:58`, `claude/statusline.rs` 1); `Reading.utilization: f64` next to `Pct`
 
-The account parameter means a uuid in one place, an email in another (switched on `contains('@')`), and a login label elsewhere. A seat is a label or a path depending on the caller. On money, an honest assessment: `f64` is adequate for an API-equivalent estimate that is never billed. Summing about 10⁶ requests keeps an error far below one cent, and the comparisons that matter (the 1.2 ratio, 85%, ETA) are not sensitive at that scale. The real costs of raw `f64` are elsewhere. USD, points and percent mix freely (`estimate_now + spent / usd_per_point`). A sentinel can hide in the column (H3). Negative, `nan` or `inf` rates from `config.toml` (TOML allows them) are accepted without a parse. So this is graded Medium, not the High that floats used for billed money would get.
+`SeatId::default()` is an empty id. `from_stored` deliberately accepts a legacy label, so a `SeatId` can hold a label: the exact confusion the type was introduced to remove. The index decodes every `seat` column through `from_stored` (`src/index/mod.rs:170`).
+
+`AccountId` is used at 23 sites, but the hot paths (`latest_readings`, `account_name`, `login_labels`, `AccountReport`) are keyed by `String`. That is how H2's `merge(…, Option<&str>, …)` could take a label from anywhere.
+
+`Usd::new` accepts NaN and negative values. Money as `f64` is a documented decision (an estimate shown with ≈), so the finding is the missing parser and the raw fields, not floats as such.
+
+Seat id stability also has two gaps:
+
+- A relative `CLAUDE_CONFIG_DIR` taken from another process is canonicalized against swarmy's cwd (`claude/procs.rs:141-146`).
+- A re-pointed symlinked seat dir gets a new id and strands `mounted`.
 
 #### Current
 
 ```rust
-// src/index/query.rs:161
-if let Some(a) = &f.account {
-    // A uuid uses the (account_uuid, ts) index; an email is looked up once.
-    if a.contains('@') {
-        w.push("r.account_uuid IN (SELECT account_uuid FROM accounts WHERE email = ?)".into());
-    } else {
-        w.push("r.account_uuid = ?".into());
-    }
-// src/vault/mod.rs:146
-pub fn find(&self, key: &str) -> Option<&Login> {
-    self.index.logins.iter().find(|l| l.label == key || l.id == key || l.email.as_deref() == Some(key))
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SeatId(String);
+pub fn from_stored(s: impl Into<String>) -> SeatId { SeatId(s.into()) }
+```
+
+#### Recommended
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct SeatId(String);
+impl TryFrom<String> for SeatId {           // 16 lowercase hex digits, nothing else
+    type Error = IdError;
+    fn try_from(s: String) -> Result<Self, IdError> { if Self::looks_like_id(&s) { Ok(SeatId(s)) } else { Err(IdError::Seat(s)) } }
 }
+pub enum StoredSeat { Id(SeatId), LegacyLabel(String) } // what an old row holds, decided once
 ```
 
-#### Recommended
-
-```rust
-#[repr(transparent)] #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)] pub struct AccountId(String);
-#[repr(transparent)] #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)] pub struct SeatLabel(String);
-pub enum AccountRef { Id(AccountId), Email(String) }          // parsed once at the CLI edge
-#[repr(transparent)] #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize)]
-pub struct Usd(f64);                                           // finite and >= 0, via Usd::new
-impl Usd { pub fn new(v: f64) -> Result<Usd, ValueError> { /* reject NaN, inf, < 0 */ } }
-impl std::iter::Sum for Usd { /* … */ }
-// Points / Usd = no impl: converting needs a UsdPerPoint, by name.
-```
-
-**Lock it in**: a compile-fail doctest showing that `Usd + Points` does not compile, `Usd::new` as the only constructor (private field), and `PriceConf` deserializing through `Usd::new`.
+**Lock it in**: compile-fail doctests showing a label cannot become a `SeatId` and an `&str` cannot be passed for an `AccountId`. A ratchet on `account_uuid: String` and `(cost|usd|spend|burn)…: f64` fields in production code. A `Usd::try_new` that rejects non-finite values.
 
 ---
 
-### M7: Claude Code's tool names leak past the reader into four modules
+### M10: The reader layer still renders, executes and depends on the fleet contract
 
 **Severity**: Medium
-**Requirement**: 1. Foreign models stay at the edge
-**Location**: `"AskUserQuestion" | "ExitPlanMode"` in `src/live/mod.rs:888`, `src/index/insights.rs:166-169`, `src/tui/view/panels.rs:2432`. `"Agent" | "Task"` in `src/claude/transcript.rs:286`, `src/live/mod.rs:889`. Effort strings in `src/tui/view/kit.rs:142-148`. File kind round-trip in `src/index/mod.rs:194-198`.
+**Requirement**: 5. Cohesion and coupling, 7. Layers
+**Location**: `src/claude/statusline.rs` (932 lines: input parsing, ANSI rendering at `:326-646`, `run_previous` spawning the user's command at `:752`, `fleet::read_fresh` at `:689`, registry scan); `src/config.rs:11` (`use crate::claude::project::Alias`) with `claude → config`; `src/limits/mod.rs:96-140` (`ctx.mask`, `ctx.show_path` inside the analysis; `limits → app`)
 
-Claude Code renaming a tool, or adding a new question tool, has to be found in four modules. If one is missed, a wait for the human is silently counted as tool time in EFFICIENCY while the lanes show it correctly.
+`claude/` is the anti-corruption layer over Claude Code's files. The status line is a whole feature (a front end) living inside it, so the reader layer points up to `config` (a cycle) and to `fleet`. The limit analysis takes the composition root and masks project paths, so the analysis cannot run without `Ctx`, and a presentation choice changes its output keys.
 
 #### Current
 
-```rust
-// src/live/mod.rs:887
-let kind = match name.as_str() {
-    "AskUserQuestion" | "ExitPlanMode" => Lane::You,
-    "Agent" | "Task" => Lane::Agents,
-    _ => Lane::Tool,
-};
-// src/tui/view/panels.rs:2432
-.filter(|t| !matches!(t.name.as_str(), "AskUserQuestion" | "ExitPlanMode"))
+```text
+claude -> config     (claude/statusline.rs: Dirs, StatuslineConf)
+config -> claude     (config.rs: claude::project::Alias)
+claude -> fleet      (claude/statusline.rs: fleet::read_fresh)
+limits -> app        (limits/mod.rs: Ctx; mask applied to by_project labels)
 ```
 
 #### Recommended
 
-```rust
-// src/claude/transcript.rs — translated once, stored as a column
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolKind { AsksHuman, SpawnsAgent, Shell, File, Search, Other }
-impl ToolKind {
-    pub fn of(name: &str) -> ToolKind {
-        match name { "AskUserQuestion" | "ExitPlanMode" => ToolKind::AsksHuman,
-                     "Agent" | "Task" => ToolKind::SpawnsAgent, /* … */ _ => ToolKind::Other }
-    }
-}
-// tool_calls.kind TEXT NOT NULL CHECK (kind IN ('asks_human','spawns_agent',...))
+```text
+src/statusline/{mod.rs (run), input.rs (ACL: Claude Code's stdin), render.rs (pure)}  -> claude, fleet, config, core
+config: project aliases as its own type (config::ProjectAlias), translated into claude::project::Alias by app
+limits::all_reports(inputs: LimitInputs, idx: &Index) -> Vec<AccountReport>   // no Ctx, no mask
+ui::mask applied by cli/tui when printing
 ```
 
-**Lock it in**: a test that the literal `"AskUserQuestion"` appears only in `src/claude/`, and an exhaustive `match` on `ToolKind` everywhere else (no `_ =>`).
+**Lock it in**: remove `claude -> config`, `config -> claude`, `claude -> fleet` and `limits -> app` from `tests/arch/edges.txt`. The edge test then fails on their return.
 
 ---
 
-### M8: The index schema carries no constraints; its rules live only in Rust
+### M11: Orchestration has grown fat again
 
 **Severity**: Medium
-**Requirement**: 3. Invariants at the lowest level
-**Location**: `src/index/schema.rs:23-171`.
+**Requirement**: 1. Tactical DDD (thin use cases), 9. Pipeline
+**Location**: `src/tui/worker.rs:26` (`worker`, 352 lines; the file went 551 → 632 lines since the split in f023af8), `src/live/mod.rs:146` (`build`, 310), `src/tui/analytics.rs:44` (`analytics`, 265), `src/index/write.rs:37` (`write_file`, 235), `src/index/mod.rs:659-800` (`post_pass`: accounts, readings, login history, re-attribution, rollup re-key, owners, projects, pricing in one function)
 
-No column has a `CHECK`. `fast`, `priced` and `finished` accept any integer, `kind`, `effort` and `readings.kind` accept any text, and token counts and `utilization` can be negative. There are no foreign keys between `requests`, `sessions` and `agents`. Every invariant is therefore enforced only by whichever code path writes it, and a future path (or a migration bug) goes unnoticed.
-
-#### Current
-
-```sql
-CREATE TABLE IF NOT EXISTS requests (
-  msg_id TEXT PRIMARY KEY,
-  ...
-  fast INTEGER NOT NULL DEFAULT 0,
-  input INTEGER NOT NULL DEFAULT 0,
-  ...
-  cost REAL NOT NULL DEFAULT -1,
-  priced INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE IF NOT EXISTS readings ( account_uuid TEXT NOT NULL, kind TEXT NOT NULL, ... utilization REAL NOT NULL, ...
-```
-
-#### Recommended
-
-```sql
-  fast INTEGER NOT NULL DEFAULT 0 CHECK (fast IN (0, 1)),
-  input INTEGER NOT NULL DEFAULT 0 CHECK (input >= 0),      -- same for cw5, cw1h, cread, output, thinking, web
-  cost REAL CHECK (cost IS NULL OR cost >= 0),
-  priced INTEGER NOT NULL DEFAULT 1 CHECK (priced IN (0, 1))
--- readings
-  kind TEXT NOT NULL CHECK (kind IN ('five_hour','seven_day','seven_day_opus','seven_day_sonnet')),
-  utilization REAL NOT NULL CHECK (utilization >= 0),
-```
-
-Generate the `kind IN (...)` lists from `WindowKind::key()` so they are declared once.
-
-**Lock it in**: the constraints themselves, plus a test that the generated `CHECK` list equals the enum's keys.
-
----
-
-### M9: The tests cover the kernel; the index, the limit analysis and the live state have none
-
-**Severity**: Medium
-**Requirement**: 10. Tests as executable specification
-**Location**: 54 tests total. `core` 17 (exemplary), `claude` 22, `vault` 5, `index` 2 (open/reopen, command grouping), `live` 1, `cli` 1, `tui` 1. Zero tests for `Index::refresh`, the dedupe upsert (`src/index/mod.rs:665-673`), re-attribution after a login swap (`:425-470`), project folding, `price_all`, `cli/limits.rs` (568 lines), `App::attention`, agent states, and vault concurrency or crash mid-switch.
-
-The documented dedupe rule, `Usage::merge_max`, is tested, but it never runs. `cargo clippy` reports "method `merge_max` is never used". The rule that runs is a second copy in SQL (`input = MAX(input, excluded.input)`), and that copy is untested. The crate is binary-only, so no scenario test can drive it through its public API from `tests/`. The `demo` world, with its synthetic seats and transcripts, would make a ready-made fixture.
+The worker loop again holds the first refresh, compaction scheduling, storage samples, fleet writing and error handling inline. `post_pass` is where H1 lives: attribution rules sit between project assignment and pricing, with no seam to test them alone.
 
 #### Current
 
 ```rust
-// src/core/usage.rs:37 — tested, dead
-pub fn merge_max(&mut self, o: &Usage) { self.input = self.input.max(o.input); /* … */ }
-// src/index/mod.rs:668 — runs, untested
-ON CONFLICT(msg_id) DO UPDATE SET
-  input = MAX(input, excluded.input), cw5 = MAX(cw5, excluded.cw5), cw1h = MAX(cw1h, excluded.cw1h),
-  cread = MAX(cread, excluded.cread), output = MAX(output, excluded.output), thinking = MAX(thinking, excluded.thinking),
-  web = MAX(web, excluded.web), tools = tools + excluded.tools,
+pub(super) fn worker(mut ctx: Ctx, tx: Sender<Msg>, wants: Arc<Mutex<Wants>>, eco: Arc<AtomicBool>, force_eco: bool) {
+    let send = |m: Msg| tx.send(m).is_ok();
+    let mut idx = match Index::open(&ctx.dirs.index_file()) { … };
+    … // 340 more lines: refresh, jobs, compaction, analytics, fleet, storage samples
 ```
 
 #### Recommended
 
 ```rust
-// Cargo: src/lib.rs (all modules) + src/main.rs (cli::run only)
-// tests/index_scenarios.rs
-#[test]
-fn incremental_equals_full_rebuild() {
-    let w = fixture::world(&[("work", SESSIONS_WITH_DUPLICATE_BLOCKS)]);
-    let inc = w.refresh_in_steps(&[100, 250, usize::MAX]);   // append in chunks
-    let full = w.refresh_once();
-    assert_eq!(inc.dump("requests"), full.dump("requests"));
-    // opus-5-5: 2 in, 409 1h-write, 155 527 read, 192 out = $0.0382254 (hand-computed)
-    assert_eq!(full.total(Period::All).cost_micros(), 38_225);
-}
-```
-
-**Lock it in**: a lib target, scenario files under `tests/fixtures/`, a rule that every bug fix lands with a reproducing scenario, and a test that fails while dead domain functions exist (`#![deny(dead_code)]` in `core`).
-
----
-
-### M10: The dashboard worker is a 368-line use case with ~15 hard-coded cadences
-
-**Severity**: Medium
-**Requirement**: 9. One pipeline, explicit order (also 8)
-**Location**: `src/tui/mod.rs:456-823` (`worker`), `:824-1085` (`analytics`, 262 lines); interval literals at `:542,545,561,569,586,614,637,647,700,704,721,742,747,786,848,850`.
-
-The battery budget is a hard requirement: about 2 CPU-seconds per minute. It is kept by an informal table in CLAUDE.md and by elapsed-time checks scattered through one loop. Moving a job, or adding one, means reading the whole worker, and nothing checks that per-second work only touches running sessions.
-
-#### Current
-
-```rust
-// src/tui/mod.rs:561
-if sl != sl_stamp && last_sl.elapsed() > Duration::from_secs(5) { /* … */ reload_seat_info(&mut ctx); }
-let stamp = login_files_stamp(&ctx);
-if stamp != login_stamp || last_info.elapsed() > Duration::from_secs(20) { /* … */ reload_seat_info(&mut ctx); }
-// …
-let due = last_analytics.is_none_or(|t| t.elapsed() > Duration::from_secs(30))
-// …
-|| last_limits.is_none_or(|t| t.elapsed() > Duration::from_secs(55));
-```
-
-#### Recommended
-
-```rust
-/// Declared once; CLAUDE.md's budget table and SWARMY_DEBUG timings are generated from it.
-const JOBS: &[Job] = &[
-    Job { name: "hot refresh",  every: secs(1),   trigger: Trigger::Tick,             cost: Cost::RunningOnly },
-    Job { name: "seat info",    every: secs(20),  trigger: Trigger::LoginFileChanged, cost: Cost::PerSeat },
-    Job { name: "limits",       every: secs(55),  trigger: Trigger::SeatsChanged,     cost: Cost::Heavy },
-    Job { name: "efficiency",   every: secs(300), trigger: Trigger::Tick,             cost: Cost::Heavy },
-    // …
-];
-```
-
-**Lock it in**: a test that no `Cost::Heavy` job runs more often than every 30 s, plus a freshness test for the generated budget table.
-
----
-
-### M11: Nothing is enforced by tooling
-
-**Severity**: Medium
-**Requirement**: Enforcement by mechanism
-**Location**: `Cargo.toml` (no `[lints]`), no CI configuration in the repository, no `clippy.toml`. `cargo clippy --all-targets` reports 40 warnings today, including 17 dead-code items (`merge_max`, `Span::contains`, `Span::hours`, `account_labels`, `active_accounts`, `open_in_memory`, `keychain_service`, …). 2 `#[allow]`.
-
-Every rule in CLAUDE.md (no personal data, the battery budget, keeping the vocabulary, "never test the vault on real dirs") is kept by agreement only. A lint that already warns is a lint nobody reads.
-
-#### Current
-
-```toml
-[dependencies]
-anyhow = "1.0.104"
-# … no [lints] table
-```
-
-#### Recommended
-
-```toml
-[lints.rust]
-unsafe_code = "forbid"
-dead_code = "deny"
-[lints.clippy]
-unwrap_used = "deny"            # tests: #![cfg_attr(test, allow(clippy::unwrap_used))]
-wildcard_enum_match_arm = "deny"
-allow_attributes_without_reason = "deny"
-```
-
-Add a `tools/check.sh` (`cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --no-fail-fast`) as a pre-push hook or CI job, together with the ratchets from H4, H5 and M3.
-
-**Lock it in**: the check script in CI or as a pre-push hook; ratchet files under version control.
-
----
-
-### L1: "mana" in code, "limits" on screen; two `Tone` enums
-
-**Severity**: Low
-**Requirement**: 1. One name per concept
-**Location**: "mana" 93 times in 5 files (`Panel::Mana`, `ManaRow`, `mana_curve`, `AttnTarget::Mana`, the alert key `"mana:{uuid}"` at `src/tui/app.rs:875`). `ui::style::Tone` (`src/ui/style.rs:12`) and `tui::app::Tone` (`src/tui/app.rs:157`).
-
-CLAUDE.md bans "mana" on screen, but the code still thinks in it, so every newcomer has to learn that `Mana` means LIMITS · SEATS.
-
-#### Current
-
-```rust
-pub enum Panel { Swarm, Mana, Burn, Attention, Agent, Projects, Models, History, Efficiency, System }
-// …
-Panel::Mana => "LIMITS · SEATS",
-```
-
-#### Recommended
-
-```rust
-pub enum Panel { Swarm, Limits, Burn, Attention, Agent, Projects, Models, History, Efficiency, System }
-pub enum LimitsRow { Seat(String), Parked(String) }
-```
-
-**Lock it in**: a glossary test that fails on `mana` in identifiers (excluding the old-dir migration in `config.rs`).
-
----
-
-### L2: Layer leaks around the reader and the read model
-
-**Severity**: Low
-**Requirement**: 7. Layers point one way
-**Location**: `src/live/mod.rs:704,711` (`live → ui::fmt`: `PastEvent.text` is a pre-formatted string), `src/demo.rs:20` (`→ tui::boot::hash`), `src/claude/statusline.rs:227,664-685` (`claude → fleet, config`; the reader layer renders ANSI and writes files), `src/config.rs:11` (`→ claude::project::Alias`).
-
-Each leak is small, but together they mean the reader layer cannot be built or reused without the front ends, and the event texts cannot be re-rendered (for example masked, or in JSON).
-
-#### Current
-
-```rust
-// src/live/mod.rs:707
-text: format!("{name} done · {took} · {}", crate::ui::fmt::money(cost.unwrap_or(0.0))),
-```
-
-#### Recommended
-
-```rust
-pub enum PastKind { Spawned { model: String, effort: Option<String> }, Done { took: Duration, cost: Option<Usd> }, /* … */ }
-// the TUI formats; `statusline.rs` moves to `src/statusline/` (reader of stdin + renderer), `Alias` to `config`.
-```
-
-**Lock it in**: the dependency test from H4 (`claude` and `live` may not import `ui`, `fleet`, `config` or `tui`).
-
----
-
-### L3: Wildcards on own enums and a silent theme fallback
-
-**Severity**: Low
-**Requirement**: 3. Exhaustive handling
-**Location**: `src/core/limits.rs:52` (`WindowKind::length`, `_ => 7 days`), `src/tui/app.rs:1191` (`Panel` → list length `_ => 0`), `src/tui/app.rs:968` (`Panel` → `Tab` `_ => Ops`), `src/tui/theme.rs:147` (`theme = "ambr"` silently becomes `ops`, while the rest of `config.toml` uses `deny_unknown_fields`). 58 `_ =>` arms in total; most match foreign strings and are legitimate.
-
-#### Current
-
-```rust
-pub fn length(self) -> Duration {
-    match self {
-        WindowKind::FiveHour => Duration::hours(5),
-        _ => Duration::days(7),
+// One function per job, dispatched from the job table; the loop only ticks.
+for job in jobs.due_now() {
+    match job {
+        Job::Hot => run_hot(&mut w)?, Job::Full => run_full(&mut w)?, Job::Compact => run_compact(&mut w)?,
+        Job::Limits => run_limits(&mut w)?, Job::FleetKeepAlive => run_fleet(&mut w)?, …
     }
 }
+// index: attribution::events(seat_info, history) -> Vec<LoginSeen> (pure), applied by post_pass
+```
+
+**Lock it in**: a `too_many_lines` threshold (150) for `src/index`, `src/tui/worker.rs` and `src/live`, with a ratchet, plus a pure, table-tested `attribution` function.
+
+---
+
+### M12: Index errors are untyped
+
+**Severity**: Medium
+**Requirement**: 9. Errors from a catalogue
+**Location**: `src/index/` (109 `anyhow::` uses, 4 `bail!`); `src/errors.rs:56-60` (`IndexError` has one variant, `NewerVersion`)
+
+The catalogue covers the vault, config, setup and lookups well. The index, the largest module, returns `anyhow` for everything. So the dashboard cannot tell these apart, and shows each as the same text:
+
+- "index busy" (another process's 10 s `busy_timeout` expired during a compaction or VACUUM);
+- "index damaged";
+- "disk full";
+- "transcript unreadable".
+
+#### Current
+
+```rust
+pub enum IndexError {
+    #[error("the index was written by a newer swarmy ({what} version {version}); update swarmy")]
+    NewerVersion { what: &'static str, version: u32 },
+}
 ```
 
 #### Recommended
 
 ```rust
-pub fn length(self) -> Duration {
-    match self {
-        WindowKind::FiveHour => Duration::hours(5),
-        WindowKind::SevenDay | WindowKind::SevenDayOpus | WindowKind::SevenDaySonnet => Duration::days(7),
-    }
+pub enum IndexError {
+    NewerVersion { what: &'static str, version: u32 },
+    #[error("another swarmy is writing the index (compaction or VACUUM); try again")] Busy,
+    #[error("the index is damaged: {0}")] Damaged(String),
+    #[error("no space left for the index at {0}")] NoSpace(PathBuf),
 }
-// config: `theme: Option<ThemeName>` with `#[serde(rename_all = "lowercase")] enum ThemeName { Ops, Phosphor, Amber, Plain }`
+impl From<rusqlite::Error> for IndexError { /* map SQLITE_BUSY, CORRUPT, FULL */ }
 ```
 
-**Lock it in**: `clippy::wildcard_enum_match_arm = "deny"` (M11).
+**Lock it in**: the `errors.rs` code-uniqueness test covers the new variants. Add a test that a held write lock makes `refresh` return `IndexError::Busy`.
 
 ---
 
-### L4: SQL is safe today, but one helper accepts a table name as `&str`
+### L1: Some account changes do not bump the settled generation
 
 **Severity**: Low
-**Requirement**: 4. Queries are never built from data
-**Location**: `src/index/query.rs:443-448` (`count(table: &str)`), `src/index/query.rs:179-181` (`LIKE '%{m}%'` without escaping `%`/`_`). All 9 `format!` SQL builders were checked: they interpolate only `&'static str` fragments (`Dim::exprs`, `SUMS`, `SEAT_ACCOUNT_AT`, `schema::TABLES`), and every value is bound.
+**Requirement**: 3. Invariants (settled = fresh)
+**Location**: `src/index/mod.rs:767-781`
+
+The owner-based and seat-fallback `UPDATE requests SET account_uuid = … WHERE account_uuid IS NULL` change the account of old, priced rows without `bump_settled`. `settled_total(account, span)` (keyed by a fixed span) then keeps a stale value for the life of the process.
+
+#### Current
+
+```rust
+tx.execute_batch("UPDATE requests SET account_uuid = (SELECT o.account_uuid FROM owners o …) WHERE account_uuid IS NULL; …")?;
+```
+
+#### Recommended
+
+```rust
+let moved = tx.execute("UPDATE requests SET account_uuid = (…) WHERE account_uuid IS NULL AND ts < ?1", [settled_before])?;
+if moved > 0 { bump_settled(&tx)?; }
+```
+
+**Lock it in**: one helper `reattribute(tx, sql)` that always bumps the generation. Check it with the same `settled` test as M1.
+
+---
+
+### L2: `fleet.json` is written on every tick, and `runs_out_at` drifts
+
+**Severity**: Low
+**Requirement**: 3. Invariants (battery budget)
+**Location**: `src/tui/worker.rs:232`, `src/tui/worker.rs:556`; same pattern at `src/tui/alerts.rs:270-279`
+
+`runs_out_at = ctx.now + eta` adds an eta computed at the last limits pass (every 55 s) to each tick's clock. The time therefore drifts later by up to a minute, and `changed` is always true while any seat has an eta. Every tick then pays two fsyncs, instead of one write every 5 s keep-alive.
+
+#### Current
+
+```rust
+runs_out_at: week.and_then(|w| w.eta).map(|d| ctx.now + d),
+…
+let changed = Some(&fl) != fleet_last.as_ref();
+```
+
+#### Recommended
+
+```rust
+runs_out_at: week.and_then(|w| w.runs_out_at),   // an instant computed once in core::limits
+```
+
+**Lock it in**: return an instant (`runs_out_at: DateTime<Utc>`) from `core::limits`, not a duration. Add a worker test that two ticks with unchanged inputs produce an equal `Fleet`.
+
+---
+
+### L3: Status-line width counts ANSI escapes and cuts by characters
+
+**Severity**: Low
+**Requirement**: 4. Integrity of the published output
+**Location**: `src/claude/statusline.rs:727-729`, `:639`
+
+The user's previous status line is measured with `UnicodeWidthStr::width`, which counts escape sequences as visible columns (about 5 per escape). Segments are then dropped though they fit. The second line is cut with `chars().take(width)`, so a session name in Chinese, Japanese or Korean comes out up to twice the allowed width.
+
+#### Current
+
+```rust
+.map(|t| unicode_width::UnicodeWidthStr::width(t.trim_end()) + 3)
+```
+
+#### Recommended
+
+```rust
+.map(|t| visible_width(t.trim_end()) + 3)   // strips CSI sequences, then unicode width
+// second line: ui::fmt::truncate_to_width(s, width)
+```
+
+**Lock it in**: render tests with a coloured previous line and a session name in Chinese, Japanese or Korean.
+
+---
+
+### L4: Read paths take the vault's write lock, and its concurrency test is flaky
+
+**Severity**: Low
+**Requirement**: 4. Reads cannot write; 10. Tests
+**Location**: `src/app/context.rs:179-204` (`drop_unconfirmed` → `v.edit(|tx| tx.seat_states(…))` on every `Ctx::load` and `reload_seat_info`), `src/tui/analytics.rs:87`, `src/vault/tests.rs:251`
+
+`swarmy report`, `doctor` and every dashboard reload take the vault's OS lock and may rewrite `logins.json` and `secrets.json`. `save` writes only on change, but `seat_states` updates seat bookkeeping. A read-only command can therefore fail with `VaultError::Locked` when another process holds the lock; it is reported as a problem, not shown as an error.
+
+In this review's full test run, `concurrent_changes_never_lose_a_login_or_corrupt_a_file` failed once while other builds loaded the machine, then passed five times in a row. A test that fails depending on machine load gets ignored.
+
+#### Current
+
+```rust
+let states = v.edit(|tx| tx.seat_states(&self.seats))?;
+```
+
+#### Recommended
+
+```rust
+let states = v.read_view().seat_states(&self.seats);   // pure over a snapshot; bookkeeping only in commands that change the vault
+```
+
+**Lock it in**: give `Vault` a read type without `edit` (`VaultView`) that `Ctx` holds. In the test, scale `LOCK_TIMEOUT` and print the failing error, so a flake shows its cause.
+
+---
+
+### L5: API surface: a table name as `&str`, raw vault writers exported
+
+**Severity**: Low
+**Requirement**: 4. Minimal API surface
+**Location**: `src/index/query.rs:495-501` (`pub fn count(&self, table: &str)` formats the name into SQL), `src/vault/mod.rs:16` (`pub mod store` exports `atomic_write`, `rewrite_merging`, `backup`, `restrict_dir`); 465 `pub fn` against 70 `pub(crate)`/`pub(super)`
+
+Callers pass only literals today. Still, `count` is the one SQL builder that takes a name from outside, and `vault::store` lets any module write seat files without `Vault::edit`.
 
 #### Current
 
@@ -819,40 +893,71 @@ pub fn count(&self, table: &str) -> anyhow::Result<u64> {
 #### Recommended
 
 ```rust
-pub enum Table { Requests, ToolCalls, Sessions, Agents /* … */ }
-pub fn count(&self, t: Table) -> anyhow::Result<u64> { /* t.name() is &'static str */ }
-// model filter: `r.model LIKE ? ESCAPE '\'` with % and _ escaped in the bound value
+pub enum Counted { Requests, ToolCalls, Sessions, Agents, UsageRollup }
+pub fn count(&self, t: Counted) -> anyhow::Result<u64> { … t.table() … }
+// vault/mod.rs: `mod store;` (private)
 ```
 
-**Lock it in**: a test that greps `format!(` calls containing SQL keywords and asserts that every `{…}` placeholder names a `const` or a `&'static str` helper.
+**Lock it in**: add `vault::store` to the architecture test's private-module list, and ban `format!` with `FROM {` outside `index/archive.rs` and `index/schema.rs`.
 
 ---
 
-### L5: Four implementations of "write a file atomically"
+### L6: One concept, two names: `Pct` and "points"
 
 **Severity**: Low
-**Requirement**: 4. One concept, one mechanism
-**Location**: `src/vault/store.rs:64-94` (fsync, 0600, dir fsync), `src/claude/statusline.rs:160-167`, `src/fleet.rs:72-84` (fixed temp name `fleet.json.tmp`), `src/cli/setup.rs:174-197` (Claude Code's `settings.json`, no fsync).
+**Requirement**: 1. Ubiquitous language
+**Location**: about 120 identifiers in `core/limits.rs`, `limits/mod.rs` and `tui/` (`usd_per_point` 31, `points_per_hour` 21, `visible_points`, `outside_points`, `limit_points` 15 each, `own_usd_per_point` 14) typed `Pct` / `UsdPerPct`; `burn`, `spend` and `cost` used side by side for API-equivalent dollars
 
-`setup` writes a Claude Code file without the guarantees the vault gets. All three non-vault copies `unwrap_or_default()` a serialization result, so a failure would write an empty file.
+The screen says "% of week" and "1% ≈ $X", and the type says `Pct`, but the fields say "points". It is harmless today, and it is the kind of drift the "mana" test already polices.
 
 #### Current
 
 ```rust
-// src/cli/setup.rs:193
-let tmp = path.with_extension("json.swarmy-tmp");
-std::fs::write(&tmp, text)?;
-std::fs::rename(&tmp, path)?;
+pub usd_per_point: UsdPerPct,
+pub points_per_hour: Option<Pct>,
 ```
 
 #### Recommended
 
 ```rust
-// one helper in a small `fsio` module, used by vault, setup, statusline and fleet
-fsio::atomic_write(path, text.as_bytes(), fsio::Mode::KeepExisting)?;   // or Mode::Private (0600)
+pub usd_per_pct: UsdPerPct,
+pub pct_per_hour: Option<Pct>,
 ```
 
-**Lock it in**: a test that `fs::rename` appears only in `fsio`.
+**Lock it in**: extend `limits_are_never_called_mana` into a forbidden-synonyms list (`mana`, `point`, `pt`) read from a glossary file.
+
+---
+
+### L7: Live caches: a new session shows Σ$0 for up to 10 s, and a second writer defeats them
+
+**Severity**: Low
+**Requirement**: 3. Invariants (battery budget, shown numbers)
+**Location**: `src/live/mod.rs:380-389`, `src/index/mod.rs:327-338` and `:655`
+
+A main row first seen on a light tick keeps `session_cost = 0`, because there is no `else` branch. The swarm panel shows Σ$0.00 and the fleet hides its burn until the next heavy tick.
+
+Every refresh commits (`set_meta("refreshed_at")`). So with two dashboards, or a dashboard plus a CLI command, `PRAGMA data_version` moves every tick, `changes.all` resets, and every per-agent read runs each second. The numbers stay right; the battery budget does not.
+
+#### Current
+
+```rust
+if let Some(o) = p.agents.iter().find(|o| o.is_main() && o.seat == a.seat && o.session_id == a.session_id) {
+    a.session_cost = o.session_cost.max(a.cost);
+    a.session_burn = o.session_burn;
+}
+```
+
+#### Recommended
+
+```rust
+match p.agents.iter().find(|o| …) {
+    Some(o) => { a.session_cost = o.session_cost.max(a.cost); a.session_burn = o.session_burn; }
+    None => { a.session_cost = idx.session_total(a.seat, &a.session_id)?; } // read once for a new session
+}
+// and: write `refreshed_at` only when the refresh wrote rows
+```
+
+**Lock it in**: a `live` test with a session that appears on a light tick. Add a `tools/perf.sh --two` run with a second process refreshing the index.
 
 ---
 
@@ -860,55 +965,86 @@ fsio::atomic_write(path, text.as_bytes(), fsio::Mode::KeepExisting)?;   // or Mo
 
 | # | Action | Findings | Effort | Impact |
 |---|---|---|---|---|
-| **1. Guardrails first** | | | | |
-| 1.1 | `[lints]` table, fix the 40 clippy warnings, `tools/check.sh` as a pre-push hook or CI | M11, L3 | S | stops new drift |
-| 1.2 | Dependency test over `crate::` edges with today's edges as a ratchet | H4, L2 | S | blocks new cycles |
-| 1.3 | Ratchet counters: fallbacks in `index/vault/cli`, files over 900 lines, threshold literals | H5, M1, M3 | S | numbers only go down |
-| **2. Structural fixes** | | | | |
-| 2.1 | `vault::edit` + `VaultTx`, std `File::lock`, unique temp names, backup of `logins/secrets.json`, concurrency test | H1, defects 1, 3, 5, 6 | M | removes the token-loss path |
-| 2.2 | Split `TABLES` into cache and fact tables; survive-a-bump test | H2 | S | keeps account history |
-| 2.3 | `cost` nullable + `CHECK`, reprice in one transaction, memo keyed by fingerprint, dashboard reloads prices | H3, defect 8 | S | no silent $0 |
-| 2.4 | Lib + bin split; move `Ctx` to `app/`, limits analysis to `limits/`, `human_bytes` to `ui/` | H4, M2, M9 | M | breaks the cycle, enables scenario tests |
-| 2.5 | Private `Index::conn`; typed read methods for `live`; pure `agent_state` | M4 | M | one owner of the schema |
-| 2.6 | `alerts.rs` out of `App`; split `panels.rs` per panel; declared job table for the worker | M3, M10 | M | smaller change surface |
-| **3. Model upgrades** | | | | |
-| 3.1 | `Level`, `current_window`, `projection_at_reset` in `core::limits`; delete the copies | M1 | S | one limit vocabulary |
-| 3.2 | Scenario tests: incremental equals full, dedupe, re-attribution, repricing, limits analysis with hand numbers | M9, M2 | M | specification for the index |
-| 3.3 | Dated built-in and observed prices; `Rates::derive` | M5, defect 9 | M | history keeps its prices |
-| 3.4 | `AccountId`, `SeatLabel`, `AccountRef`, `Usd`, `ToolKind`, `ThemeName` | M6, M7, L3 | M | type-checked keys |
-| 3.5 | `CHECK` constraints generated from enums | M8 | S | the database guards every path |
+| **1. Guardrails** | | | | |
+| 1.1 | Install `tools/check.sh` as the pre-push hook (or a CI job); deny `let_underscore_must_use`, `wildcard_enum_match_arm`, `cast_possible_wrap`; add a per-module clippy-count ratchet; extend the fallback ratchet to `claude`, `live`, `tui` | M8 | S | High |
+| 1.2 | Remove `claude ↔ config`, `claude → fleet` and `limits → app` from `edges.txt` as they are fixed | M10 | S | Medium |
+| 1.3 | Multi-block responses in the scenario fixture; a property test for "compacted = never compacted" over random worlds, cuts and login changes | H3, M2 | M | High |
+| **2. Correctness** | | | | |
+| 2.1 | Login changes as events with provenance (vault switch time, first observation); `session-owner` wins over seat inference; no `profileFetchedAt` backdating | H1 | M | High |
+| 2.2 | Account (and `v`) in `LiveLimits`; `merge` takes `&AccountId` and ignores other accounts' readings; keep the first-seen `at` | H2, M5 | S | High |
+| 2.3 | Skip rolled-up records per response (first block), not per record | H3 | S | High |
+| 2.4 | Make `switch` all or nothing (stage both seat files, restore the backup on failure); `sync` re-mounts by fingerprint; `.credentials.json` through `rewrite_merging`, which fails instead of overwriting | H4, M7 | M | High |
+| 2.5 | `spend_series` sized from its own span; a two-instant test for every kept sum; bump the generation on every re-attribution | M1, L1 | S | Medium |
+| 2.6 | `n_unpriced` as a count in the archive; re-key via a selected key set | M2 | S | Medium |
+| 2.7 | Report unreadable chunks; read marks only for agents the archive holds; roll orphan raw rows before a cache bump; damaged `settings.json` is an error | M3, M4 | M | Medium |
+| 2.8 | Settle and document the refresh-token rotation question; grant identity that survives rotation | M6 | S–M | Medium–High |
+| **3. Structure** | | | | |
+| 3.1 | Move the status line out of `claude/` into its own module with a pure renderer; aliases owned by `config` | M10, L3 | M | Medium |
+| 3.2 | `limits::all_reports` over plain inputs (no `Ctx`, no mask) | M10 | S | Medium |
+| 3.3 | One function per job in the worker; pure `attribution` out of `post_pass` | M11 | M | Medium |
+| 3.4 | Typed `IndexError` (`Busy`, `Damaged`, `NoSpace`); `VaultView` for read paths | M12, L4 | S | Medium |
+| **4. Model upgrades** | | | | |
+| 4.1 | `SeatId` via `TryFrom` (no `Default`, legacy labels as `StoredSeat::LegacyLabel`); `AccountId` everywhere account uuids travel; `Usd::try_new` | M9 | M | Medium |
+| 4.2 | `Counted` enum for `Index::count`; `vault::store` private | L5 | S | Low |
+| 4.3 | `Pct` vocabulary in identifiers; glossary file with forbidden synonyms | L6 | S | Low |
+| 4.4 | Fleet carries instants; live cache for new sessions; `refreshed_at` only on writes | L2, L7 | S | Low |
+
+## Invariant map
+
+| Invariant (business terms) | Enforced at | Write paths covered | Gap / finding |
+|---|---|---|---|
+| One API response is counted once | `requests.msg_id` primary key, merge by `max` | raw writes | raw vs archive: per-record skip double counts (H3) |
+| A compacted index reads the same as one never compacted | `compact_scenarios.rs` on every surface | compactor, union reads | split responses (H3), re-key and `priced` merge (M2), settled series (M1) |
+| A request is billed to the account that made it | `owners` (from transcripts), `seat_accounts` inferred from `profileFetchedAt` and reading times | `post_pass` | seat inference overrides owners and backdates a switch (H1); a stale status-line reading relabelled (H2) |
+| A limit reading belongs to the account it was fetched for | Claude Code's cache carries `accountUuid`; the status-line file does not | `post_pass` readings insert | nowhere for status-line readings (H2) |
+| A reading's time is when its numbers were true | none | `swarmy statusline` | restamped every 5 min (M5) |
+| `cost` is NULL exactly when unpriced | `CHECK (CASE WHEN priced = 1 THEN cost IS NOT NULL ELSE cost IS NULL END)` | every write (DB) | archive keeps `MAX(priced)` (M2) |
+| Tokens and costs are non-negative | `CHECK (… >= 0)` on every count and cost column | DB | none |
+| A kept settled sum equals a fresh sum | settled generation bumped by reprice, re-attribution, late rows, seat adoption | most writers | owner/seat fallback updates (L1); key missing span end (M1) |
+| Facts never die with a schema bump | four table lists; fact and archive tables never dropped; tests | `schema::migrate` | raw rows of gone transcripts (M4) |
+| Raw detail stays re-readable from transcripts | `keep_raw_days ≤ retention − 2` (`core::storage`) | config load, `--keep-days` | unreadable `settings.json` counts as default; removed seat dirs (M4) |
+| No record is dropped silently | `skipped_records` counter | refresh | parse errors `continue`; marks skip never-indexed sessions (M3) |
+| Every saved login has its secret | `save` writes secrets before the index that adds them | `Vault::edit` | none |
+| One OAuth grant is never mounted in two seats | `SharedGrant` check in `switch` | `switch` only | a failed switch frees the grant (H4) |
+| A switch never loses a token | step 1 saves the seat's login first; backups | `switch` | concurrent `.credentials.json` refresh overwritten (M7) |
+| A login stays the same login across refreshes | fingerprint of the refresh token | `sync`, `observe` | contradicts "refresh tokens rotate" (M6) |
+| Vault and seat files are always whole | `fsutil::atomic_write` (unique temp, fsync file and dir), architecture test on renames | all writers | none |
+| A seat's id is stable | SHA-256 of the canonical dir | discovery, status line | relative `CLAUDE_CONFIG_DIR`; re-pointed symlink (M9) |
+| Limit thresholds have one definition | `core::limits::Level`, `limit_threshold_copies` ratchet = 0 | all front ends | none |
+| A price applies from its date | dated `PriceBook`, `observed_prices.seen_on` with `CHECK (date(seen_on) IS seen_on)` | `price_all` (raw and rollups in one transaction) | none |
 
 ## Defects found along the way
 
 | Severity | Location | Defect | Prevented by |
 |---|---|---|---|
-| High | `src/vault/mod.rs:135,383,440`, `src/vault/store.rs:47,70`, `src/tui/mod.rs:444,863` | Unlocked read-modify-write of `logins.json`/`secrets.json` from the dashboard worker, the UI thread and other processes. Same temp path for every thread of a process, so writes can interleave bytes. No backup of the vault's own files (H1). | a pipeline that owns the lock (`VaultTx`) |
-| High | `src/index/mod.rs:130-137`, `src/index/schema.rs:174` | A schema bump drops `seat_accounts`/`accounts`, which cannot be rebuilt; past spend moves to the wrong account (H2). | fact/cache split with a test |
-| High | `src/index/mod.rs:595`, `src/index/query.rs:186`, `src/cli/limits.rs:87-114` | During a reprice, other processes sum unpriced rows as $0 with `priced = 1`. The dashboard memoizes such totals for its lifetime and never invalidates them on a price change (H3). | `CHECK`, one transaction |
-| Medium | `src/vault/store.rs:128-158` | Stale-lock takeover is a TOCTOU race. A reader can see the file before its pid is written, treat it as dead and delete it, or two takers can both delete and recreate it, and then both "hold" the lock. A reused pid blocks the lock forever. | `std::fs::File::lock` (flock) |
-| Medium | `src/vault/mod.rs:527-552` | `switch` reads `.claude.json`, then backs up and fsyncs several files, then writes `.claude.json` back. Claude Code rewrites that file every few seconds, so whatever it wrote in between is lost. | re-read and compare mtime immediately before the write; retry |
-| Medium | `src/vault/mod.rs:223-225` | `put` on an existing login sets `label` without a uniqueness check (`accounts capture <seat> --label <taken>`). `find` then returns the first match, so `switch` can mount the wrong login. | `LoginLabel` unique by construction; uniqueness checked in one place |
-| Medium | `src/tui/mod.rs:479,593` vs `src/index/mod.rs:592-596` | The dashboard keeps the `PriceBook` from launch. A CLI run with a newer book reprices the whole table, and the dashboard's next refresh reprices it back, so the two disagree in turn and both rewrite every row. | price book reloaded on `.claude.json`/config change; fingerprint in the memo key |
-| Medium | `src/config.rs:139-140` | A `[[price]]` override of a model drops its fast-mode multiplier and long-context rule, because the user entry fully replaces the built-in one. Fast-mode Opus 5.5 is then priced at 1× instead of 2×. Negative, `nan` or `inf` rates are accepted. | `Rates::derive` with inheritance; `Usd::new` parser |
-| Low | `src/core/pricing.rs:171`, `src/config.rs:137` | A missing cache-read price falls back to 10% of input instead of the model's built-in rate (Opus 5.5: 5%, Fable 5.2: 2.5%), so cache-heavy usage is overpriced 2× to 4× when Claude Code's cache omits `promptCacheReadTokens` or a user override omits `cache_read`. | `Rates::derive` (one default) |
-| Low | `src/index/mod.rs:672,800` | Re-reading a replaced or truncated transcript from the start adds `tools` and `compactions` a second time. The rows themselves are deduplicated by `MAX`. | "incremental equals full rebuild" scenario test |
-| Low | `src/vault/mod.rs:609-611` | `remove` deletes the secret before saving the index. If the save fails, a listed login has no secret. | write the index first, then delete; or a tombstone |
-| Low | `src/vault/mod.rs:524-541` | Backups are pruned to 40 files across all seats (about 20 switches), so a rarely switched seat loses its only backup. Second-resolution stamps make two switches in the same second overwrite each other's backup. | per-seat retention, unique names |
-| Low | `src/vault/mod.rs:235-238`, `src/tui/view/kit.rs:205` | Auto-generated login labels are the email's local part, and `--mask` masks only strings that contain `@`, so screenshots taken with `--mask` show it. | masking by type (`Email`, `Label`) at render time |
-| Low (verify intent) | `src/live/mod.rs:395-398` | An unfinished subagent of an exited Claude Code shows as STALLED (red) for 24 h, while its main thread shows as exited. | table tests for a pure `agent_state` (M4) |
-
-No access-control, network or SQL-injection defects were found. The tool makes no network calls, every SQL value is bound, the vault directory is 0700 and its files are 0600, and `Secret` never prints a token.
+| High | `src/index/mod.rs:702-748`, `:48` | vault switch backdates the login change to the saved `profileFetchedAt`; days of the old account's requests and rollups move to the new one, overriding `session-owner` (confirmed by test) | login-change events with provenance; owner-first attribution |
+| High | `src/claude/statusline.rs:172-212` | status-line reading relabelled with the seat's current account; wrong `readings` fact and re-attribution (confirmed by two tests) | account inside `LiveLimits` (a required typed field) |
+| High | `src/index/write.rs:119-128` | split response straddling `rolled_until` inserted again on a re-read (confirmed by test) | per-response skip; multi-block fixtures |
+| High | `src/vault/mod.rs:674-699` | failed `.claude.json` write after the credentials write: seat and vault disagree, `SharedGrant` bypassed (confirmed by test) | an all-or-nothing switch (stage, commit, restore) |
+| Medium | `src/index/query.rs:538-550` | kept series shorter than the fresh one, so `zip` drops the newest buckets of the limit curve (confirmed by test) | length from the call's span; two-instant test |
+| Medium | `src/index/archive.rs:383-400` | rollup re-key double counts when two changes fall in one quarter hour (confirmed by test) | re-key by selected key set; property test |
+| Medium | `src/index/archive.rs:181-187` | `MAX(priced)` hides unpriced requests after compaction (confirmed by test) | `n_unpriced` count |
+| Medium | `src/index/mod.rs:600`, `src/index/marks.rs:64-69` | parse errors dropped silently; old records of never-indexed sessions in a compacted seat skipped for good | reported `unreadable`; marks only for archived agents |
+| Medium | `src/index/schema.rs:411-437`, `src/claude/seats.rs:68-74` | cache bump drops raw rows of gone transcripts; damaged `settings.json` passes the retention check | roll orphans before a bump; typed settings error |
+| Medium | `src/claude/statusline.rs:672-686` | stale numbers restamped as fresh; two sessions on one seat flip the stored readings | first-seen `at`; per-session files |
+| Medium | `src/claude/credentials.rs:57-81`, `src/vault/mod.rs:603-612` | grant identity = refresh-token hash, while the code says the token rotates | rotation-proof grant id; verified format note |
+| Medium | `src/vault/mod.rs:679-692`, `src/vault/store.rs:58-81` | `.credentials.json` replaced without a change check; torn read aborts a half-done switch; 8th attempt overwrites | one merging writer that fails instead of overwriting |
+| Low | `src/index/mod.rs:767-781` | account fallback updates without `bump_settled` | one re-attribution helper |
+| Low | `src/tui/worker.rs:232`, `:556` | `fleet.json` rewritten every tick; `runs_out_at` drifts | instants from `core::limits` |
+| Low | `src/claude/statusline.rs:727-729`, `:639` | ANSI counted as width; wide characters cut by count | visible-width helper |
+| Low | `src/live/mod.rs:380-389` | new session shows Σ$0 until the next heavy tick | read once for a new session |
+| Low | `src/index/write.rs:140-146` | a usage value above `i64::MAX` wraps, fails the `CHECK` and aborts the refresh batch on every run | `i64::try_from`, record skipped and counted |
+| Low | `src/vault/tests.rs:251` | concurrency test failed once in six runs under load | load-tolerant timeout, error printed |
+| Low | `src/tui/vault_ui.rs:470` | `let _ = remove_dir_all(&scratch)` can leave a live login in `vault/new-<ts>/` silently (the CLI path reports it) | `let_underscore_must_use = "deny"` |
 
 ## What is already good
 
-- **A pure, well-tested kernel.** `src/core` has no I/O, and its tests compute money by hand in comments (`src/core/pricing.rs:298-310`, `src/core/limits.rs:188-207`). Keep that style as the template for every new rule.
-- **Unknown is never $0.** `Cost::priced` flags models without a price (`src/core/pricing.rs:68-73,226-237`), and unknown transcript record types are counted and reported by `doctor`.
-- **Price precedence is data.** The user, Claude Code cache and built-in layers merge by an explicit key `(source, specificity, from)` (`src/core/pricing.rs:203-224`), and the merge is tested.
-- **The anti-corruption layer exists.** `src/claude/*` translates Claude Code's JSON into `core` types (`Reading`, `WindowKind`, `Usage`). `WindowKind::from_key` rejects unknown windows instead of guessing.
-- **Safe SQL.** `where_clause` (`src/index/query.rs:150-184`) binds every value, and the dynamic parts are `&'static str`. `from_for` joins only the tables a query refers to.
-- **Incremental indexing done carefully.** It tracks inode, size and offset, re-reads files that shrank or were replaced, leaves a partial last line for later (tested in `src/claude/transcript.rs`), and uses WAL with a 10 s busy timeout.
-- **Switch safety basics are right.** The seat's current login is saved first, both files are backed up, writes use fsync+rename at 0600, `mcpOAuth` is kept (tested in `src/vault/tests.rs:35-108`), a grant is refused in two seats without `--share`, and a different refresh token is treated as a new login, never overwritten (`src/vault/tests.rs:135`).
-- **Secrets hygiene.** `Secret`'s `Debug` shows only the fingerprint, and its token strings are wiped on drop (`src/claude/credentials.rs:12-54`).
-- **Strict config.** `deny_unknown_fields` on every `config.toml` struct (`src/config.rs:63,83,90,235`).
-- **Explicit rule revisions.** `PROJECTS_REV` recomputes project folding once when the rules change (`src/index/mod.rs:31`), and `readings` is deliberately kept out of the drop list.
-- **Synthetic test data.** The vault tests run on throwaway seats under a temp dir and never touch a real config dir.
+- **Pure kernel, enforced.** `src/core` has no clock, files, database or environment (`tests/architecture.rs::core_is_pure`). Limit, pricing and storage rules are tested with numbers computed by hand in comments (`core/limits.rs`, `core/pricing.rs`, `core/storage.rs`).
+- **Architecture as tests.** `tests/architecture.rs` checks module edges with a reason per line (`tests/arch/edges.txt`), six ratchets, SQL only in `index/`, renames only in `fsutil`, one word for limits, and no id slicing. These are the right kind of checks; extend them rather than replace them.
+- **Declared once, derived.** `index/archive.rs` `KEYS`/`SUMS` generate the rollup DDL, the merge and the re-key SQL. `ToolClass`, `FileKind::TAGS` and `WindowKind` generate the `CHECK` lists. `tui/jobs.rs` holds every cadence, with tests pinning the measured values.
+- **Data lifecycle by class.** Raw, dimension, archive and fact tables (`index/schema.rs`) with explicit migration steps. Facts survive cache bumps (test `a_login_swap_moves_later_requests_and_survives_a_cache_rebuild`). Prices are dated per local day.
+- **Transactions where they matter.** Each compaction chunk is one immediate transaction covering inserts, deletes, `rolled_until` and the rowid high mark. Ingest re-checks offsets and `rolled_until` inside its write transaction. `price_all` reprices raw rows and rollups together.
+- **The vault's lock and files.** `Vault::edit` holds a cross-process `flock` for the whole read-modify-write, re-reads under it, and saves only on change, with backups. Secrets are written before the index that names them. `fsutil::atomic_write` uses unique temp names, creates files 0600 before data and fsyncs file and dir. A damaged vault or seat file is an error, never "empty".
+- **Error catalogue with stable codes** (`src/errors.rs`), tested for uniqueness and for surviving `anyhow` context.
+- **Performance guarded by a tool.** `tools/perf.sh` measures CPU-seconds per minute on a realistic demo wall and fails above budget. The panel cache keys were checked and are complete: input, resize, eco, blink, theme and mask all invalidate correctly.
+- **Value objects started right.** `SeatId`, `SessionId`, `AccountId`, `Usd`, `Pct`, `UsdPerPct` are `repr(transparent)`, serialize as the primitive, and `Usd + Pct` is a compile error (doctest in `core/units.rs`). `SessionId::short` cannot panic.

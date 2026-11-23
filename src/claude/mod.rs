@@ -8,6 +8,5 @@ pub mod procs;
 pub mod project;
 pub mod registry;
 pub mod seats;
-pub mod statusline;
 pub mod tmux;
 pub mod transcript;

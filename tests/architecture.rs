@@ -308,3 +308,31 @@ fn short_ids_are_never_sliced() {
         .collect();
     assert!(found.is_empty(), "id slicing in {found:?}");
 }
+
+/// The vault's raw writers stay private to it (review L5), and the seat files Claude Code also
+/// writes (`.credentials.json`, `.claude.json`) are written only through the checked writers,
+/// which never go over a version they have not read (`store::replace_if_unchanged`,
+/// `store::rewrite_merging`; review M7): never with a plain `atomic_write`.
+#[test]
+fn seat_files_are_written_only_through_checked_writers() {
+    let (root, files) = files();
+    let mut found: Vec<String> = Vec::new();
+    for (p, t) in &files {
+        let name = p.strip_prefix(&root).unwrap().display().to_string();
+        let prod = production(t);
+        if module_of(&root, p) != "vault" && prod.contains("vault::store") {
+            found.push(format!("{name}: uses vault::store"));
+        }
+        if prod.contains("pub mod store") {
+            found.push(format!("{name}: exports a raw writer module"));
+        }
+        for line in prod.lines() {
+            if line.contains("atomic_write(")
+                && (line.contains("credentials_file") || line.contains("claude_json"))
+            {
+                found.push(format!("{name}: {}", line.trim()));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}

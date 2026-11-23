@@ -1,215 +1,11 @@
-//! Claude Code's status line as a source of exact limit readings.
-//!
-//! When `settings.json` has `"statusLine": {"type": "command", "command": "swarmy statusline"}`,
-//! Claude Code runs the command after each model response and passes a JSON on stdin. For
-//! subscribers it carries `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`, taken
-//! from the response itself: the real numbers, no extra request. `swarmy statusline` writes them
-//! to `<data>/statusline/<seat key>.json` and prints a short line for Claude Code to show. The
-//! dashboard reads those files as limit readings of the seat's account.
-//!
-//! Format (Claude Code 2.1.329, documented in its binary): `rate_limits` is present only for
-//! subscribers, after the first API response, while a window is active; `resets_at` is in epoch
-//! seconds.
+//! Drawing the status line: segments in their forms from full to shortest, shortened in a fixed
+//! order to the width Claude Code gives. Pure: everything comes in through `Input` and `Extra`.
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use chrono::{DateTime, Utc};
 
-use chrono::{DateTime, TimeZone, Utc};
-use serde::{Deserialize, Serialize};
-
-use crate::claude::config_json::Utilization;
+use super::input::{Input, Window};
 use crate::core::ids::SeatId;
-use crate::core::limits::{Level, Reading, WindowKind};
-
-/// What `swarmy statusline` keeps of one call.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct LiveLimits {
-    /// When Claude Code ran the status line.
-    pub at: DateTime<Utc>,
-    /// The config dir of the Claude Code that ran it.
-    pub config_dir: String,
-    pub session_id: Option<String>,
-    /// (used %, resets at) per window.
-    pub five_hour: Option<(f64, DateTime<Utc>)>,
-    pub seven_day: Option<(f64, DateTime<Utc>)>,
-}
-
-/// The part of Claude Code's status-line input that swarmy uses.
-#[derive(Debug, Default, Deserialize)]
-pub struct Input {
-    #[serde(default)]
-    pub session_id: Option<String>,
-    #[serde(default)]
-    pub model: Option<Model>,
-    #[serde(default)]
-    pub cost: Option<Cost>,
-    #[serde(default)]
-    pub context_window: Option<ContextWindow>,
-    #[serde(default)]
-    pub rate_limits: Option<RateLimits>,
-    #[serde(default)]
-    pub session_name: Option<String>,
-    #[serde(default)]
-    pub effort: Option<Effort>,
-    #[serde(default)]
-    pub workspace: Option<Workspace>,
-    #[serde(default)]
-    pub prompt_cache: Option<PromptCache>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct Effort {
-    #[serde(default)]
-    pub level: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct Workspace {
-    #[serde(default)]
-    pub current_dir: Option<String>,
-    #[serde(default)]
-    pub git_worktree: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct PromptCache {
-    #[serde(default)]
-    pub warm: Option<bool>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct Model {
-    #[serde(default)]
-    pub display_name: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct Cost {
-    #[serde(default)]
-    pub total_cost_usd: Option<f64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct ContextWindow {
-    #[serde(default)]
-    pub used_percentage: Option<f64>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct RateLimits {
-    #[serde(default)]
-    pub five_hour: Option<Window>,
-    #[serde(default)]
-    pub seven_day: Option<Window>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct Window {
-    pub used_percentage: f64,
-    /// Epoch seconds.
-    pub resets_at: f64,
-}
-
-impl Window {
-    fn pair(&self) -> Option<(f64, DateTime<Utc>)> {
-        let t = Utc.timestamp_opt(self.resets_at as i64, 0).single()?;
-        Some((self.used_percentage, t))
-    }
-}
-
-/// The file a seat's readings go to: named by its seat id (a hash of its config dir), so
-/// `swarmy statusline` needs nothing but `CLAUDE_CONFIG_DIR` to find it.
-pub fn file_for(data_dir: &Path, config_dir: &Path) -> PathBuf {
-    file_of(data_dir, &crate::claude::seats::seat_id(config_dir))
-}
-
-/// The status-line file of a seat id.
-pub fn file_of(data_dir: &Path, seat: &SeatId) -> PathBuf {
-    data_dir.join("statusline").join(format!("{seat}.json"))
-}
-
-/// The config dir of the Claude Code that runs us: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
-pub fn current_config_dir(home: &Path) -> PathBuf {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".claude"))
-}
-
-pub fn parse_input(text: &str) -> Input {
-    serde_json::from_str(text).unwrap_or_default()
-}
-
-pub fn live_from(input: &Input, config_dir: &Path, at: DateTime<Utc>) -> Option<LiveLimits> {
-    let rl = input.rate_limits.as_ref()?;
-    let five_hour = rl.five_hour.as_ref().and_then(Window::pair);
-    let seven_day = rl.seven_day.as_ref().and_then(Window::pair);
-    if five_hour.is_none() && seven_day.is_none() {
-        return None;
-    }
-    Some(LiveLimits {
-        at,
-        config_dir: config_dir.to_string_lossy().into_owned(),
-        session_id: input.session_id.clone(),
-        five_hour,
-        seven_day,
-    })
-}
-
-/// Writes atomically (`fsutil::atomic_write`); errors are ignored by the caller, a status line
-/// must never fail.
-pub fn write(path: &Path, live: &LiveLimits) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(live)?;
-    crate::fsutil::atomic_write(path, &bytes, crate::fsutil::Mode::Private)
-}
-
-pub fn read(path: &Path) -> Option<LiveLimits> {
-    serde_json::from_slice(&std::fs::read(path).ok()?).ok()
-}
-
-/// The seat's utilization: the status-line reading when it is newer than Claude Code's cached
-/// one, for the same account.
-pub fn merge(
-    cached: Option<Utilization>,
-    account: Option<&str>,
-    live: Option<LiveLimits>,
-) -> Option<Utilization> {
-    let (Some(live), Some(account)) = (live, account) else {
-        return cached;
-    };
-    if cached.as_ref().is_some_and(|c| c.fetched_at >= live.at) {
-        return cached;
-    }
-    let mut readings: Vec<Reading> = Vec::new();
-    for (kind, v) in [
-        (WindowKind::FiveHour, live.five_hour),
-        (WindowKind::SevenDay, live.seven_day),
-    ] {
-        if let Some((utilization, resets_at)) = v {
-            readings.push(Reading {
-                kind,
-                utilization,
-                resets_at,
-                fetched_at: live.at,
-            });
-        }
-    }
-    // Windows the status line does not carry (per-model weekly limits) keep the cached values.
-    if let Some(c) = cached.as_ref().filter(|c| c.account_uuid == account) {
-        readings.extend(
-            c.readings
-                .iter()
-                .filter(|r| !matches!(r.kind, WindowKind::FiveHour | WindowKind::SevenDay))
-                .copied(),
-        );
-    }
-    Some(Utilization {
-        account_uuid: account.to_string(),
-        fetched_at: live.at,
-        readings,
-        extra_usage_enabled: cached.map(|c| c.extra_usage_enabled).unwrap_or(false),
-    })
-}
+use crate::core::limits::Level;
 
 /// One piece of the line: its forms from full to shortest (text with colour, plain width).
 struct Segment {
@@ -232,6 +28,8 @@ pub struct Extra {
     pub segments: Vec<String>,
     pub width: usize,
     pub lines: u8,
+    /// The git branch of the session's directory (second line only).
+    pub branch: Option<String>,
 }
 
 struct Paint(bool);
@@ -286,39 +84,6 @@ fn hm(d: chrono::Duration) -> String {
     } else {
         format!("{m}m")
     }
-}
-
-/// The current git branch of `dir`, read from `.git/HEAD` (never by running git).
-fn branch_of(dir: &Path) -> Option<String> {
-    let mut cur = Some(dir);
-    while let Some(d) = cur {
-        let git = d.join(".git");
-        let head = if git.is_dir() {
-            git.join("HEAD")
-        } else if git.is_file() {
-            let t = std::fs::read_to_string(&git).ok()?;
-            let gd = t
-                .lines()
-                .find_map(|l| l.strip_prefix("gitdir:"))?
-                .trim()
-                .to_string();
-            let gd = if Path::new(&gd).is_absolute() {
-                PathBuf::from(gd)
-            } else {
-                d.join(gd)
-            };
-            gd.join("HEAD")
-        } else {
-            cur = d.parent();
-            continue;
-        };
-        let h = std::fs::read_to_string(head).ok()?;
-        return Some(match h.trim().strip_prefix("ref: refs/heads/") {
-            Some(b) => b.to_string(),
-            None => h.trim().chars().take(8).collect(),
-        });
-    }
-    None
 }
 
 /// The status line: who needs you, this session's agents, the week, 5 hours, context, cost and
@@ -618,9 +383,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 .unwrap_or_default();
             second.push(format!("{m}{e}"));
         }
-        if let Some(dir) = input.workspace.as_ref().and_then(|w| w.current_dir.clone())
-            && let Some(b) = branch_of(Path::new(&dir))
-        {
+        if let Some(b) = x.branch.clone() {
             let wt = input
                 .workspace
                 .as_ref()
@@ -635,11 +398,63 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
             second.push("cache cold".into());
         }
         if !second.is_empty() {
-            let l = second.join(" · ");
-            let l: String = l.chars().take(x.width).collect();
+            let l = truncate_to_width(&second.join(" · "), x.width);
             out.push('\n');
             out.push_str(&p.c(&l, "2"));
         }
+    }
+    out
+}
+
+/// The columns a terminal gives `s`: escape sequences (colours, OSC links) take none, wide
+/// characters take two (review L3).
+pub fn visible_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(strip_escapes(s).as_str())
+}
+
+/// `s` without its terminal escape sequences: CSI (`ESC [ … final byte`) and OSC
+/// (`ESC ] … BEL` or `ESC \\`).
+fn strip_escapes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('[') => {
+                for c in it.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = it.next() {
+                    if c == '\x07' || (c == '\x1b' && it.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+/// The longest start of `s` that fits `width` columns, cut at a character, never inside a wide
+/// one (review L3: a cut by character count made Chinese, Japanese or Korean text twice as wide).
+pub fn truncate_to_width(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > width {
+            break;
+        }
+        out.push(c);
+        w += cw;
     }
     out
 }
@@ -659,175 +474,16 @@ fn static_key(k: &str) -> &'static str {
     .unwrap_or("?")
 }
 
-/// `swarmy statusline [--then CMD]`: record, then print (after the user's own status line).
-pub fn run(
-    dirs: &crate::config::Dirs,
-    conf: &crate::config::StatuslineConf,
-    then: Option<&str>,
-) -> anyhow::Result<()> {
-    let mut text = String::new();
-    let _ = std::io::stdin().read_to_string(&mut text);
-    let input = parse_input(&text);
-    let dir = current_config_dir(&dirs.home);
-    let now = Utc::now();
-    let file = file_for(&dirs.data, &dir);
-    if let Some(live) = live_from(&input, &dir, now) {
-        // Only when the numbers moved: the file is the dashboard's trigger.
-        let old = read(&file);
-        if old.as_ref().is_none_or(|o| {
-            o.five_hour != live.five_hour
-                || o.seven_day != live.seven_day
-                || (now - o.at).num_minutes() >= 5
-        }) && let Err(e) = write(&file, &live)
-        {
-            crate::diag::log(
-                "statusline",
-                &format!("cannot write {}: {e}", file.display()),
-            );
-        }
-    }
-    let fleet = crate::fleet::read_fresh(&crate::fleet::path(&dirs.data), conf.fresh_seconds, now);
-    // No dashboard running: find the sessions that wait for the user ourselves.
-    let waiting = if fleet.is_some() || !conf.segments.iter().any(|s| s == "attention") {
-        Vec::new()
-    } else {
-        let mut dirs_: Vec<PathBuf> = vec![dirs.home.join(".claude"), dir.clone()];
-        if let Ok(rd) = std::fs::read_dir(&dirs.home) {
-            for e in rd.flatten() {
-                if e.file_name().to_string_lossy().starts_with(".claude-")
-                    && e.path().join("sessions").is_dir()
-                {
-                    dirs_.push(e.path());
-                }
-            }
-        }
-        dirs_.sort();
-        dirs_.dedup();
-        dirs_
-            .iter()
-            .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
-            .map(|w| {
-                (
-                    w.session_id.to_string(),
-                    w.label(),
-                    w.what.clone(),
-                    w.tmux.clone(),
-                )
-            })
-            .collect()
-    };
-    let seat_key = crate::claude::seats::seat_id(&dir);
-    let columns: usize = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(120);
-    let theirs = then
-        .and_then(|cmd| run_previous(cmd, &text))
-        .filter(|s| !s.trim().is_empty());
-    let theirs_w = theirs
-        .as_ref()
-        .map(|t| unicode_width::UnicodeWidthStr::width(t.trim_end()) + 3)
-        .unwrap_or(0);
-    let x = Extra {
-        fleet,
-        waiting,
-        seat_key,
-        mask: conf.mask || std::env::var_os("SWARMY_MASK").is_some(),
-        color: std::env::var_os("NO_COLOR").is_none(),
-        segments: conf.segments.clone(),
-        width: columns
-            .saturating_sub(conf.reserve as usize + theirs_w + 4)
-            .max(20),
-        lines: conf.lines,
-    };
-    let mine = render(&input, &x, now);
-    match theirs {
-        Some(t) => println!("{} │ {mine}", t.trim_end()),
-        None => println!("{mine}"),
-    }
-    Ok(())
-}
-
-/// The status line the user had before: same stdin, its first line of output.
-fn run_previous(cmd: &str, stdin: &str) -> Option<String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = if cfg!(windows) {
-        Command::new("cmd")
-            .args(["/C", cmd])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .ok()?
-    } else {
-        Command::new("sh")
-            .args(["-c", cmd])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .ok()?
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(stdin.as_bytes());
-    }
-    let out = child.wait_with_output().ok()?;
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or("")
-            .to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::statusline::input::parse_input;
+    use chrono::TimeZone;
 
     const INPUT: &str = r#"{"session_id":"s1","model":{"display_name":"Opus"},"cost":{"total_cost_usd":4.2},
         "context_window":{"used_percentage":42.0},
         "rate_limits":{"five_hour":{"used_percentage":12.5,"resets_at":1795400000},
                        "seven_day":{"used_percentage":3,"resets_at":1795960000}}}"#;
-
-    #[test]
-    fn readings_come_from_rate_limits_and_win_when_newer() {
-        let input = parse_input(INPUT);
-        let at = Utc.timestamp_opt(1_795_380_000, 0).unwrap();
-        let live = live_from(&input, Path::new("/x/.claude"), at).unwrap();
-        assert_eq!(live.seven_day.unwrap().0, 3.0);
-        assert_eq!(live.five_hour.unwrap().1.timestamp(), 1_795_400_000);
-
-        // Older cached reading (95%) of the same account: the live one replaces it.
-        let cached = Utilization {
-            account_uuid: "acc".into(),
-            fetched_at: at - chrono::Duration::hours(1),
-            readings: vec![Reading {
-                kind: WindowKind::SevenDay,
-                utilization: 95.0,
-                resets_at: at,
-                fetched_at: at,
-            }],
-            extra_usage_enabled: false,
-        };
-        let m = merge(Some(cached.clone()), Some("acc"), Some(live.clone())).unwrap();
-        let week = m
-            .readings
-            .iter()
-            .find(|r| r.kind == WindowKind::SevenDay)
-            .unwrap();
-        assert_eq!((week.utilization, m.fetched_at), (3.0, at));
-
-        // A newer cached reading stays; no account means nothing to attach the live one to.
-        let newer = Utilization {
-            fetched_at: at + chrono::Duration::minutes(1),
-            ..cached.clone()
-        };
-        assert_eq!(
-            merge(Some(newer.clone()), Some("acc"), Some(live.clone())),
-            Some(newer)
-        );
-        assert_eq!(merge(None, None, Some(live)), None);
-    }
 
     fn extra(fleet: Option<crate::fleet::Fleet>, width: usize) -> Extra {
         Extra {
@@ -839,6 +495,7 @@ mod tests {
             segments: crate::config::StatuslineConf::default().segments,
             width,
             lines: 1,
+            branch: None,
         }
     }
 
@@ -913,11 +570,29 @@ mod tests {
         assert!(tiny.contains("week 3%"), "{tiny}");
     }
 
+    /// Review L3: the user's coloured status line is measured by what it shows, and the second
+    /// line is cut to the width in columns, not characters.
+    #[test]
+    fn widths_count_columns_not_bytes_or_escapes() {
+        let coloured = "\x1b[1;32mmain\x1b[0m \x1b]8;;https://example.com\x07link\x1b]8;;\x07 ok";
+        assert_eq!(visible_width(coloured), "main link ok".len());
+        assert_eq!(visible_width("項目の説明"), 10);
+        assert_eq!(truncate_to_width("項目の説明", 5), "項目");
+        assert_eq!(truncate_to_width("abc", 5), "abc");
+        let now = Utc::now();
+        let input = parse_input(r#"{"session_id":"s","session_name":"重要な機能の作業"}"#);
+        let mut x = extra(None, 20);
+        x.lines = 2;
+        let out = render(&input, &x, now);
+        let second = out.lines().nth(1).unwrap();
+        assert!(visible_width(second) <= 20, "{second:?}");
+        assert!(second.contains("重要な機能"), "{second:?}");
+    }
+
     #[test]
     fn without_the_dashboard_or_limits() {
         let now = Utc::now();
         let input = parse_input(r#"{"session_id":"s","cost":{"total_cost_usd":0.5}}"#);
-        assert!(live_from(&input, Path::new("/x"), now).is_none());
         assert_eq!(render(&input, &extra(None, 120), now), "$0.50");
         // The registry fallback still tells who waits; masked names are hidden.
         let mut x = extra(None, 120);

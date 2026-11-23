@@ -359,6 +359,7 @@ mod tests {
     use crate::config::{Config, Dirs};
     use crate::core::pricing::PriceBook;
     use crate::index::archive_scenarios::{NOW, populate, readings, refresh};
+    use crate::index::query::Counted;
     use crate::index::scenarios::{World, at};
     use crate::ui::style::{ColorChoice, Painter};
 
@@ -391,8 +392,8 @@ mod tests {
 
     fn rows(idx: &Index) -> (u64, u64) {
         (
-            idx.count("requests").unwrap(),
-            idx.count("usage_rollup").unwrap(),
+            idx.count(Counted::Requests).unwrap(),
+            idx.count(Counted::UsageRollup).unwrap(),
         )
     }
 

@@ -18,7 +18,7 @@ mod tests {
     use crate::core::limits::{Reading, WindowKind};
     use crate::core::period::Span;
     use crate::core::pricing::{PriceBook, PriceEntry, PriceSource, RateOverrides, Rates};
-    use crate::index::query::{Dim, Filter};
+    use crate::index::query::{Counted, Dim, Filter};
     use crate::index::{Index, SeatInfo};
 
     /// Seats and transcripts under a temp dir. Never a real config dir.
@@ -350,6 +350,46 @@ mod tests {
         assert_eq!(compactions, 1);
     }
 
+    /// A usage count beyond what SQLite holds (a damaged record) is refused and counted; it
+    /// does not fail the refresh, and the records around it count.
+    #[test]
+    fn a_usage_count_out_of_range_is_refused_not_fatal() {
+        let w = World::new(&["work"]);
+        let huge = serde_json::json!({
+            "type": "assistant", "timestamp": "2026-11-01T10:01:00Z", "cwd": "/w/shop", "sessionId": "s",
+            "message": {"id": "bad", "model": "claude-sonnet-5-5", "content": [],
+                "usage": {"input_tokens": 9_223_372_036_854_775_808_u64, "output_tokens": 1}}
+        })
+        .to_string();
+        let m = "claude-sonnet-5-5";
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                assistant("a", "2026-11-01T10:00:00Z", m, "/w/shop", (10, 1), &[]),
+                huge,
+                assistant("b", "2026-11-01T10:02:00Z", m, "/w/shop", (10, 1), &[]),
+            ],
+        );
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &PriceBook::builtin());
+        assert_eq!(
+            dump(&idx, "SELECT msg_id FROM requests ORDER BY 1"),
+            ["a", "b"]
+        );
+        assert_eq!(
+            dump(
+                &idx,
+                &format!(
+                    "SELECT count FROM record_types WHERE type = '{}'",
+                    crate::claude::transcript::MALFORMED
+                )
+            ),
+            ["1"]
+        );
+    }
+
     #[test]
     fn records_of_one_response_merge_by_message_id() {
         let w = World::new(&["work"]);
@@ -380,53 +420,73 @@ mod tests {
         assert!(close(by_project[1].cost, 0.002));
     }
 
+    /// Review H1. The transcripts' `session-owner` records say which account a request used;
+    /// the seat's login history only fills in for sessions without one, from the moment a change
+    /// is seen (never from the profile's `profileFetchedAt`: a vault switch restores a profile
+    /// fetched days earlier). Both survive a cache rebuild.
     #[test]
-    fn a_login_swap_moves_later_requests_and_survives_a_cache_rebuild() {
+    fn the_owner_decides_and_a_seen_login_change_only_fills_in() {
         let w = World::new(&["work"]);
         let m = "claude-sonnet-5-5";
-        // The session started under acc-a and keeps writing acc-a as its owner; the seat's login
-        // was swapped to acc-b at 11:00.
+        let req = |id: &str, ts: &str| assistant(id, ts, m, "/w/shop", (1000, 0), &[]);
+        let later = |h: i64| (Utc::now() + chrono::Duration::hours(h)).to_rfc3339();
+        // s1 runs under acc-a (its owner records); s0 comes from a Claude Code that wrote none.
         w.append(
             "work",
             "s1",
             &[
                 owner("acc-a"),
-                assistant("r1", "2026-11-10T10:00:00Z", m, "/w/shop", (1000, 0), &[]),
-                assistant("r2", "2026-11-10T12:00:00Z", m, "/w/shop", (1000, 0), &[]),
+                req("r1", "2026-11-09T10:00:00Z"),
+                req("r2", "2026-11-10T10:00:00Z"),
             ],
         );
-        let info = [SeatInfo {
+        w.append("work", "s0", &[req("r0", "2026-11-09T09:00:00Z")]);
+        let seat = |acc: &str, since: &str| SeatInfo {
             seat: Default::default(),
             label: "work".into(),
-            account: Some(account("acc-b", "2026-11-10T11:00:00Z")),
+            account: Some(account(acc, since)),
             utilization: None,
-        }];
+        };
         let path = w.dir.path().join("i.sqlite");
         let mut idx = Index::open(&path).unwrap();
-        w.refresh(&mut idx, &info, &PriceBook::builtin());
+        w.refresh(
+            &mut idx,
+            &[seat("acc-a", "2026-11-08T00:00:00Z")],
+            &PriceBook::builtin(),
+        );
+        // The vault switches the seat to acc-b, whose saved profile is from 11-09.
+        w.refresh(
+            &mut idx,
+            &[seat("acc-b", "2026-11-09T00:00:00Z")],
+            &PriceBook::builtin(),
+        );
         let accounts = |idx: &Index| {
             dump(
                 idx,
                 "SELECT msg_id, account_uuid FROM requests ORDER BY msg_id",
             )
         };
-        let expected = vec!["r1|acc-a".to_string(), "r2|acc-b".to_string()];
-        assert_eq!(accounts(&idx), expected);
-        // A request written after the swap follows the seat at once.
-        w.append(
-            "work",
-            "s1",
-            &[assistant(
-                "r3",
-                "2026-11-10T13:00:00Z",
-                m,
-                "/w/shop",
-                (1000, 0),
-                &[],
-            )],
+        assert_eq!(accounts(&idx), ["r0|acc-a", "r1|acc-a", "r2|acc-a"]);
+        let history = dump(
+            &idx,
+            "SELECT ts, account_uuid FROM seat_accounts ORDER BY ts",
         );
-        w.refresh(&mut idx, &info, &PriceBook::builtin());
-        assert_eq!(accounts(&idx).last().unwrap(), "r3|acc-b");
+        assert_eq!(history.len(), 2);
+        let switched: i64 = history[1].split('|').next().unwrap().parse().unwrap();
+        assert!(
+            switched >= Utc::now().timestamp_millis() - 60_000,
+            "dated when seen: {history:?}"
+        );
+        // After the change: the owner-less session follows the seat, s1 keeps its owner.
+        w.append("work", "s0", &[req("r3", &later(1))]);
+        w.append("work", "s1", &[req("r4", &later(1))]);
+        w.refresh(
+            &mut idx,
+            &[seat("acc-b", "2026-11-09T00:00:00Z")],
+            &PriceBook::builtin(),
+        );
+        let expected = ["r0|acc-a", "r1|acc-a", "r2|acc-a", "r3|acc-b", "r4|acc-a"];
+        assert_eq!(accounts(&idx), expected);
 
         // A new cache version: the cache is rebuilt from the transcripts. The seat no longer
         // reports any account (logged out), so only the stored login history can tell.
@@ -436,16 +496,18 @@ mod tests {
             .set_meta("schema_version", "0")
             .unwrap();
         let mut idx = Index::open(&path).unwrap();
-        assert_eq!(idx.count("requests").unwrap(), 0, "the cache was dropped");
         assert_eq!(
-            idx.count("seat_accounts").unwrap(),
-            1,
+            idx.count(Counted::Requests).unwrap(),
+            0,
+            "the cache was dropped"
+        );
+        assert_eq!(
+            idx.count(Counted::SeatAccounts).unwrap(),
+            2,
             "the facts were kept"
         );
         w.refresh(&mut idx, &[], &PriceBook::builtin());
-        let after = accounts(&idx);
-        assert_eq!(after[..2], expected[..]);
-        assert_eq!(after[2], "r3|acc-b");
+        assert_eq!(accounts(&idx), expected);
     }
 
     #[test]
@@ -511,9 +573,9 @@ mod tests {
             .unwrap();
         let mut idx = Index::open(&path).unwrap();
         assert_eq!(
-            idx.count("requests").unwrap(),
-            0,
-            "the raw rows were dropped"
+            idx.count(Counted::Requests).unwrap(),
+            2,
+            "the raw rows were dropped, but for those of the deleted transcripts (nothing else has them)"
         );
         w.refresh(&mut idx, &[], &PriceBook::builtin());
         // The new session is read again and merges into its rows unchanged; the old one keeps
@@ -531,8 +593,8 @@ mod tests {
                 .iter()
                 .map(|r| (r.key.as_str(), r.requests))
                 .collect::<Vec<_>>(),
-            vec![("main thread", 1), ("reviewer", 1)],
-            "only the new session's requests are left to count"
+            vec![("main thread", 2), ("reviewer", 2)],
+            "the deleted session's requests still count"
         );
     }
 

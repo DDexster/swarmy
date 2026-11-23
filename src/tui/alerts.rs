@@ -276,7 +276,10 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
                         "{label}: {} used · runs out in {} ({})",
                         fmt::pct(w.estimate_now),
                         fmt::duration(eta),
-                        (now + eta).with_timezone(&chrono::Local).format("%a %H:%M")
+                        w.runs_out_at
+                            .unwrap_or(now + eta)
+                            .with_timezone(&chrono::Local)
+                            .format("%a %H:%M")
                     ),
                     since: None,
                     target: AttnTarget::Limits,
@@ -592,6 +595,7 @@ mod tests {
                 burn_usd_per_hour: Usd::ZERO,
                 points_per_hour: None,
                 eta: eta_hours.map(Duration::hours),
+                runs_out_at: eta_hours.map(|h| now() + Duration::hours(h)),
                 eta_seconds: eta_hours.map(|h| h * 3600),
                 shares: Vec::new(),
                 window_usd: None,

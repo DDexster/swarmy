@@ -391,6 +391,13 @@ yet. A row's band is decided per request at compaction, so a mix shows up as two
 
 ### 3.7 Account re-attribution (`seat_accounts`)
 
+> Superseded (third review, H1): a login change is dated when swarmy sees it, never at the
+> profile's or a reading's time, and the transcripts' `session-owner` records decide a request's
+> account (`seat_accounts` only fills in for sessions without one). Rollups are never re-keyed:
+> they were attributed while their raw rows and owners existed, the archive cannot tell an
+> owner's attribution from the seat's, and a change dated when seen is newer than
+> `rolled_until`. `archive::rekey_sql` is gone. The original design follows.
+
 `post_pass` in `index/mod.rs` runs
 `UPDATE requests SET account_uuid = SEAT_ACCOUNT_AT WHERE seat = ? AND ts >= ?` when a seat's
 login changes. The new `seat_accounts.ts` is the time the seat recorded the profile or reading.
@@ -568,7 +575,7 @@ records per seat, so this is visible.
 |---|---|---|
 | price fingerprint changes | `price_all` (unchanged) | same transaction: recompute `usage_rollup.cost` from sums (§3.6), rewrite `agent_rollup` |
 | new raw rows | priced by `price_all` | not involved (pending rows are never rolled up) |
-| login change at time t | `UPDATE requests …` (unchanged) | re-key rows with `first_ts >= t` (§3.7), same transaction |
+| login change seen at time t | `UPDATE requests …` for requests without an owner | untouched (§3.7, superseded) |
 | `PROJECTS_REV` / aliases | `projects` recompute over the union (§3.8) | nothing stored per project |
 | `CACHE_VERSION` bump | raw tables dropped and re-read from the transcripts (all still on disk, §3.1) | untouched; `write_file` skips records older than `rolled_until` (§4.3) |
 
@@ -752,9 +759,9 @@ There are prompts, API errors and compactions. One session spans day 1 to day 40
 6. **`reprice_after_compaction`.** Change a price version and add a price for the unpriced model.
    The snapshot of the compacted index equals that of a never-compacted one. A threshold change is
    listed by `doctor` instead.
-7. **`reattribution_after_compaction`.** A `seat_accounts` row older than `rolled_until` appears
-   (swarmy "was off"). The account totals equal those of a never-compacted index, except for a
-   straddling quarter hour that the test constructs on purpose and asserts separately.
+7. **`a_login_change_found_after_compaction_moves_nothing`** (was
+   `reattribution_after_compaction`, superseded by §3.7's note). A login change found after weeks
+   off moves no request and no rollup; compacted and never compacted agree.
 8. **`cache_rebuild_keeps_history`.** Bump `CACHE_VERSION` in the test: drop raw, re-read. The
    snapshot is unchanged. With the transcripts of days 1–20 deleted first, it is still unchanged;
    the same scenario fails on today's code.
@@ -956,18 +963,14 @@ Where the code differs from the text above, and why.
   change.
 - `Index::band_drift` lists the models and days whose rows took their band against another
   threshold than the prices in force give (the inexact case; `doctor` shows it in step 8).
-- The re-key is `archive::rekey_sql`, generated from `KEYS` and `SUMS`: insert the seat's rows
-  with `first_ts >= t` whose account at `first_ts` differs under their new key (adding into rows
-  already there), then delete the old keys. `post_pass` runs it only for a switch older than
-  `rolled_until`. `agent_rollup` has no account, so it does not change.
+- The re-key was `archive::rekey_sql`; removed with the third review's H1 (§3.7).
 - `projects` moved to `index/projects.rs`: a new rule revision takes the cwds of raw rows and
   rollups, orphan votes count rolled-up requests by session, and a cwd whose dir is gone, that
   resolves as an orphan and has no votes keeps the project recorded for it.
 - Tests: `reprice_after_compaction` (a dated price inside the archive, a price for the unpriced
   model, new long-context multipliers; then a threshold change listed by `band_drift`),
-  `reattribution_after_compaction` (a switch on a quarter hour changes no number; one between
-  two responses of a rolled-up row moves exactly the second response's cost between the two
-  accounts and nothing else), `projects_come_from_the_union_and_are_never_downgraded`.
+  `a_login_change_found_after_compaction_moves_nothing`,
+  `projects_come_from_the_union_and_are_never_downgraded`.
 
 **Step 7 (mechanics, the job, the CLI).**
 - `journal_size_limit` is 32 MB, set at open. SQLite's temp dir is `<data>/tmp`, set once per
@@ -1035,3 +1038,42 @@ Where the code differs from the text above, and why.
 - On a copy of the owner's index before compaction: 290 MB, 287k requests since 2026-10-22,
   +161 KB/day estimated, ≈ 206 MB in 12 months; after `swarmy compact`, 201k requests of detail,
   21k rollup rows ≈ 1.4 MB.
+
+**After the third architecture review (`BACKEND_REVIEW_RESULTS.md`, H3, M1–M4, L1, L7).**
+- **A response is skipped or written whole** (`write::write_file`). Claude Code writes one
+  response as several records, one per content block, each with its own time; the raw row keeps
+  the first one's, and the compactor rolls the response up by it. A file read again from its
+  start decides each message id by its first record, so a block after `rolled_until` of a
+  response rolled up before it no longer comes back as a new row. Its tool calls are rolled up by
+  their own time, so a tool call after `rolled_until` is still written (a no-op when it is raw).
+  The archive fixture writes responses as Claude Code does, one record per block.
+- **§4.3's rule is narrower: nothing is skipped on a guess** (`marks::Marks::of`). A known agent
+  (session and agent id, any seat) repeats; a new agent of a known session (a subagent file never
+  read) is new; a session never seen in a compacted seat (§4.3 rule 2) is decided by its records:
+  it repeats only when every response older than `rolled_until` in it is one the archive holds
+  (`marks::all_held`: a rollup row of its quarter hour and model with at least its tokens, as a
+  fork's copies are), otherwise it is new and rolled up by the same refresh (`roll_late`). The
+  "conservative error" of §4.3 (records of a restored or synced transcript skipped) is gone.
+- **Nothing is dropped silently.** A transcript that cannot be read goes into the raw table
+  `unreadable_files` (removed when a read succeeds), `RefreshStats::unreadable`, `doctor` and
+  ATTENTION; it is read again on the next refresh. Lines that are no JSON record and records with
+  numbers beyond i64 are counted per file in `record_types` (`transcript::MALFORMED`) and
+  reported by `doctor`.
+- **A cache rebuild keeps what no transcript gives back** (`schema::stash_unrereadable`). §3.1
+  assumed every raw row could be read again; a seat dir removed or moved, a retention shorter than
+  the raw window, or an old record appended after a compaction (raw below `rolled_until`, which a
+  re-read skips) broke that. Before the raw tables are dropped, rows of an agent with no
+  transcript left on disk (by `files`) and rows older than `rolled_until` go to temp tables and
+  back into the new ones; the first refresh rolls the late ones up. A damaged `settings.json` is
+  an error (`ConfigError::SeatSettings`), listed in `problems`, never taken for "not set".
+- **Unpriced requests are counted in the archive** (`ARCHIVE_VERSION` 2). One key can hold a
+  request priced at $0 (no tokens, any model) next to one without a price; `MAX(priced)` hid the
+  second. `usage_rollup` keeps `n_unpriced` and `n_empty` (requests without tokens, so a reprice
+  from the sums knows how many stay priced); `priced` now means "any of them is priced" (`cost`
+  is not NULL). Rows rolled up before keep what the flag said.
+- **Settled parts:** `spend_series` resizes the kept part to its own span's length (a later span
+  end in the same horizon cut the limit curve); the owner and seat fallbacks of `post_pass` bump
+  the settled generation when settled requests got an account.
+- **Two writers:** a refresh that finds nothing commits nothing (`refreshed_at` only after a read,
+  the `accounts` row only when it changed or is an hour old), so a second process no longer makes
+  every per-agent cache read again each second.

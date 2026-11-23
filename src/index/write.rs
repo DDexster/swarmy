@@ -44,9 +44,15 @@ pub(super) fn write_file(
 ) -> anyhow::Result<Written> {
     let mut late = false;
     let mut skipped = 0;
-    let rolled = |t: i64| marks::rolled_up(w.marked, at.rolled_until, t);
+    let mut refused: i64 = 0;
+    let marked = match w.mark {
+        marks::Mark::New => false,
+        marks::Mark::Repeats => true,
+        marks::Mark::MaybeCopies => marks::all_held(tx, &chunk.events, at.rolled_until)?,
+    };
+    let rolled = |t: i64| marks::rolled_up(marked, at.rolled_until, t);
     // Rows older than this were rolled up and are not read again: a reset keeps them.
-    let kept_before = if w.marked { at.rolled_until } else { i64::MIN };
+    let kept_before = if marked { at.rolled_until } else { i64::MIN };
     let f = &w.file;
     let main = f.kind == FileKind::Main;
     if w.reset {
@@ -67,13 +73,23 @@ pub(super) fn write_file(
             .execute([f.path.to_string_lossy()])?;
     }
     // Exactly once per byte range: the offset is checked and advanced in this transaction.
-    for (t, n) in &chunk.stats.by_type {
+    // Lines that are no record are counted too: what they held is lost, and `doctor` says so.
+    let malformed = (chunk.stats.malformed > 0)
+        .then(|| (transcript::MALFORMED.to_string(), chunk.stats.malformed));
+    for (t, n) in chunk
+        .stats
+        .by_type
+        .iter()
+        .chain(malformed.iter().map(|(t, n)| (t, n)))
+    {
         tx.prepare_cached(
             "INSERT INTO record_types(path, type, count) VALUES (?1, ?2, ?3)
              ON CONFLICT(path, type) DO UPDATE SET count = count + excluded.count",
         )?
         .execute(params![f.path.to_string_lossy(), t, *n as i64])?;
     }
+    // Whether each response of a marked file was rolled up, decided by its first record.
+    let mut first_seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut account = w.account.clone();
     let mut last_ts = w.last_ts;
     let mut agg = FileAgg::default();
@@ -116,12 +132,48 @@ pub(super) fn write_file(
                         cwds.insert(c.clone());
                     }
                 }
-                if rolled(t) {
+                // One response is several records (one per content block), each with its own
+                // time; its raw row carries the first one's, and the compactor rolled it up by
+                // that time. So the response is skipped or written whole, as its first record
+                // decides, never block by block (a later block past `rolled_until` would come
+                // back as a new row).
+                let gone = marked && *first_seen.entry(r.msg_id.clone()).or_insert(rolled(t));
+                if gone {
                     skipped += 1;
+                    // Tool calls are rolled up by their own time: one at or after
+                    // `rolled_until` is still raw (or gone with a cache rebuild) and is kept.
+                    if !rolled(t) {
+                        insert_tools(&mut ins_tool, f, &r, t)?;
+                    }
                     continue;
                 }
-                late |= t < at.settled_before;
                 let u = r.usage;
+                // A count SQLite cannot hold (beyond i64) is no real usage: the record is refused
+                // and counted, never wrapped to a negative that fails the batch on every run.
+                let tok = [
+                    u.input,
+                    u.cache_write_5m,
+                    u.cache_write_1h,
+                    u.cache_read,
+                    u.output,
+                    u.thinking,
+                    u.web_search,
+                ]
+                .map(i64::try_from);
+                let [
+                    Ok(input),
+                    Ok(cw5),
+                    Ok(cw1h),
+                    Ok(cread),
+                    Ok(output),
+                    Ok(thinking),
+                    Ok(web),
+                ] = tok
+                else {
+                    refused += 1;
+                    continue;
+                };
+                late |= t < at.settled_before;
                 // Numbered above every rowid ever given out (`compact::requests_rowid_high`); a
                 // merge into an existing row leaves the number unused.
                 *rowid += 1;
@@ -137,30 +189,16 @@ pub(super) fn write_file(
                     r.effort,
                     r.fast as i64,
                     r.cwd,
-                    u.input as i64,
-                    u.cache_write_5m as i64,
-                    u.cache_write_1h as i64,
-                    u.cache_read as i64,
-                    u.output as i64,
-                    u.thinking as i64,
-                    u.web_search as i64,
+                    input,
+                    cw5,
+                    cw1h,
+                    cread,
+                    output,
+                    thinking,
+                    web,
                     *rowid,
                 ])?;
-                for tu in &r.tool_uses {
-                    if !tu.id.is_empty() {
-                        ins_tool.execute(params![
-                            tu.id,
-                            r.msg_id,
-                            f.seat,
-                            f.session_id,
-                            f.agent_id,
-                            t,
-                            tu.name,
-                            tu.summary,
-                            tu.target
-                        ])?;
-                    }
-                }
+                insert_tools(&mut ins_tool, f, &r, t)?;
                 // A response's tool calls are counted, not added up: its records may be read
                 // more than once, in any order.
                 if !r.tool_uses.is_empty() {
@@ -224,6 +262,17 @@ pub(super) fn write_file(
         }
     }
 
+    if refused > 0 {
+        tx.prepare_cached(
+            "INSERT INTO record_types(path, type, count) VALUES (?1, ?2, ?3)
+             ON CONFLICT(path, type) DO UPDATE SET count = count + excluded.count",
+        )?
+        .execute(params![
+            f.path.to_string_lossy(),
+            transcript::MALFORMED,
+            refused
+        ])?;
+    }
     if main {
         if let Some(dir) = f.path.parent().map(|p| p.join(&f.session_id))
             && let Some(t) = files::read_custom_title(&dir)
@@ -289,4 +338,28 @@ pub(super) fn write_file(
             account,
         ])?;
     Ok(Written { late, skipped })
+}
+
+/// The tool calls of one record of response `r` (at `t`, the record's time). A tool id is written
+/// once; a record read again adds nothing.
+fn insert_tools(
+    ins_tool: &mut rusqlite::CachedStatement,
+    f: &crate::claude::files::TranscriptFile,
+    r: &transcript::Request,
+    t: i64,
+) -> rusqlite::Result<()> {
+    for tu in r.tool_uses.iter().filter(|tu| !tu.id.is_empty()) {
+        ins_tool.execute(params![
+            tu.id,
+            r.msg_id,
+            f.seat,
+            f.session_id,
+            f.agent_id,
+            t,
+            tu.name,
+            tu.summary,
+            tu.target
+        ])?;
+    }
+    Ok(())
 }

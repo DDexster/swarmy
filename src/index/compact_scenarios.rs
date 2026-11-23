@@ -3,8 +3,8 @@
 //! mid-way and resumed ends where an uninterrupted one does, and a second run changes nothing.
 //! Then the read marks: files read again after a compaction (appended, replaced, truncated,
 //! forked, every file after a cache rebuild, a seat found later) count every record once. Then
-//! what changes old spend after it was rolled up: a price change, a login switch older than the
-//! raw window, a new revision of the project rules.
+//! what changes old spend after it was rolled up: a price change, a new revision of the project
+//! rules; and what does not: a login change found late (review H1).
 
 #[cfg(test)]
 mod tests {
@@ -18,7 +18,7 @@ mod tests {
     use crate::index::archive;
     use crate::index::archive_scenarios::{NOW, diff, populate, readings, refresh, snapshot};
     use crate::index::compact::{self, CompactOpts, CompactReport, FAIL_IN_CHUNK};
-    use crate::index::query::{Dim, Filter};
+    use crate::index::query::Filter;
     use crate::index::scenarios::{World, account, assistant, at, owner};
     use crate::index::{Index, SeatInfo, schema};
 
@@ -467,6 +467,342 @@ mod tests {
         );
     }
 
+    /// RFC 3339 of `t` epoch ms.
+    fn iso(t: i64) -> String {
+        crate::index::from_ms(t).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// A session of `work` with a response written as Claude Code writes it, one record per
+    /// content block, whose blocks lie on both sides of `cut`: a text block a minute before it,
+    /// a tool call 30 s after it (same message id, same usage), the tool's result, and a
+    /// response on each side.
+    fn straddling(cut: i64) -> Vec<String> {
+        let m = |id: &str, t: i64, tools: &[&str]| {
+            assistant(id, &iso(t), "claude-opus-5-5", "/w/api", (4000, 700), tools)
+        };
+        vec![
+            owner("acc-a"),
+            m("split-0", cut - 3_600_000, &[]),
+            m("split-1", cut - 60_000, &[]),
+            m("split-1", cut + 30_000, &["split-t1"]),
+            serde_json::json!({"type": "user", "timestamp": iso(cut + 90_000), "sessionId": "s",
+                "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "split-t1",
+                    "content": "ok", "is_error": false}]}})
+            .to_string(),
+            m("split-2", cut + 3_600_000, &[]),
+        ]
+    }
+
+    #[test]
+    fn a_response_straddling_the_cut_counts_once_when_read_again() {
+        // The raw row keeps the first block's time, so the compactor rolls the whole response
+        // up; read again from the start, its second block (after rolled_until) must not come
+        // back as a new raw row.
+        let (w, path) = base();
+        let cut = compact::cutoff(at(NOW), 14);
+        let lines = straddling(cut);
+        std::fs::write(proj(&w, "work").join("split.jsonl"), text(&lines)).unwrap();
+        let mut never = copy(&w, &path, "never.sqlite");
+        let mut done = copy(&w, &path, "done.sqlite");
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        let r = compact(&w, &mut done, 14, None);
+        assert_eq!(r.rolled_until, cut);
+        let raw = |i: &Index| {
+            count(
+                i,
+                "SELECT COUNT(*) FROM requests WHERE msg_id LIKE 'split-%'",
+            )
+        };
+        assert_eq!(raw(&done), 1, "split-2 alone stays raw");
+        // Replaced (another inode): read again from its start.
+        let p = proj(&w, "work").join("split.jsonl");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::write(&p, text(&lines)).unwrap();
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        assert_eq!(raw(&done), 1, "the second block is no new response");
+        assert_eq!(
+            count(
+                &done,
+                "SELECT COUNT(*) FROM tool_calls WHERE id = 'split-t1' AND done_ts IS NOT NULL"
+            ),
+            1,
+            "its tool call (after the cut) stays raw, finished"
+        );
+        assert_same(
+            &snapshot(&w, &never),
+            &snapshot(&w, &done),
+            "a straddling response read again",
+        );
+    }
+
+    #[test]
+    fn records_never_read_count_after_a_compaction_and_none_are_lost_silently() {
+        // After a compaction, records the index never read are new information, whatever their
+        // age: a session synced from another machine into a compacted seat, a subagent file of a
+        // known session that was never read. Only what the archive holds is skipped (a fork, in
+        // `reread_after_compaction_counts_once`).
+        let (w, path) = base();
+        let mut never = copy(&w, &path, "never.sqlite");
+        let mut done = copy(&w, &path, "done.sqlite");
+        let r = compact(&w, &mut done, 14, None);
+        let big = |id: &str, t: &str| {
+            assistant(id, t, "claude-opus-5-5", "/w/api", (900_000, 9_000), &[])
+        };
+        let synced = [
+            owner("acc-a"),
+            big("sync-0", "2026-10-02T03:01:00Z"),
+            big("sync-1", "2026-10-02T03:20:00Z"),
+            fresh("sync-2", "2026-10-29T09:00:00Z"),
+        ];
+        std::fs::write(proj(&w, "work").join("synced.jsonl"), text(&synced)).unwrap();
+        let sub = proj(&w, "work").join("s03/subagents/agent-zz.jsonl");
+        std::fs::write(
+            &sub,
+            text(&[
+                big("zz-0", "2026-09-24T03:05:00Z"),
+                big("zz-1", "2026-09-24T03:09:00Z"),
+            ]),
+        )
+        .unwrap();
+        // A damaged line in a known file: not counted, and said so.
+        let p = proj(&w, "lab").join("s35.jsonl");
+        let mut l = lines(&p);
+        l.push("{\"type\": \"assistant\", oops".into());
+        std::fs::write(&p, text(&l)).unwrap();
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        assert_eq!(
+            count(
+                &done,
+                &format!(
+                    "SELECT COUNT(*) FROM requests WHERE ts < {}",
+                    r.rolled_until
+                )
+            ),
+            0,
+            "the old ones are rolled up at once"
+        );
+        assert_eq!(
+            count(
+                &done,
+                "SELECT SUM(requests) FROM usage_rollup WHERE input >= 900000"
+            ),
+            4
+        );
+        assert_same(
+            &snapshot(&w, &never),
+            &snapshot(&w, &done),
+            "records never read before",
+        );
+        assert_eq!(
+            count(
+                &done,
+                &format!(
+                    "SELECT count FROM record_types WHERE type = '{}'",
+                    crate::claude::transcript::MALFORMED
+                )
+            ),
+            1
+        );
+        // A transcript that cannot be read is recorded and reported until it can be.
+        let locked = proj(&w, "home").join("locked.jsonl");
+        std::fs::write(
+            &locked,
+            text(&[owner("acc-b"), fresh("lk-0", "2026-10-30T10:00:00Z")]),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&locked).is_err() {
+            refresh(&w, &mut done);
+            let bad = done.unreadable_files().unwrap();
+            assert_eq!(bad.len(), 1, "{bad:?}");
+            assert!(bad[0].0.ends_with("locked.jsonl") && !bad[0].1.is_empty());
+            assert_eq!(
+                count(&done, "SELECT COUNT(*) FROM requests WHERE msg_id = 'lk-0'"),
+                0
+            );
+        }
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        assert!(done.unreadable_files().unwrap().is_empty());
+        assert_same(
+            &snapshot(&w, &never),
+            &snapshot(&w, &done),
+            "read once it can be",
+        );
+    }
+
+    #[test]
+    fn a_cache_rebuild_keeps_raw_rows_no_transcript_gives_back() {
+        // Raw rows are the only record of their days once the transcripts are gone, and of
+        // old records found after a compaction until the next one: a cache rebuild keeps both.
+        let (w, path) = base();
+        let mut never = copy(&w, &path, "never.sqlite");
+        let mut done = copy(&w, &path, "done.sqlite");
+        let r = compact(&w, &mut done, 14, None);
+        // A response with a clock far behind, appended to a known file after the compaction:
+        // read incrementally, it stays raw below rolled_until.
+        let long = proj(&w, "work").join("long.jsonl");
+        let mut l = lines(&long);
+        l.push(fresh("behind-0", "2026-10-03T05:00:00Z"));
+        std::fs::write(&long, text(&l)).unwrap();
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        let below = format!(
+            "SELECT COUNT(*) FROM requests WHERE ts < {}",
+            r.rolled_until
+        );
+        assert_eq!(count(&done, &below), 1);
+        let expected = snapshot(&w, &never);
+        assert_same(&expected, &snapshot(&w, &done), "before the rebuild");
+        drop(done);
+        // The seat `lab` is gone (its dir removed), and so are `home`'s recent transcripts.
+        let lab = w.seats.iter().find(|s| s.label == "lab").unwrap();
+        std::fs::remove_dir_all(&lab.dir).unwrap();
+        for d in (20..40).filter(|d| d % 3 == 1) {
+            let p = proj(&w, "home").join(format!("s{d:02}.jsonl"));
+            std::fs::remove_file(&p).unwrap();
+            std::fs::remove_dir_all(p.with_extension("")).unwrap();
+        }
+        bump(&w.dir.path().join("done.sqlite"));
+        let mut done = Index::open(&w.dir.path().join("done.sqlite")).unwrap();
+        assert!(
+            count(&done, "SELECT COUNT(*) FROM requests") > 0,
+            "rows no transcript gives back are kept"
+        );
+        refresh(&w, &mut done);
+        assert_eq!(count(&done, &below), 0, "the late row is rolled up");
+        assert_same(&expected, &snapshot(&w, &done), "after the rebuild");
+    }
+
+    #[test]
+    fn every_kind_of_reread_after_compaction_reads_as_never_compacted() {
+        // All at once, as a real index meets them: a response straddling the cut, a key with
+        // priced and unpriced requests, then after the compaction files appended, replaced,
+        // truncated, forked, a session and a subagent never read, an old record appended, and
+        // finally a cache rebuild after a seat and recent transcripts are gone; then a second
+        // compaction with a shorter raw window. Every number on every surface, by every
+        // dimension, equals the never-compacted index's.
+        let (w, path) = base();
+        let cut = compact::cutoff(at(NOW), 14);
+        std::fs::write(proj(&w, "work").join("split.jsonl"), text(&straddling(cut))).unwrap();
+        let mx = |id: &str, t: &str, tok| assistant(id, t, "claude-mystery-1", "/w/api", tok, &[]);
+        let mystery = [
+            owner("acc-b"),
+            mx("mx-0", "2026-10-04T10:01:00Z", (0, 0)),
+            mx("mx-1", "2026-10-04T10:03:00Z", (900, 90)),
+        ];
+        std::fs::write(proj(&w, "home").join("mystery.jsonl"), text(&mystery)).unwrap();
+        let mut never = copy(&w, &path, "never.sqlite");
+        let mut done = copy(&w, &path, "done.sqlite");
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        let r = compact(&w, &mut done, 14, None);
+        assert_eq!(r.rolled_until, cut);
+        assert_same(&snapshot(&w, &never), &snapshot(&w, &done), "compacted");
+
+        rewrite(&w);
+        let split = proj(&w, "work").join("split.jsonl");
+        let l = lines(&split);
+        std::fs::remove_file(&split).unwrap();
+        std::fs::write(&split, text(&l)).unwrap();
+        let big = |id: &str, t: &str| {
+            assistant(id, t, "claude-opus-5-5", "/w/api", (900_000, 9_000), &[])
+        };
+        std::fs::write(
+            proj(&w, "lab").join("synced.jsonl"),
+            text(&[owner("acc-a"), big("sync-0", "2026-10-05T03:01:00Z")]),
+        )
+        .unwrap();
+        std::fs::write(
+            proj(&w, "home").join("s04/subagents/agent-zz.jsonl"),
+            text(&[big("zz-0", "2026-09-25T03:05:00Z")]),
+        )
+        .unwrap();
+        let long = proj(&w, "work").join("long.jsonl");
+        let mut l = lines(&long);
+        l.push(fresh("behind-0", "2026-10-03T05:00:00Z"));
+        std::fs::write(&long, text(&l)).unwrap();
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        let expected = snapshot(&w, &never);
+        assert_same(
+            &expected,
+            &snapshot(&w, &done),
+            "read again after compacting",
+        );
+        drop((never, done));
+
+        let lab = w.seats.iter().find(|s| s.label == "lab").unwrap();
+        std::fs::remove_dir_all(&lab.dir).unwrap();
+        for d in (20..40).filter(|d| d % 3 == 1) {
+            let p = proj(&w, "home").join(format!("s{d:02}.jsonl"));
+            std::fs::remove_file(&p).unwrap();
+            std::fs::remove_dir_all(p.with_extension("")).unwrap();
+        }
+        for name in ["never.sqlite", "done.sqlite"] {
+            let p = w.dir.path().join(name);
+            bump(&p);
+            let mut idx = Index::open(&p).unwrap();
+            refresh(&w, &mut idx);
+            assert_same(&expected, &snapshot(&w, &idx), &format!("{name} rebuilt"));
+        }
+        let mut done = Index::open(&w.dir.path().join("done.sqlite")).unwrap();
+        compact(&w, &mut done, 8, None);
+        assert_same(&expected, &snapshot(&w, &done), "compacted again, 8 days");
+    }
+
+    #[test]
+    fn requests_without_a_price_stay_counted_in_the_archive() {
+        // Two responses of a model nobody priced, in one rollup key: one has no tokens (priced
+        // at $0, as a synthetic record is), the other has tokens (no price known). The archive
+        // keeps how many had no price, before and after a reprice.
+        let (w, path) = base();
+        let m = |id: &str, t: &str, tok| assistant(id, t, "claude-mystery-1", "/w/api", tok, &[]);
+        let lines = [
+            owner("acc-a"),
+            m("mx-0", "2026-10-02T10:01:00Z", (0, 0)),
+            m("mx-1", "2026-10-02T10:03:00Z", (900, 90)),
+        ];
+        std::fs::write(proj(&w, "work").join("mystery.jsonl"), text(&lines)).unwrap();
+        let mut never = copy(&w, &path, "never.sqlite");
+        let mut done = copy(&w, &path, "done.sqlite");
+        refresh(&w, &mut never);
+        refresh(&w, &mut done);
+        compact(&w, &mut done, 14, None);
+        let span = Period::Range(day("2026-10-02"), day("2026-10-02")).span(at(NOW), None);
+        let f = Filter {
+            model: Some("mystery".into()),
+            ..Default::default()
+        };
+        let unpriced = |i: &Index| i.total(span, &f).unwrap().unpriced;
+        let expected = unpriced(&never);
+        assert!(expected >= 1);
+        assert_eq!(unpriced(&done), expected, "compacted");
+        assert_same(&snapshot(&w, &never), &snapshot(&w, &done), "compacted");
+        // A price change elsewhere reprices every rollup row from its sums: still no price for
+        // the model, still the same count.
+        let mut book = PriceBook::builtin();
+        book.push_override(
+            "claude-sonnet-5-5",
+            Some(day("2026-10-01")),
+            4.0,
+            20.0,
+            &RateOverrides::default(),
+            day("2026-10-30"),
+        )
+        .unwrap();
+        for i in [&mut never, &mut done] {
+            i.price_all(&book).unwrap();
+        }
+        assert_eq!(unpriced(&done), expected, "repriced");
+        assert_same(&snapshot(&w, &never), &snapshot(&w, &done), "repriced");
+    }
+
     #[test]
     fn a_seat_found_after_compaction_is_counted_once_and_rolled_up_at_once() {
         // The seat `late` was not there when the compaction ran; its transcripts, a month old,
@@ -654,33 +990,14 @@ mod tests {
         .collect()
     }
 
+    /// Review H1: swarmy was off for weeks and finds `work` on another login (a vault switch
+    /// restored a profile fetched on 10-10). The change is dated when it is seen, so no request
+    /// and no rollup before it moves: the owners in the transcripts decided those, and the
+    /// archive is never re-keyed on the seat's word. Compacted and never compacted still agree.
     #[test]
-    fn reattribution_after_compaction() {
-        // swarmy was off for weeks: the login swaps of `work` show up only after the days they
-        // happened on were rolled up. The rollups move with the raw rows.
+    fn a_login_change_found_after_compaction_moves_nothing() {
         let w = World::new(&["work", "home", "lab", "late"]);
         populate(&w);
-        // Two responses of one key in one quarter hour, on a day `work` has nothing else.
-        let straddle = [
-            owner("acc-a"),
-            assistant(
-                "st-1",
-                "2026-10-13T15:01:00Z",
-                "claude-opus-5-5",
-                "/w/api",
-                (5000, 900),
-                &[],
-            ),
-            assistant(
-                "st-2",
-                "2026-10-13T15:08:00Z",
-                "claude-opus-5-5",
-                "/w/api",
-                (7000, 1100),
-                &[],
-            ),
-        ];
-        std::fs::write(proj(&w, "work").join("straddle.jsonl"), text(&straddle)).unwrap();
         let book = PriceBook::builtin();
         let path = w.dir.path().join("base.sqlite");
         let mut idx = Index::open(&path).unwrap();
@@ -690,78 +1007,39 @@ mod tests {
         let mut never = copy(&w, &path, "never.sqlite");
         let mut done = copy(&w, &path, "done.sqlite");
         let r = compact(&w, &mut done, 14, None);
-        let switch = at("2026-10-10T12:00:00Z").timestamp_millis();
-        assert!(switch < r.rolled_until);
+        assert!(at("2026-10-10T12:00:00Z").timestamp_millis() < r.rolled_until);
+        let accounts = |i: &Index| {
+            crate::index::scenarios::dump(
+                i,
+                "SELECT seat, session_id, agent_id, first_ts, account_uuid FROM usage_rollup ORDER BY 1, 2, 3, 4, 5",
+            )
+        };
+        let rolled = accounts(&done);
+        let raw = |i: &Index| {
+            crate::index::scenarios::dump(i, "SELECT msg_id, account_uuid FROM requests ORDER BY 1")
+        };
+        let raw_before = raw(&never);
         for i in [&mut never, &mut done] {
             w.refresh(i, &logins("acc-b", "2026-10-10T12:00:00Z"), &book);
         }
-        let moved = |acc: &str| {
-            count(
-                &done,
-                &format!(
-                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = '{}' AND account_uuid = '{acc}' AND first_ts >= {switch}",
-                    w.id("work")
-                ),
-            )
-        };
-        assert!(moved("acc-b") > 10 && moved("acc-a") == 0);
-        assert_eq!(
-            count(
-                &done,
-                &format!(
-                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = '{}' AND account_uuid = 'acc-b' AND first_ts < {switch}",
-                    w.id("work")
-                )
+        assert_eq!(accounts(&done), rolled, "no rollup moved");
+        assert_eq!(raw(&never), raw_before, "no request moved");
+        let seen = count(
+            &done,
+            &format!(
+                "SELECT MAX(ts) FROM seat_accounts WHERE seat = '{}' AND account_uuid = 'acc-b'",
+                w.id("work")
             ),
-            0,
-            "nothing before the switch moves"
         );
-        // On a quarter hour, as logins are recorded in practice: every number is the same.
+        assert!(
+            seen > r.rolled_until,
+            "dated when seen, not at the profile's time"
+        );
         assert_same(
             &snapshot(&w, &never),
             &snapshot(&w, &done),
-            "a login switch older than the raw window",
+            "a login change found after compaction",
         );
-        // Back to acc-a between the two responses of one rolled-up row: the row keeps its
-        // account (its first response was before the switch). That is the second response's
-        // cost on the other account, and nothing else changes.
-        for i in [&mut never, &mut done] {
-            w.refresh(i, &logins("acc-a", "2026-10-13T15:08:00Z"), &book);
-        }
-        let second: f64 = never
-            .conn
-            .query_row("SELECT cost FROM requests WHERE msg_id = 'st-2'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert!(second > 0.01);
-        let all = Period::All.span(at(NOW), None);
-        let f = Filter::default();
-        let by_account = |i: &Index| -> Vec<(String, f64)> {
-            i.spend_by(Dim::Account, all, &f)
-                .unwrap()
-                .into_iter()
-                .map(|g| (g.key, g.cost))
-                .collect()
-        };
-        let (n, d) = (by_account(&never), by_account(&done));
-        let cost = |v: &[(String, f64)], k: &str| v.iter().find(|x| x.0 == k).unwrap().1;
-        let close = |a: f64, b: f64| (a - b).abs() < 1e-9 * a.abs().max(1.0);
-        assert!(
-            close(cost(&d, "acc-a") + second, cost(&n, "acc-a")),
-            "{n:?} {d:?}"
-        );
-        assert!(
-            close(cost(&d, "acc-b") - second, cost(&n, "acc-b")),
-            "{n:?} {d:?}"
-        );
-        for dim in [Dim::Project, Dim::Model, Dim::Seat, Dim::Day, Dim::Session] {
-            let (a, b) = (
-                serde_json::to_value(never.spend_by(dim, all, &f).unwrap()).unwrap(),
-                serde_json::to_value(done.spend_by(dim, all, &f).unwrap()).unwrap(),
-            );
-            assert_same(&a, &b, &format!("{dim:?} after a straddling switch"));
-        }
     }
 
     #[test]
