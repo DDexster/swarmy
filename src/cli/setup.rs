@@ -235,7 +235,7 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
         println!("  {:<12} {:<34} {state}", s.label, show(&s.dir));
     }
     let exe = std::env::current_exe().context("cannot find the swarmy binary")?;
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = crate::fsutil::canonical(&exe).unwrap_or(exe);
 
     // 1. The status line.
     let todo: Vec<&Seat> = ctx

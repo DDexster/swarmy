@@ -29,14 +29,14 @@ pub struct Seat {
 /// The id of a config dir: [`SeatId::of_canonical_dir`] of its canonical path (the path as
 /// given when it cannot be resolved, e.g. a dir that is gone).
 pub fn seat_id(dir: &Path) -> SeatId {
-    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canon = crate::fsutil::canonical(dir).unwrap_or_else(|_| dir.to_path_buf());
     SeatId::of_canonical_dir(&canon)
 }
 
 /// Where the `.claude.json` of config dir `dir` lives: `~/.claude.json` for the default dir
 /// (`~/.claude`), `<dir>/.claude.json` for any other (the rule [`discover`] follows).
 pub fn claude_json_of(dir: &Path, home: &Path) -> PathBuf {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let canon = |p: &Path| crate::fsutil::canonical(p).unwrap_or_else(|_| p.to_path_buf());
     if canon(dir) == canon(&home.join(".claude")) {
         home.join(".claude.json")
     } else {
@@ -144,7 +144,7 @@ pub struct Candidates<'a> {
 pub fn discover(c: &Candidates) -> Vec<Seat> {
     let mut found: BTreeMap<PathBuf, (Vec<&'static str>, Option<String>)> = BTreeMap::new();
     let mut add = |p: PathBuf, by: &'static str, label: Option<String>| {
-        let key = std::fs::canonicalize(&p).unwrap_or(p);
+        let key = crate::fsutil::canonical(&p).unwrap_or(p);
         let e = found.entry(key).or_default();
         if !e.0.contains(&by) {
             e.0.push(by);
@@ -179,7 +179,7 @@ pub fn discover(c: &Candidates) -> Vec<Seat> {
         }
     }
 
-    let canon_default = std::fs::canonicalize(&default).unwrap_or(default);
+    let canon_default = crate::fsutil::canonical(&default).unwrap_or(default);
     let mut seats: Vec<Seat> = found
         .into_iter()
         .map(|(dir, (found_by, label))| {

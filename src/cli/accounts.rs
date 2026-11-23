@@ -93,7 +93,7 @@ fn live_in(ctx: &Ctx, s: &Seat) -> usize {
         .claude
         .iter()
         .filter(|p| match &p.config_dir {
-            Some(d) => std::fs::canonicalize(d)
+            Some(d) => crate::fsutil::canonical(d)
                 .map(|d| d == s.dir)
                 .unwrap_or(false),
             None => s.is_default,

@@ -1,0 +1,4 @@
+# Sources are LF everywhere (the architecture tests read them as text, also on Windows).
+* text=auto eol=lf
+*.png binary
+*.gif binary

@@ -102,3 +102,6 @@ vault -> diag
 vault -> errors
 # The vault's files and the seat files it switches go through fsutil::atomic_write.
 vault -> fsutil
+# Canonical paths without Windows' verbatim prefix, one helper for seats and the compactor.
+claude -> fsutil
+index -> fsutil

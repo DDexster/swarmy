@@ -61,10 +61,51 @@ swarmy demo
 
 ## Install
 
+Every release on the [releases page](https://github.com/koorchik/swarmy/releases) has a single
+static binary per platform (no runtime dependencies, SQLite built in), with the man page and
+shell completions. Check downloads against `SHA256SUMS`.
+
+| Platform | Download |
+|---|---|
+| Linux x86_64 | `swarmy-<version>-x86_64-unknown-linux-musl.tar.gz`, `swarmy_<version>-1_amd64.deb`, `swarmy-<version>-1.x86_64.rpm` |
+| Linux aarch64 (Raspberry Pi 3/4/5 on a 64-bit OS, ARM servers) | `swarmy-<version>-aarch64-unknown-linux-musl.tar.gz`, `swarmy_<version>-1_arm64.deb`, `swarmy-<version>-1.aarch64.rpm` |
+| Linux ARMv7 (Raspberry Pi 2/3/4/5 on 32-bit Raspberry Pi OS) | `swarmy-<version>-armv7-unknown-linux-musleabihf.tar.gz`, `swarmy_<version>-1_armhf.deb`, `swarmy-<version>-1.armv7hl.rpm` |
+| Linux ARMv6 (Raspberry Pi Zero / Zero W / 1) | `swarmy-<version>-arm-unknown-linux-musleabihf.tar.gz`, `swarmy_<version>-1_armhf.deb` |
+| macOS (Apple silicon and Intel) | `swarmy-<version>-universal-apple-darwin.tar.gz`, or Homebrew |
+| Windows x86_64 | `swarmy-<version>-x86_64-pc-windows-msvc.zip` |
+
+The Linux binaries are linked statically against musl, so one file runs on every distribution
+and release, old or new. The `armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit
+Raspberry Pi.
+
 ```sh
-cargo install --path .
+# Debian, Ubuntu, Raspberry Pi OS: install / uninstall
+sudo apt install ./swarmy_<version>-1_amd64.deb        # sudo apt remove swarmy
+# Fedora, RHEL, openSUSE
+sudo dnf install ./swarmy-<version>-1.x86_64.rpm       # sudo dnf remove swarmy
+# Homebrew (macOS, Linux)
+brew install koorchik/tap/swarmy
+# any Linux or macOS: unpack and put the binary on your PATH
+tar xzf swarmy-<version>-<target>.tar.gz && install -m 755 swarmy-<version>-<target>/swarmy ~/.local/bin/
+
 swarmy setup        # optional, see below
 ```
+
+The macOS binary is not signed yet: a download from the browser is quarantined, so run
+`xattr -d com.apple.quarantine swarmy` once, or install with Homebrew, which does not quarantine
+formulae. From an archive, the man page is `man/swarmy.1` and the completions are in
+`completions/` (or generate them: `swarmy man`, `swarmy completions <shell>`).
+
+### Build from source
+
+```sh
+cargo install --locked --git https://github.com/koorchik/swarmy   # or, in a clone: cargo install --locked --path .
+```
+
+Rust 2024 edition (a recent stable toolchain) and a C compiler for the bundled SQLite.
+Distributions that ship a system `libsqlite3` can build with `--no-default-features` (drops the
+`bundled-sqlite` feature). Release builds and packages: `tools/release-local.sh` and
+[`packaging/README.md`](packaging/README.md).
 
 ### Optional: `swarmy setup` and the status line
 

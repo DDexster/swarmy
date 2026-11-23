@@ -90,7 +90,7 @@ impl Staged {
     /// Renames the temp file over `path` and fsyncs the directory, so the new name survives a
     /// crash too.
     pub fn commit(mut self, path: &Path) -> std::io::Result<()> {
-        std::fs::rename(&self.tmp, path)?;
+        rename_over(&self.tmp, path)?;
         self.committed = true;
         sync_dir(path)
     }
@@ -111,6 +111,31 @@ impl Drop for Staged {
             }
         }
     }
+}
+
+/// Renames `from` over `to`. Windows refuses to replace a file while another writer (thread or
+/// process) is replacing it or holds it open without delete sharing (access denied, sharing
+/// violation); those moments are short, so the rename is tried again for a while.
+fn rename_over(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::rename(from, to) {
+                Err(e)
+                    if (e.kind() == std::io::ErrorKind::PermissionDenied
+                        || e.raw_os_error() == Some(ERROR_SHARING_VIOLATION))
+                        && start.elapsed() < std::time::Duration::from_secs(2) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                other => return other,
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(from, to)
 }
 
 /// Fsyncs the directory holding `path` (Unix; elsewhere the rename is all there is).
@@ -151,6 +176,21 @@ pub fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
     }
     std::fs::rename(from, to)?;
     sync_dir(to)
+}
+
+/// `std::fs::canonicalize` without Windows' verbatim prefix (`\\?\C:\…` → `C:\…`), so paths
+/// shown to people and hashed into seat ids look the same as the ones they typed.
+pub fn canonical(p: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    if cfg!(windows) {
+        let s = c.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\")
+            && rest.as_bytes().get(1) == Some(&b':')
+        {
+            return Ok(std::path::PathBuf::from(rest));
+        }
+    }
+    Ok(c)
 }
 
 #[cfg(test)]

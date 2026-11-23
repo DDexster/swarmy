@@ -561,7 +561,7 @@ impl Index {
 
 /// A config dir as `rollup_seats` stores it: canonical when it can be resolved.
 pub(super) fn canonical(dir: &Path) -> String {
-    std::fs::canonicalize(dir)
+    crate::fsutil::canonical(dir)
         .unwrap_or_else(|_| dir.to_path_buf())
         .to_string_lossy()
         .into_owned()

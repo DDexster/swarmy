@@ -128,6 +128,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
 | `tools/perf.sh` | the battery budget measured on `swarmy demo --wall`, fails above it |
+| `tools/dist.sh`, `tools/release-local.sh` | release steps shared with `.github/workflows/release.yml`; the local Linux + Windows build into `dist/` |
+| `packaging/` | Homebrew formula template (`homebrew/swarmy.rb`) and the release / tap / signing notes (`README.md`) |
 
 ## Claude Code format notes (verified on 2.1.329)
 
@@ -182,9 +184,25 @@ cargo run --release -- demo                # try the dashboard on fake data
 cargo zigbuild --release --target x86_64-unknown-linux-musl
 readelf -l target/x86_64-unknown-linux-musl/release/swarmy | grep -c INTERP   # must print 0
 
+# release packages as the tag workflow makes them (packaging/README.md): 4 musl targets, .deb,
+# .rpm, Windows (cargo-xwin) into dist/
+tools/release-local.sh
+
 tools/record-readme.sh                     # refresh docs/img (screenshots + demo.gif)
 tools/perf.sh && tools/perf.sh --mask      # battery budget on the wall load (needs tmux, ~5 min)
 ```
+
+Releases: a `v<version>` tag matching `Cargo.toml` runs `.github/workflows/release.yml`
+(notes from the `## v<version>` section of `CHANGELOG.md`). Code must build for Linux musl
+(x86_64, aarch64, ARMv7, ARMv6 — 32-bit: no `usize` for file sizes or offsets), Windows (no
+inode, no Unix modes; a rename over a file being replaced can fail for a moment —
+`fsutil::rename_over` retries) and macOS; CI runs the tests on all three.
+
+Allocator (measured 23.11.2026, x86_64 musl release, 32 cores; mimalloc was not adopted, the
+memory doubled): cold index of 2,742 transcripts (10.6 GB, 3 seats) — musl malloc 27–37 s
+wall, 32–45 CPU-s, peak RSS 270–480 MB; mimalloc 24–27 s, 33–35 CPU-s, 580–630 MB. Dashboard
+on `demo --wall` 326×81, 12 min, side by side — musl malloc 1.46 CPU-s/min, RSS 178 MB;
+mimalloc 1.32 CPU-s/min, RSS 365 MB (peak 408 MB).
 
 Visual changes to the dashboard: record at the sizes that matter (326×81 wall, 160×81 column,
 140×34 tabs) with `swarmy demo --record … --size WxH --keys …` and `tools/render_frames.py`,

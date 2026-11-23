@@ -1,0 +1,7 @@
+# Release binaries carry their C runtime: the Windows build links the CRT statically (no
+# VCRUNTIME140.dll to install), like the musl builds on Linux.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

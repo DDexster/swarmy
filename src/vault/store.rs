@@ -15,7 +15,12 @@ use crate::fsutil::{self, Mode};
 pub type Secrets = BTreeMap<String, Value>;
 
 /// Where secrets are kept: a JSON file readable only by the owner.
-pub const STORE_NAME: &str = "file (0600)";
+/// How the secrets are kept, for `accounts` and `doctor`.
+pub const STORE_NAME: &str = if cfg!(windows) {
+    "file (your profile's permissions)"
+} else {
+    "file (0600)"
+};
 
 /// Reads a file that may not exist yet.
 pub fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {

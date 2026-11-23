@@ -287,13 +287,24 @@ pub fn from_ms(t: i64) -> DateTime<Utc> {
 }
 
 #[cfg(unix)]
-fn inode(m: &std::fs::Metadata) -> u64 {
+fn inode(_path: &Path, m: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     m.ino()
 }
 
-#[cfg(not(unix))]
-fn inode(_m: &std::fs::Metadata) -> u64 {
+/// Windows has no inode in `Metadata`: the file index of an open handle (mixed with the
+/// volume serial) tells a replaced file from one appended to, as the inode does on Unix.
+#[cfg(windows)]
+fn inode(path: &Path, _m: &std::fs::Metadata) -> u64 {
+    winapi_util::Handle::from_path_any(path)
+        .and_then(|h| winapi_util::file::information(&h))
+        .map_or(0, |i| {
+            i.file_index() ^ i.volume_serial_number().rotate_left(48)
+        })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn inode(_path: &Path, _m: &std::fs::Metadata) -> u64 {
     0
 }
 
@@ -559,7 +570,7 @@ impl Index {
             let Ok(m) = std::fs::metadata(&f.path) else {
                 continue;
             };
-            let (ino, size) = (inode(&m), m.len());
+            let (ino, size) = (inode(&f.path, &m), m.len());
             let mtime = m
                 .modified()
                 .ok()
