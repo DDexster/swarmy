@@ -227,6 +227,12 @@ impl Index {
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
             let Some(oldest) = oldest_raw(&tx, cut)? else {
+                // Nothing raw is left before the cutoff: everything before it is rolled up, so
+                // the mark goes to the cutoff itself, wherever the last non-empty chunk ended
+                // (otherwise it depends on how the chunk grid meets local midnight).
+                let until = archive::rolled_until(&tx)?.max(cut);
+                schema::set_meta(&tx, "rolled_until", &until.to_string())?;
+                tx.commit()?;
                 report.done = true;
                 break;
             };

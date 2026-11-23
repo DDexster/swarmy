@@ -799,6 +799,7 @@ pub(super) mod hooks {
     }
 }
 
+#[cfg(unix)]
 /// A seat whose `.claude.json` lives outside its dir (as the default seat's does, in `$HOME`).
 fn seat_with_home(root: &Path, label: &str) -> anyhow::Result<(Seat, PathBuf)> {
     let dir = root.join(format!(".claude-{label}"));

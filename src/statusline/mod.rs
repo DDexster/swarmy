@@ -251,8 +251,9 @@ mod tests {
         .unwrap();
         let input = |pct: f64| {
             parse_input(&format!(
-                r#"{{"session_id":"s1","transcript_path":"{}","rate_limits":{{"seven_day":{{"used_percentage":{pct},"resets_at":1795960000}}}}}}"#,
-                transcript.display()
+                r#"{{"session_id":"s1","transcript_path":{},"rate_limits":{{"seven_day":{{"used_percentage":{pct},"resets_at":1795960000}}}}}}"#,
+                // A JSON string: Windows paths carry backslashes.
+                serde_json::Value::String(transcript.display().to_string())
             ))
         };
         let now = "2026-11-22T11:00:00Z"

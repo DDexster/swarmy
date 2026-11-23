@@ -139,7 +139,7 @@ mod tests {
             assert!(r.requests > 100 && r.tool_calls > 100, "{keep}: {r:?}");
             assert!(r.prompts > 0 && r.api_errors > 0, "{keep}: {r:?}");
             assert_eq!(r.rolled_until % BUCKET_MS, 0);
-            assert!(r.rolled_until <= r.cutoff && r.rolled_until > r.cutoff - compact::CHUNK_MS);
+            assert_eq!(r.rolled_until, r.cutoff, "{keep}: {r:?}");
             // Every old row moved, once.
             for t in ["requests", "tool_calls", "prompts", "api_errors"] {
                 let old = format!("SELECT COUNT(*) FROM {t} WHERE ts < {}", r.cutoff);
@@ -606,26 +606,30 @@ mod tests {
             ),
             1
         );
-        // A transcript that cannot be read is recorded and reported until it can be.
-        let locked = proj(&w, "home").join("locked.jsonl");
-        std::fs::write(
-            &locked,
-            text(&[owner("acc-b"), fresh("lk-0", "2026-10-30T10:00:00Z")]),
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::File::open(&locked).is_err() {
-            refresh(&w, &mut done);
-            let bad = done.unreadable_files().unwrap();
-            assert_eq!(bad.len(), 1, "{bad:?}");
-            assert!(bad[0].0.ends_with("locked.jsonl") && !bad[0].1.is_empty());
-            assert_eq!(
-                count(&done, "SELECT COUNT(*) FROM requests WHERE msg_id = 'lk-0'"),
-                0
-            );
+        // A transcript that cannot be read is recorded and reported until it can be (Unix
+        // permissions make it unreadable; elsewhere this part is skipped).
+        #[cfg(unix)]
+        {
+            let locked = proj(&w, "home").join("locked.jsonl");
+            std::fs::write(
+                &locked,
+                text(&[owner("acc-b"), fresh("lk-0", "2026-10-30T10:00:00Z")]),
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::File::open(&locked).is_err() {
+                refresh(&w, &mut done);
+                let bad = done.unreadable_files().unwrap();
+                assert_eq!(bad.len(), 1, "{bad:?}");
+                assert!(bad[0].0.ends_with("locked.jsonl") && !bad[0].1.is_empty());
+                assert_eq!(
+                    count(&done, "SELECT COUNT(*) FROM requests WHERE msg_id = 'lk-0'"),
+                    0
+                );
+            }
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
         refresh(&w, &mut never);
         refresh(&w, &mut done);
         assert!(done.unreadable_files().unwrap().is_empty());
