@@ -405,7 +405,7 @@ tools/perf.sh                  # the battery budget, for changes to the worker, 
 tools/record-readme.sh         # refresh docs/img after visual changes
 ```
 
-[`CLAUDE.md`](CLAUDE.md) holds the architecture, the rules and the reasons behind them. Tests use
+[`AGENTS.md`](AGENTS.md) holds the architecture, the rules and the reasons behind them. Tests use
 synthetic data only, and screenshots come only from `swarmy demo`.
 
 ## License
