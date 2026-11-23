@@ -91,7 +91,9 @@ pub fn rewrite_merging(
         refused = None;
         let staged = fsutil::stage(path, new.as_bytes(), Mode::Private)
             .with_context(|| format!("cannot write next to {}", path.display()))?;
-        if stamp(path) == before {
+        // The stamp alone is not enough: on Windows a quick replace can keep the same time and
+        // size, so the text itself must still be what was read.
+        if stamp(path) == before && read_optional(path)?.as_deref() == Some(text.as_str()) {
             staged
                 .commit(path)
                 .with_context(|| format!("cannot replace {}", path.display()))?;
