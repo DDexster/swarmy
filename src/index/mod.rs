@@ -286,6 +286,13 @@ pub fn from_ms(t: i64) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
+/// A file identity as the index stores it: SQLite integers are signed and the column is
+/// `CHECK (ino >= 0)`, so the top bit goes. Windows' file index mixed with the volume serial uses
+/// all 64 bits (real NTFS volumes, not Wine's), which used to fail every insert there.
+fn file_key(ino: u64) -> u64 {
+    ino & i64::MAX.unsigned_abs()
+}
+
 #[cfg(unix)]
 fn inode(_path: &Path, m: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -570,7 +577,7 @@ impl Index {
             let Ok(m) = std::fs::metadata(&f.path) else {
                 continue;
             };
-            let (ino, size) = (inode(&f.path, &m), m.len());
+            let (ino, size) = (file_key(inode(&f.path, &m)), m.len());
             let mtime = m
                 .modified()
                 .ok()
@@ -1032,5 +1039,15 @@ mod tests {
         other.set_meta("refreshed_at", "1").unwrap();
         w.refresh(&mut idx, &[], &book);
         assert_ne!(seq(&idx, "a1"), sub2);
+    }
+}
+
+#[cfg(test)]
+mod file_key_tests {
+    #[test]
+    fn a_64_bit_file_identity_fits_the_signed_column() {
+        assert_eq!(super::file_key(u64::MAX), i64::MAX.unsigned_abs());
+        assert!(i64::try_from(super::file_key(0xF000_0000_0000_0001)).is_ok());
+        assert_eq!(super::file_key(42), 42);
     }
 }
