@@ -8,13 +8,12 @@ use super::*;
 fn seat(root: &Path, label: &str) -> anyhow::Result<Seat> {
     let dir = root.join(format!(".claude-{label}"));
     std::fs::create_dir_all(&dir)?;
-    Ok(Seat {
-        label: label.into(),
-        claude_json: dir.join(".claude.json"),
-        dir,
-        is_default: false,
-        found_by: vec![],
-    })
+    Ok(Seat::new(
+        label,
+        dir.clone(),
+        dir.join(".claude.json"),
+        false,
+    ))
 }
 
 fn write_seat(s: &Seat, refresh: &str, account: &str) -> anyhow::Result<()> {
@@ -33,7 +32,7 @@ fn read_json(p: &Path) -> anyhow::Result<Value> {
 }
 
 fn find<'a>(v: &'a Vault, key: &str) -> Option<&'a Login> {
-    v.index.find(key)
+    v.index.find(key).ok()
 }
 
 fn login<'a>(v: &'a Vault, key: &str) -> anyhow::Result<&'a Login> {
@@ -71,7 +70,7 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
 
     v.edit(|tx| tx.capture(&work, Some("alice")))?;
     v.edit(|tx| tx.capture(&spare, Some("bob")))?;
-    assert_eq!(login(&v, "alice")?.mounted.as_deref(), Some("work"));
+    assert_eq!(login(&v, "alice")?.mounted.as_ref(), Some(&work.id));
     assert_eq!(login(&v, "bob")?.email.as_deref(), Some("bob@example.com"));
 
     // bob is mounted in `spare`: refused without --share.
@@ -113,7 +112,7 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
         "the rest of .claude.json is untouched"
     );
     assert_eq!(login(&v, "alice")?.mounted, None);
-    assert_eq!(login(&v, "bob")?.mounted.as_deref(), Some("work"));
+    assert_eq!(login(&v, "bob")?.mounted.as_ref(), Some(&work.id));
     let backups = std::fs::read_dir(rep.backup.context("no backup")?)?.count();
     assert!(backups >= 2);
     #[cfg(unix)]
@@ -155,7 +154,7 @@ fn a_fresh_access_token_is_followed() -> anyhow::Result<()> {
     write_creds(&work, "acc-new", "r-alice")?;
     v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
     let alice = login(&v, "alice")?.clone();
-    assert_eq!(alice.mounted.as_deref(), Some("work"));
+    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
     assert_eq!(secret_of(&v, &alice.id)?["accessToken"], "acc-new");
     Ok(())
 }
@@ -171,7 +170,7 @@ fn a_new_login_never_overwrites_the_saved_one() -> anyhow::Result<()> {
     // A backup of another account is copied in; the profile still names alice.
     write_creds(&work, "acc-bob", "r-bob")?;
     let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
-    let st = &states["work"];
+    let st = &states[&work.id];
     assert!(
         st.unverified_since.is_some(),
         "account not confirmed: {st:?}"
@@ -189,12 +188,12 @@ fn a_new_login_never_overwrites_the_saved_one() -> anyhow::Result<()> {
     v.edit(|tx| tx.capture(&work, Some("bob")))?;
     let bob = login(&v, "bob")?;
     assert_eq!(bob.account_uuid, None);
-    assert_eq!(bob.mounted.as_deref(), Some("work"));
+    assert_eq!(bob.mounted.as_ref(), Some(&work.id));
     assert_eq!(v.logins().len(), 2);
     // Claude Code re-reads the profile: now the account is known.
     let cj = json!({"oauthAccount": {"accountUuid": "bob", "emailAddress": "bob@example.com", "profileFetchedAt": Utc::now().timestamp_millis()}});
     std::fs::write(&work.claude_json, cj.to_string())?;
-    let st = &v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?["work"];
+    let st = &v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?[&work.id];
     assert_eq!(st.unverified_since, None);
     assert_eq!(st.account_uuid.as_deref(), Some("bob"));
     assert_eq!(st.saved_as.as_deref(), Some("bob"));
@@ -355,7 +354,7 @@ fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<(
         let mounted = v
             .logins()
             .iter()
-            .filter(|l| l.mounted.as_deref() == Some(&s.label))
+            .filter(|l| l.mounted.as_ref() == Some(&s.id))
             .count();
         assert!(mounted <= 1, "{} logins mounted in {}", mounted, s.label);
     }
@@ -418,7 +417,7 @@ fn a_failed_edit_saves_nothing() -> anyhow::Result<()> {
     let mut v = Vault::open(&t.path().join("vault"))?;
     let res: anyhow::Result<()> = v.edit(|tx| {
         tx.put(&secret("r-a"), None, None, Some("a"), None)?;
-        bail!("changed my mind")
+        anyhow::bail!("changed my mind")
     });
     assert!(res.is_err());
     assert!(v.logins().is_empty());
@@ -625,7 +624,8 @@ fn seat_backups_are_kept_per_seat_and_never_overwrite() -> anyhow::Result<()> {
     for login in ["carol", "alice", "carol"] {
         v.edit(|tx| tx.switch(&work, login, false))?;
     }
-    let work_dir = t.path().join("vault/backups/seats/work");
+    // Kept under the seat's id: a new label changes nothing.
+    let work_dir = t.path().join("vault/backups/seats").join(work.id.as_str());
     assert_eq!(count(&work_dir, "-credentials.json"), 3);
     assert_eq!(count(&work_dir, "-claude.json"), 3);
     for i in 0..SEAT_BACKUPS + 5 {
@@ -639,5 +639,132 @@ fn seat_backups_are_kept_per_seat_and_never_overwrite() -> anyhow::Result<()> {
         1,
         "a rarely switched seat keeps its backup"
     );
+    Ok(())
+}
+
+/// Review H3: a vault an older swarmy wrote names seats by label (`mounted: "work"`, `seats`
+/// keyed by label, no `v`). It is read in place, nothing is lost, and the labels become seat ids
+/// the first time the seat is seen; a label no seat carries waits. Afterwards a new label of the
+/// seat changes nothing.
+#[test]
+fn an_old_vault_keyed_by_labels_moves_to_seat_ids() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let vdir = t.path().join("vault");
+    std::fs::create_dir_all(&vdir)?;
+    // What the version before seat ids wrote (fingerprints as `credentials::LoginMeta` makes them).
+    let fp = |r: &str| secret(r).meta().fingerprint;
+    let login = |id: &str, label: &str, refresh: &str, mounted: &str| {
+        json!({"id": id, "label": label, "account_uuid": label, "email": null, "plan": null,
+               "meta": serde_json::to_value(secret(refresh).meta()).unwrap(),
+               "oauth_account": null, "captured_at": "2026-11-01T00:00:00Z",
+               "updated_at": "2026-11-01T00:00:00Z", "mounted": mounted})
+    };
+    let old = json!({
+        "logins": [login("l1", "alice", "r-alice", "work"), login("l2", "bob", "r-bob", "gone")],
+        "seats": {
+            "work": {"fingerprint": fp("r-alice"), "account_uuid": "alice", "profile_at": null, "unverified_since": null},
+            "gone": {"fingerprint": fp("r-bob"), "account_uuid": "bob", "profile_at": null, "unverified_since": null}
+        }
+    });
+    std::fs::write(
+        vdir.join("logins.json"),
+        serde_json::to_string_pretty(&old)?,
+    )?;
+    let secrets = json!({"l1": secret("r-alice").expose(), "l2": secret("r-bob").expose()});
+    std::fs::write(vdir.join("secrets.json"), secrets.to_string())?;
+
+    // Read as it is: the labels are kept aside, not taken for ids.
+    let mut v = Vault::open(&vdir)?;
+    assert_eq!(v.logins().len(), 2);
+    assert!(v.logins().iter().all(|l| l.mounted.is_none()));
+    assert_eq!(v.index.logins[0].mounted_label.as_deref(), Some("work"));
+
+    // The first change that sees the seat adopts its label.
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    assert_eq!(states[&work.id].saved_as.as_deref(), Some("alice"));
+    let alice = login_of(&v, "alice")?;
+    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
+    assert_eq!(alice.mounted_label, None);
+    let bob = login_of(&v, "bob")?;
+    assert_eq!(bob.mounted, None);
+    assert_eq!(
+        bob.mounted_label.as_deref(),
+        Some("gone"),
+        "waits for its seat"
+    );
+    let disk = read_json(&vdir.join("logins.json"))?;
+    assert_eq!(disk["v"], 2);
+    assert!(disk["seats"].get(work.id.as_str()).is_some(), "{disk}");
+    assert!(disk["seats"].get("work").is_none());
+    assert!(
+        disk["legacy_seats"].get("gone").is_some(),
+        "nothing dropped: {disk}"
+    );
+    // Both secrets are kept; alice's copy follows the seat (the mount was recognised).
+    let disk_secrets = read_json(&vdir.join("secrets.json"))?;
+    assert_eq!(disk_secrets["l2"], secrets["l2"]);
+    assert_eq!(disk_secrets["l1"]["refreshToken"], "r-alice");
+    assert_eq!(disk_secrets["l1"]["expiresAt"], 1_795_377_583_375_i64);
+    // A login still mounted under an old label is not forgotten by accident.
+    assert!(v.edit(|tx| tx.remove("bob", false)).is_err());
+
+    // The seat gets another label: the vault still knows what is in it.
+    let job = Seat::new("job", work.dir.clone(), work.claude_json.clone(), false);
+    assert_eq!(job.id, work.id);
+    v.edit(|tx| tx.capture(&job, None))?;
+    assert_eq!(v.logins().len(), 2, "the same login, not a new one");
+    assert_eq!(login_of(&v, "alice")?.mounted.as_ref(), Some(&work.id));
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&job)))?;
+    assert_eq!(states[&job.id].unverified_since, None);
+    Ok(())
+}
+
+fn login_of(v: &Vault, label: &str) -> anyhow::Result<Login> {
+    login(v, label).cloned()
+}
+
+/// Review L3: a key that names two logins is an error naming both, never the first match.
+#[test]
+fn a_key_naming_two_logins_is_ambiguous() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    let acct = |uuid: &str, email: &str| crate::claude::config_json::Account {
+        account_uuid: uuid.into(),
+        email: Some(email.into()),
+        ..Default::default()
+    };
+    v.edit(|tx| {
+        tx.put(
+            &secret("r-1"),
+            None,
+            Some(&acct("u1", "a@example.com")),
+            Some("first"),
+            None,
+        )?;
+        // A label equal to the other login's email.
+        tx.put(
+            &secret("r-2"),
+            None,
+            Some(&acct("u2", "b@example.com")),
+            Some("a@example.com"),
+            None,
+        )
+    })?;
+    let e = v.edit(|tx| tx.rename("a@example.com", "x")).unwrap_err();
+    assert_eq!(crate::errors::code_of(&e), Some("vault-ambiguous-login"));
+    let msg = e.to_string();
+    assert!(
+        msg.contains("first") && msg.contains("a@example.com"),
+        "{msg}"
+    );
+    // Unique keys still work: a label, an id, an email.
+    assert_eq!(login(&v, "first")?.account_uuid.as_deref(), Some("u1"));
+    assert_eq!(login(&v, "b@example.com")?.label, "a@example.com");
+    let e = v.edit(|tx| tx.remove("nobody", false)).unwrap_err();
+    assert_eq!(crate::errors::code_of(&e), Some("vault-no-login"));
+    let e = v.edit(|tx| tx.rename("first", "")).unwrap_err();
+    assert_eq!(crate::errors::code_of(&e), Some("vault-label-empty"));
     Ok(())
 }

@@ -105,7 +105,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
                 w.shares
                     .iter()
                     .filter(|s| s.key == p.name)
-                    .map(|s| s.limit_points)
+                    .map(|s| s.limit_points.get())
             })
             .sum();
         let name = if app.mask {

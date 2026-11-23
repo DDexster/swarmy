@@ -4,20 +4,34 @@
 app -> claude
 app -> config
 app -> core
+# A vault that cannot be read while resolving --account is reported on the debug channel.
+app -> diag
+# Failures users see come from the error catalogue (src/errors.rs, review L3).
+app -> errors
 app -> index
 # Ctx::index draws the first-run progress bar with ui::fmt.
 app -> ui
 app -> vault
 claude -> config
 claude -> core
+# Failures that the status line must swallow go to the debug channel.
+claude -> diag
 claude -> fleet
+# Every file replacement goes through fsutil::atomic_write (review M8).
+claude -> fsutil
 # Commands start from the composition root.
 cli -> app
 cli -> claude
 cli -> config
 cli -> core
 cli -> demo
+# A bad config.toml under the status line is reported on the debug channel.
+cli -> diag
+# Coded failures from the error catalogue (src/errors.rs).
+cli -> errors
 cli -> fleet
+# `swarmy setup` writes Claude Code's settings.json with fsutil::atomic_write.
+cli -> fsutil
 cli -> index
 # `swarmy limits` and `swarmy accounts` print the limit analysis.
 cli -> limits
@@ -26,11 +40,21 @@ cli -> ui
 cli -> vault
 config -> claude
 config -> core
+# Coded failures from the error catalogue (src/errors.rs).
+config -> errors
 demo -> claude
 # The demo world's pseudo-randomness (ui::hash, shared with the boot animation).
 demo -> ui
+# The fleet summary names seats and sessions by their ids (core::ids).
+fleet -> core
+# The fleet summary is written with fsutil::atomic_write.
+fleet -> fsutil
+# A temp file that cannot be removed is reported on the debug channel.
+fsutil -> diag
 index -> claude
 index -> core
+# Coded failures from the error catalogue (src/errors.rs).
+index -> errors
 # The analysis reads its inputs (now, names, tiers, seat readings) from the context.
 limits -> app
 # Pure estimation rules.
@@ -41,9 +65,13 @@ live -> claude
 live -> core
 live -> index
 tui -> claude
+# The theme named in config.toml (config::ThemeName).
+tui -> config
 # The dashboard's worker starts from the composition root.
 tui -> app
 tui -> core
+# A fleet summary that cannot be written is reported on the debug channel.
+tui -> diag
 tui -> fleet
 tui -> index
 # The dashboard shows the same limit analysis as `swarmy limits`.
@@ -54,3 +82,9 @@ tui -> ui
 tui -> vault
 ui -> core
 vault -> claude
+# Seats that cannot be read and a journal that cannot be written go to the debug channel.
+vault -> diag
+# Coded failures from the error catalogue (src/errors.rs).
+vault -> errors
+# The vault's files and the seat files it switches go through fsutil::atomic_write.
+vault -> fsutil

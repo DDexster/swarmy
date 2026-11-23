@@ -72,6 +72,8 @@ pub struct Analytics {
     pub limits: Vec<AccountReport>,
     pub logins: Vec<Login>,
     pub seats: Vec<SeatRow>,
+    /// What could not be read (`Ctx::problems`, the vault): shown in ATTENTION.
+    pub problems: Vec<String>,
     pub transcripts_bytes: Vec<(String, u64)>,
     pub index_bytes: u64,
     /// The index's size, growth and 12-month projection (SYSTEM), and the budget it is held to.
@@ -93,6 +95,8 @@ pub struct ProjectRow {
 
 #[derive(Debug, Clone)]
 pub struct SeatRow {
+    pub id: crate::core::ids::SeatId,
+    /// For display; unique within one run.
     pub label: String,
     /// The confirmed account (None while a new login is unconfirmed).
     pub account: Option<String>,
@@ -148,7 +152,7 @@ pub fn run(ctx: Ctx, no_boot: bool, force_eco: bool) -> anyhow::Result<()> {
     }));
     let w2 = wants.clone();
     let mask = ctx.mask;
-    let theme = theme::Theme::named(ctx.config.theme.as_deref());
+    let theme = theme::Theme::named(ctx.config.theme);
     let seats = ctx.seats.clone();
     let vault_dir = ctx.dirs.vault_dir();
     let eco = Arc::new(std::sync::atomic::AtomicBool::new(
@@ -220,9 +224,16 @@ fn ui_loop(
     }
 }
 
+/// The UI's wishes, shared with the worker. They are plain values that are always whole, so a
+/// thread that panicked while holding the lock leaves nothing half-written: the lock is taken
+/// back instead of failing.
+pub(crate) fn lock(w: &Mutex<Wants>) -> std::sync::MutexGuard<'_, Wants> {
+    w.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Tells the worker what the UI shows: the selected agent (for its timeline), the period…
 fn sync_wants(app: &mut App, wants: &Arc<Mutex<Wants>>) {
-    let mut w = wants.lock().unwrap();
+    let mut w = lock(wants);
     w.period = Some(app.period.clone());
     w.group = Some(app.group);
     let sel = app.selected_agent().cloned();
@@ -255,7 +266,7 @@ pub fn record(
         ..Default::default()
     }));
     let w2 = wants.clone();
-    let theme = theme::Theme::named(ctx.config.theme.as_deref());
+    let theme = theme::Theme::named(ctx.config.theme);
     let (seats, vault_dir) = (ctx.seats.clone(), ctx.dirs.vault_dir());
     let eco = Arc::new(std::sync::atomic::AtomicBool::new(false));
     std::thread::spawn(move || worker::worker(ctx, tx, w2, eco, false));

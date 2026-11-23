@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use super::archive::{self, Plan};
 use super::{Index, from_ms, ms};
+use crate::core::ids::{AccountId, SeatId};
 use crate::core::limits::{Reading, WindowKind};
 use crate::core::period::{BUCKET_MS, Span, bucket_start};
 use crate::core::usage::Usage;
@@ -56,7 +57,11 @@ impl Dim {
                 "COALESCE(r.account_uuid, '?')",
                 "MAX(COALESCE(c.email, c.display_name, r.account_uuid, '(unknown)'))",
             ),
-            Dim::Seat => ("r.seat", "r.seat"),
+            // The key is the seat id; the label its name in `seats` (current or last seen).
+            Dim::Seat => (
+                "r.seat",
+                "COALESCE((SELECT st.label FROM seats st WHERE st.seat = r.seat), r.seat)",
+            ),
             Dim::Model => ("r.model", "r.model"),
             Dim::Effort => ("COALESCE(r.effort, '-')", "COALESCE(r.effort, '-')"),
             Dim::AgentType => (AGENT_TYPE_OF_REQUEST, AGENT_TYPE_OF_REQUEST),
@@ -107,8 +112,10 @@ impl Dim {
 
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
-    pub account: Option<String>,
-    pub seat: Option<String>,
+    /// Resolved at the edge (`app::Ctx::resolve_account`): a uuid, an email or a label typed by
+    /// the user all end up here as the one account they name.
+    pub account: Option<AccountId>,
+    pub seat: Option<SeatId>,
     /// Matches the project name or key.
     pub project: Option<String>,
     pub model: Option<String>,
@@ -168,17 +175,12 @@ fn where_clause(plan: Plan, f: &Filter, args: &mut Vec<rusqlite::types::Value>) 
     args.push(V::Integer(plan.start));
     args.push(V::Integer(plan.end));
     if let Some(a) = &f.account {
-        // A uuid uses the (account_uuid, ts) index; an email is looked up once.
-        if a.contains('@') {
-            w.push("r.account_uuid IN (SELECT account_uuid FROM accounts WHERE email = ?)".into());
-        } else {
-            w.push("r.account_uuid = ?".into());
-        }
-        args.push(V::Text(a.clone()));
+        w.push("r.account_uuid = ?".into());
+        args.push(V::Text(a.as_str().to_string()));
     }
     if let Some(s) = &f.seat {
         w.push("r.seat = ?".into());
-        args.push(V::Text(s.clone()));
+        args.push(V::Text(s.as_str().to_string()));
     }
     if let Some(p) = &f.project {
         w.push("(p.name = ? OR p.key = ?)".into());
@@ -364,7 +366,7 @@ impl Index {
         now: DateTime<Utc>,
     ) -> anyhow::Result<f64> {
         let filter = Filter {
-            account: Some(account.to_string()),
+            account: Some(AccountId::new(account)),
             ..Default::default()
         };
         if ms(span.end) >= ms(now) - super::SETTLED_AFTER_MS {
@@ -422,6 +424,21 @@ impl Index {
             })?;
             Ok(rows.collect::<Result<_, _>>()?)
         })
+    }
+
+    /// The accounts the index knows under `key`: an account uuid it has seen anywhere (requests,
+    /// readings, logins of a seat), or the email of an account it has seen (any case).
+    pub fn accounts_matching(&self, key: &str) -> anyhow::Result<Vec<AccountId>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT account_uuid FROM accounts WHERE account_uuid = ?1 OR lower(email) = lower(?1)
+             UNION SELECT account_uuid FROM readings WHERE account_uuid = ?1
+             UNION SELECT account_uuid FROM seat_accounts WHERE account_uuid = ?1
+             UNION SELECT account_uuid FROM (SELECT account_uuid FROM requests WHERE account_uuid = ?1 LIMIT 1)",
+        )?;
+        let rows = st.query_map([key], |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .map(|r| r.map(AccountId::new))
+            .collect::<Result<_, _>>()?)
     }
 
     /// Every stored utilization reading of an account and window, oldest first.

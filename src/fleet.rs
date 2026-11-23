@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const VERSION: u32 = 1;
+use crate::core::ids::{SeatId, SessionId};
+
+/// 2: seats are named by their id (`core::ids::SeatId`) everywhere, never by label.
+pub const VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Fleet {
@@ -19,15 +22,15 @@ pub struct Fleet {
     pub needs_you: Vec<NeedsYou>,
     pub counts: Counts,
     /// Per session id: its agents (the main thread not counted) and its spend rate.
-    pub sessions: BTreeMap<String, SessionCounts>,
-    /// Per seat, keyed like the status-line reading files (`statusline::file_for`).
-    pub seats: BTreeMap<String, SeatLimit>,
+    pub sessions: BTreeMap<SessionId, SessionCounts>,
+    /// Per seat id, the key of the status-line reading files too (`statusline::file_for`).
+    pub seats: BTreeMap<SeatId, SeatLimit>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct NeedsYou {
-    pub session_id: String,
-    pub seat: String,
+    pub session_id: SessionId,
+    pub seat: SeatId,
     /// Session title, else its project.
     pub name: String,
     pub what: String,
@@ -58,7 +61,8 @@ pub struct SessionCounts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SeatLimit {
     pub label: String,
-    pub account: String,
+    /// The account's display name (`Ctx::account_name`).
+    pub account_name: String,
     pub week_used: Option<f64>,
     pub runs_out_at: Option<DateTime<Utc>>,
     pub resets_at: Option<DateTime<Utc>>,
@@ -70,17 +74,8 @@ pub fn path(data_dir: &Path) -> PathBuf {
 
 /// Atomic write, readable by the user only.
 pub fn write(path: &Path, f: &Fleet) -> std::io::Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(f).unwrap_or_default())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    }
-    std::fs::rename(&tmp, path)
+    let bytes = serde_json::to_vec(f)?;
+    crate::fsutil::atomic_write(path, &bytes, crate::fsutil::Mode::Private)
 }
 
 /// The summary when it is younger than `fresh_seconds` and its writer still runs.

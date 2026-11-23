@@ -128,7 +128,10 @@ mod tests {
             // An older owner of the first day's session (owners only label requests that have no
             // account; the snapshot does not see it).
             idx.conn
-                .execute("INSERT INTO owners VALUES ('work', 's00', -5, 'acc-z')", [])
+                .execute(
+                    "INSERT INTO owners VALUES (?1, 's00', -5, 'acc-z')",
+                    [w.id("work")],
+                )
                 .unwrap();
             let r = compact(&w, &mut idx, keep, None);
             assert!(r.done && r.waiting.is_none(), "{r:?}");
@@ -643,6 +646,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(label, acc, since)| SeatInfo {
+            seat: Default::default(),
             label: label.into(),
             account: Some(account(acc, since)),
             utilization: None,
@@ -695,7 +699,8 @@ mod tests {
             count(
                 &done,
                 &format!(
-                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = 'work' AND account_uuid = '{acc}' AND first_ts >= {switch}"
+                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = '{}' AND account_uuid = '{acc}' AND first_ts >= {switch}",
+                    w.id("work")
                 ),
             )
         };
@@ -704,7 +709,8 @@ mod tests {
             count(
                 &done,
                 &format!(
-                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = 'work' AND account_uuid = 'acc-b' AND first_ts < {switch}"
+                    "SELECT COUNT(*) FROM usage_rollup WHERE seat = '{}' AND account_uuid = 'acc-b' AND first_ts < {switch}",
+                    w.id("work")
                 )
             ),
             0,
@@ -874,9 +880,12 @@ mod tests {
             Err(VacuumSkip::Done)
         );
         assert_same(&before, &snapshot(&w, &idx), "after the VACUUM");
-        // From now on a compaction gives its pages back to the file system.
+        // From now on a compaction gives its pages back to the file system: none stay free in
+        // the file (without auto-vacuum they did, above). Whether the file ends up smaller
+        // depends on how the rollups it added fill their pages, which varies with the seat ids
+        // (hashes of the temp dirs), so the freelist is what is checked.
         let r = compact(&w, &mut idx, 8, None);
-        assert!(r.chunks > 0 && r.freed_bytes > 0, "{r:?}");
+        assert!(r.chunks > 0, "{r:?}");
         assert_eq!(idx.file_stats().unwrap().free_pages, 0);
     }
 }

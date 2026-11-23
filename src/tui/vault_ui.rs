@@ -1,10 +1,10 @@
-//! The vault, operated inside the MANA · SEATS panel: seats first, then the logins parked in the
+//! The vault, operated inside the LIMITS · SEATS panel: seats first, then the logins parked in the
 //! vault. Enter on a seat opens a picker of logins sorted by limit left (the best one first);
 //! Enter on a parked login picks its seat. `S` puts the best login into the selected seat.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
-use super::app::{App, ManaRow, Panel, Tone};
+use super::app::{App, LimitsRow, Panel, Tone};
 use crate::vault::{Login, Vault};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,14 +79,24 @@ impl App {
         }
     }
 
+    /// Live sessions in the seat labelled `seat` (labels are unique within one run).
     fn live_in(&self, seat: &str) -> usize {
-        self.live.iter().filter(|l| l.seat == seat).count()
+        let Some(id) = self
+            .analytics
+            .seats
+            .iter()
+            .find(|s| s.label == seat)
+            .map(|s| &s.id)
+        else {
+            return 0;
+        };
+        self.live.iter().filter(|l| &l.seat == id).count()
     }
 
     /// Limit used by a login's account: the larger of the 5-hour and weekly estimates (unknown
     /// sorts last).
     pub fn login_pressure(&self, l: &Login) -> f64 {
-        let (five, week, _) = self.mana_of(l.account_uuid.as_deref());
+        let (five, week, _) = self.limits_of(l.account_uuid.as_deref());
         match (five, week) {
             (None, None) => 1_000.0,
             (f, w) => f.unwrap_or(0.0).max(w.unwrap_or(0.0)),
@@ -106,8 +116,8 @@ impl App {
         v.into_iter().map(|l| l.label.clone()).collect()
     }
 
-    fn selected_row(&self) -> Option<ManaRow> {
-        self.mana_rows().get(self.cur(Panel::Mana)).cloned()
+    fn selected_row(&self) -> Option<LimitsRow> {
+        self.limits_rows().get(self.cur(Panel::Limits)).cloned()
     }
 
     /// Asks for confirmation (always naming what is saved first), then switches.
@@ -211,7 +221,7 @@ impl App {
         self.request_analytics();
     }
 
-    /// Keys of the MANA · SEATS panel and of its dialogs. Returns true when the key was used.
+    /// Keys of the LIMITS · SEATS panel and of its dialogs. Returns true when the key was used.
     pub fn vault_key(&mut self, k: KeyEvent) -> bool {
         if !self.vault.loaded {
             self.vault_reload();
@@ -243,18 +253,18 @@ impl App {
             }
             return true;
         }
-        let rows = self.mana_rows();
-        let cur = self.cur(Panel::Mana).min(rows.len().saturating_sub(1));
+        let rows = self.limits_rows();
+        let cur = self.cur(Panel::Limits).min(rows.len().saturating_sub(1));
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor
-                    .insert(Panel::Mana, (cur + 1).min(rows.len().saturating_sub(1)));
+                    .insert(Panel::Limits, (cur + 1).min(rows.len().saturating_sub(1)));
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                self.cursor.insert(Panel::Mana, cur.saturating_sub(1));
+                self.cursor.insert(Panel::Limits, cur.saturating_sub(1));
             }
             KeyCode::Enter => match self.selected_row() {
-                Some(ManaRow::Seat(seat)) => {
+                Some(LimitsRow::Seat(seat)) => {
                     let items = self.candidates_for(&seat);
                     if items.is_empty() {
                         self.toast("no free saved login (the others are in seats): c saves this seat's login, a adds one", Tone::Warn);
@@ -266,7 +276,7 @@ impl App {
                         });
                     }
                 }
-                Some(ManaRow::Login(login)) => {
+                Some(LimitsRow::Login(login)) => {
                     let items: Vec<String> = self.seats.iter().map(|s| s.label.clone()).collect();
                     self.vault.picker = Some(Picker {
                         what: PickFor::Login(login),
@@ -277,7 +287,7 @@ impl App {
                 None => {}
             },
             KeyCode::Char('S') => {
-                if let Some(ManaRow::Seat(seat)) = self.selected_row() {
+                if let Some(LimitsRow::Seat(seat)) = self.selected_row() {
                     match self.candidates_for(&seat).first().cloned() {
                         Some(best) => self.request_switch(seat, best),
                         None => self.toast("no other saved login to switch to", Tone::Warn),
@@ -285,7 +295,7 @@ impl App {
                 }
             }
             KeyCode::Char('c') => {
-                if let Some(ManaRow::Seat(s)) = self.selected_row() {
+                if let Some(LimitsRow::Seat(s)) = self.selected_row() {
                     self.vault.modal = Some(Modal::Input {
                         title: format!("Save the login of seat '{s}' as"),
                         value: s.clone(),
@@ -304,8 +314,8 @@ impl App {
             }
             KeyCode::Char('r') => {
                 let label = match self.selected_row() {
-                    Some(ManaRow::Login(l)) => Some(l),
-                    Some(ManaRow::Seat(s)) => self
+                    Some(LimitsRow::Login(l)) => Some(l),
+                    Some(LimitsRow::Seat(s)) => self
                         .analytics
                         .seats
                         .iter()
@@ -322,7 +332,7 @@ impl App {
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
-                if let Some(ManaRow::Login(label)) = self.selected_row() {
+                if let Some(LimitsRow::Login(label)) = self.selected_row() {
                     self.vault.modal = Some(Modal::Confirm {
                         text: format!(
                             "Forget the saved login '{label}'?\n\nIts tokens are deleted from the vault.\n\n[y] forget   [n] cancel"
@@ -436,13 +446,12 @@ impl App {
                 .env("CLAUDE_CONFIG_DIR", &scratch)
                 .status()
                 .map_err(|e| anyhow::anyhow!("cannot start `claude`: {e}"))?;
-            let seat = crate::claude::seats::Seat {
-                label: format!("scratch-{label}"),
-                claude_json: scratch.join(".claude.json"),
-                dir: scratch.clone(),
-                is_default: false,
-                found_by: vec![],
-            };
+            let seat = crate::claude::seats::Seat::new(
+                format!("scratch-{label}"),
+                scratch.clone(),
+                scratch.join(".claude.json"),
+                false,
+            );
             let s = crate::vault::read_seat(&seat)?;
             let secret = s
                 .secret

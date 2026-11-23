@@ -1,6 +1,10 @@
 //! Architecture checks over the source text: which top-level modules may name which, and
 //! counters that may only go down (ratchets). When a check fails because something got
 //! *better*, lower the number in `tests/arch/` — that is the point.
+#![allow(
+    clippy::unwrap_used,
+    reason = "a test binary: a failed read is a failed test"
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -38,16 +42,78 @@ fn production(text: &str) -> &str {
     }
 }
 
+/// Files that are test modules themselves, declared `#[cfg(test)] mod x;` (`src/vault/tests.rs`,
+/// `src/index/scenarios.rs`, …): none of their text is production code (review M1).
+fn test_only_files(files: &[(PathBuf, String)]) -> BTreeSet<PathBuf> {
+    let mut out = BTreeSet::new();
+    for (p, text) in files {
+        // `a/mod.rs` and `lib.rs` declare children in their own dir, `a/b.rs` in `a/b/`.
+        let dir = match p.file_name().and_then(|n| n.to_str()) {
+            Some("mod.rs" | "lib.rs" | "main.rs") => p.parent().unwrap().to_path_buf(),
+            _ => p.with_extension(""),
+        };
+        let mut lines = text.lines().map(str::trim);
+        while let Some(l) = lines.next() {
+            if l != "#[cfg(test)]" {
+                continue;
+            }
+            let Some(next) = lines.next() else { break };
+            let decl = next
+                .trim_start_matches("pub(crate) ")
+                .trim_start_matches("pub(super) ")
+                .trim_start_matches("pub ");
+            if let Some(name) = decl.strip_prefix("mod ").and_then(|r| r.strip_suffix(';')) {
+                out.insert(dir.join(format!("{name}.rs")));
+                out.insert(dir.join(name).join("mod.rs"));
+            }
+        }
+    }
+    out
+}
+
 fn files() -> (PathBuf, Vec<(PathBuf, String)>) {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut v = Vec::new();
     src_files(&root, &mut v);
     v.sort();
-    let texts = v.into_iter().map(|p| {
-        let t = std::fs::read_to_string(&p).unwrap();
-        (p, t)
+    let all: Vec<(PathBuf, String)> = v
+        .into_iter()
+        .map(|p| {
+            let t = std::fs::read_to_string(&p).unwrap();
+            (p, t)
+        })
+        .collect();
+    // Test-only files count as empty production code.
+    let tests = test_only_files(&all);
+    let texts = all.into_iter().map(|(p, t)| {
+        if tests.contains(&p) {
+            (p, String::new())
+        } else {
+            (p, t)
+        }
     });
     (root.clone(), texts.collect())
+}
+
+#[test]
+fn test_modules_are_not_production_code() {
+    let (root, files) = files();
+    let empty = |rel: &str| {
+        files
+            .iter()
+            .find(|(p, _)| p == &root.join(rel))
+            .is_some_and(|(_, t)| t.is_empty())
+    };
+    for f in [
+        "vault/tests.rs",
+        "index/scenarios.rs",
+        "index/archive_scenarios.rs",
+        "index/compact_scenarios.rs",
+        "index/seat_scenarios.rs",
+    ] {
+        assert!(empty(f), "{f} is a test module");
+    }
+    assert!(!empty("vault/mod.rs"));
 }
 
 fn read_list(name: &str) -> BTreeSet<String> {
@@ -179,4 +245,66 @@ fn sql_stays_in_the_index() {
         .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
         .collect();
     assert!(found.is_empty(), "SQL outside src/index/: {found:?}");
+}
+
+/// One way to replace a file (review M8): `fsutil::atomic_write`. A rename elsewhere is a second
+/// implementation with weaker guarantees. `config.rs` moves the old program's dirs over once.
+#[test]
+fn renames_only_in_fsutil() {
+    let (root, files) = files();
+    let found: Vec<String> = files
+        .iter()
+        .filter(|(p, _)| !p.ends_with("fsutil.rs") && !p.ends_with("config.rs"))
+        .filter(|(_, t)| production(t).contains("fs::rename("))
+        .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
+    assert!(found.is_empty(), "rename outside src/fsutil.rs: {found:?}");
+}
+
+/// One name per concept (first review L1): the screen says "limits", so does the code. Only the
+/// one-time move from the old program's dirs (`agentmana`) may say the old word.
+#[test]
+fn limits_are_never_called_mana() {
+    let (root, files) = files();
+    let found: Vec<String> = files
+        .iter()
+        .filter(|(_, t)| {
+            // `mana`, `mana_x`, `Mana`, `ManaRow`; not `manage` or `manager`.
+            let t = t.replace("agentmana", "");
+            ["mana", "Mana", "MANA"].iter().any(|w| {
+                t.match_indices(w).any(|(i, _)| {
+                    !t[i + w.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase())
+                })
+            })
+        })
+        .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
+    assert!(found.is_empty(), "\"mana\" in {found:?}");
+}
+
+/// Short ids come from `core::ids::short` / `SessionId::short` (review M10): a byte slice like
+/// `[..8]` panics on a short or multi-byte id.
+#[test]
+fn short_ids_are_never_sliced() {
+    let (root, files) = files();
+    let found: Vec<String> = files
+        .iter()
+        .filter(|(_, t)| {
+            // Digests (fixed-size arrays) may be sliced; ids read from files may not.
+            [
+                "[..8.min(",
+                ".min(8)]",
+                "_id[..",
+                "uuid[..",
+                "fingerprint[..",
+            ]
+            .iter()
+            .any(|p| t.contains(p))
+        })
+        .map(|(p, _)| p.strip_prefix(&root).unwrap().display().to_string())
+        .collect();
+    assert!(found.is_empty(), "id slicing in {found:?}");
 }

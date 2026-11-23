@@ -44,12 +44,20 @@ logins. Users run it in a spare terminal, mostly on laptops.
   map a level to their colour), `current_window`, `runs_out`, `projection_at_reset`, `was_reset`, and `window_of`, the window in force (a reset by hand moves its start; `limits`, the dashboard and `report --period week` all use it). Readings of one window are named by their reset to the minute; a fall counts as a reset only when it holds across sources (`effective_start`).
   Every surface reads an account's limit from `Ctx::latest_readings` (index + seats, newest wins)
   through `limits::all_reports`; the `limit_threshold_copies` ratchet keeps copies out.
+- Identities are newtypes in `src/core/ids.rs`: `SeatId` (the first 16 hex digits of the SHA-256
+  of the seat's canonical config dir), `SessionId` (`short()` for display, never `[..8]`),
+  `AccountId`. Every `seat` column, the vault (`mounted`, `seats`), the status-line files and
+  `fleet.json` hold the `SeatId`; a seat's label is display only (the index's `seats` table names
+  ids for reports). Stores written by an older swarmy keyed seats by label: the index lists them
+  as legacy rows of `seats` (`FACTS_VERSION` 2) and the vault as `mounted_label`/`legacy_seats`
+  (`logins.json` `v` 2); both move to the id the first time a seat with that label is seen
+  (`index::seats`, `vault::logins`), nothing is dropped.
 - The index schema (`src/index/schema.rs`) has raw tables (requests, tool calls, … dropped and
   read again from transcripts when `CACHE_VERSION` changes), dimension tables that label them and
   outlive Claude Code's 30-day transcript retention (`sessions`, `agents`, `projects`,
   `cost_states`: kept across a bump, merged into on a re-read), archive tables (quarter-hour
   rollups of raw rows that are gone, `ARCHIVE_VERSION`, never dropped), and fact tables that
-  nothing else records (`seat_accounts`, `accounts`, `readings`, `observed_prices`: migrated by
+  nothing else records (`seat_accounts`, `accounts`, `readings`, `observed_prices`, `seats`: migrated by
   `FACTS_VERSION` steps, never dropped). A new table goes into exactly one list; data rules are `CHECK`s, enum
   lists generated from the Rust enums.
   `cost` is NULL until priced (`priced` NULL) or when no price is known (`priced = 0`).
@@ -97,7 +105,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - Status line (optional, `swarmy setup`): Claude Code runs `statusLine.command` after each response
   with a JSON on stdin; `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at (epoch s)}`
   are exact. `swarmy statusline` must stay fast (no index, no scan): it writes
-  `<data>/statusline/<sha256(config dir)[..16]>.json` and prints one line. The dashboard merges
+  `<data>/statusline/<seat id>.json` (`SeatId`) and prints one line. The dashboard merges
   these readings when newer than `.claude.json`'s. `setup` writes only `settings.json` (backup
   first, never over an older backup) and only after a yes. The status line reads the dashboard's
   `statusline/fleet.json` (`src/fleet.rs`; fresh while < `fresh_seconds` and its writer pid runs)
@@ -145,7 +153,9 @@ Words on screen (keep them, and the legend in `view/help.rs::legend_lines`, in s
   "1% ≈ $X". Never "mana" or "pt" on screen.
 - Trends say what they compare with ("▲▼ vs previous 7d", "vs day before").
 - Every new glyph, unit or colour gets a legend line; the footer keeps "? help & legend" visible.
-- `--mask` blanks emails and the OS user name in the finished frame (`mask_user`).
+- `--mask` hides by type at render time (`ui::mask`): emails, login labels made from an email's
+  local part (`alice`, `alice-2`), and, in the finished frame, those local parts and the OS user
+  name wherever they were drawn (`mask_word`).
 
 Style rules the owner asked for:
 - Panel titles and in-panel section headings sit on a plate (`Theme::heading()`, the

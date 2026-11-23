@@ -1,14 +1,14 @@
 //! The vault's files: the exclusive lock, the secrets file, safe writes and bounded backups.
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use crate::fsutil::{self, Mode};
 
 /// Secrets by login id: the verbatim `claudeAiOauth` objects.
 pub type Secrets = BTreeMap<String, Value>;
@@ -25,61 +25,11 @@ pub fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
     }
 }
 
-/// Temp-file names are unique per process and per call, so two threads never share one.
-static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-fn temp_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let dir = path.parent().context("path without a parent")?;
-    let name = path
-        .file_name()
-        .context("path without a file name")?
-        .to_string_lossy();
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(dir.join(format!(".{name}.swarmy-{}-{seq}.tmp", std::process::id())))
-}
-
-/// Creates a new temp file next to `path` holding `bytes`, fsynced, mode 0600 on Unix.
-fn write_temp(path: &Path, bytes: &[u8]) -> anyhow::Result<PathBuf> {
-    let tmp = temp_path(path)?;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let written = opts.open(&tmp).and_then(|mut f| {
-        f.write_all(bytes)?;
-        f.sync_all()
-    });
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e).with_context(|| format!("cannot write {}", tmp.display()));
-    }
-    Ok(tmp)
-}
-
-/// Renames the temp file over the target and fsyncs the directory.
-fn commit_temp(tmp: &Path, path: &Path) -> anyhow::Result<()> {
-    if let Err(e) = std::fs::rename(tmp, path) {
-        let _ = std::fs::remove_file(tmp);
-        return Err(e).with_context(|| format!("cannot replace {}", path.display()));
-    }
-    // Best effort: the rename is already visible; this only makes it durable sooner.
-    #[cfg(unix)]
-    if let Some(dir) = path.parent()
-        && let Ok(d) = std::fs::File::open(dir)
-    {
-        let _ = d.sync_all();
-    }
-    Ok(())
-}
-
-/// Writes through a temporary file in the same directory, fsyncs, and renames over the target, so
-/// a crash leaves either the old or the new file, never half of one. Mode 0600 on Unix.
+/// Writes through a unique temp file, fsyncs it and the directory, mode 0600 on Unix
+/// (`fsutil::atomic_write`, the one implementation).
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let tmp = write_temp(path, bytes)?;
-    commit_temp(&tmp, path)
+    fsutil::atomic_write(path, bytes, Mode::Private)
+        .with_context(|| format!("cannot write {}", path.display()))
 }
 
 /// What identifies one version of a file: another writer's rename or rewrite changes it.
@@ -115,13 +65,17 @@ pub fn rewrite_merging(
         let Some(text) = read_optional(path)? else {
             return Ok(false);
         };
-        let tmp = write_temp(path, change(&text)?.as_bytes())?;
+        let staged = fsutil::stage(path, change(&text)?.as_bytes(), Mode::Private)
+            .with_context(|| format!("cannot write next to {}", path.display()))?;
         // The last attempt writes anyway: the window between this check and the rename is tiny.
         if stamp(path) == before || attempt == ATTEMPTS {
-            commit_temp(&tmp, path)?;
+            staged
+                .commit(path)
+                .with_context(|| format!("cannot replace {}", path.display()))?;
             return Ok(true);
         }
-        std::fs::remove_file(&tmp).with_context(|| format!("cannot remove {}", tmp.display()))?;
+        // Dropped: the temp file is removed, and the next attempt starts from the newer text.
+        drop(staged);
     }
     Ok(false)
 }
@@ -215,7 +169,7 @@ impl Lock {
                     std::thread::sleep(Duration::from_millis(5));
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
-                    bail!("another swarmy is changing the vault (still busy after {timeout:?})")
+                    return Err(crate::errors::VaultError::Locked(timeout).into());
                 }
                 Err(std::fs::TryLockError::Error(e)) => {
                     return Err(e).with_context(|| format!("cannot lock {}", path.display()));

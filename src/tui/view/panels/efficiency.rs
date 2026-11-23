@@ -388,7 +388,7 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
                     dim(app),
                 ),
                 Span::styled(
-                    format!("  ×{:.1}", win.cost_in_window / week_price.max(1e-9)),
+                    format!("  ×{:.1}", win.cost_in_window.get() / week_price.max(1e-9)),
                     th.bold(th.good),
                 ),
             ]));
@@ -423,7 +423,9 @@ pub fn efficiency(f: &mut Frame, app: &mut App, area: Rect) {
     let mut pages: Vec<Vec<Vec<Line<'static>>>> = vec![vec![Vec::new(); ncols]];
     for mut sec in sections {
         sec.truncate(height);
-        let page = pages.last_mut().unwrap();
+        let Some(page) = pages.last_mut() else {
+            break;
+        };
         let fits = |c: &Vec<Line>| c.len() + sec.len() + usize::from(!c.is_empty()) <= height;
         match (0..ncols)
             .filter(|i| fits(&page[*i]))

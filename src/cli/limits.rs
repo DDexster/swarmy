@@ -5,6 +5,7 @@ use chrono::Local;
 
 use crate::app::context::Ctx;
 use crate::core::limits::Share;
+use crate::core::units::{Pct, Usd};
 use crate::limits::{WindowReport, all_reports};
 use crate::ui::fmt;
 use crate::ui::style::Tone;
@@ -61,7 +62,7 @@ pub fn run(ctx: &Ctx, format: Format, top: usize) -> anyhow::Result<()> {
 fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
     let p = &ctx.painter;
     let r = &w.reading;
-    let shown = w.estimate_now;
+    let shown = w.estimate_now.get();
     let tone = Tone::of_utilization(shown);
     let label = format!("{:<13}", r.kind.label());
     let main = if w.reset_passed {
@@ -116,7 +117,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
             (ctx.now + d).with_timezone(&Local).format("%a %H:%M"),
             fmt::duration(d)
         )),
-        None if w.burn_usd_per_hour > 0.0 => burn.push_str(" · lasts until reset"),
+        None if w.burn_usd_per_hour > Usd::ZERO => burn.push_str(" · lasts until reset"),
         None => {}
     }
     println!(
@@ -148,7 +149,7 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
         );
     }
     if let (Some(v), Some(o)) = (w.visible_points, w.outside_points)
-        && o >= 2.0
+        && o >= Pct::new(2.0)
     {
         println!(
             "{pad}{}",
@@ -185,18 +186,21 @@ fn print_window(ctx: &Ctx, w: &WindowReport, top: usize) {
         let rest: Vec<&Share> = w.shares.iter().skip(top).collect();
         t.row(vec![
             Cell::tone(format!("… {} more", rest.len()), Tone::Dim),
-            Cell::tone(fmt::money(rest.iter().map(|s| s.cost).sum()), Tone::Dim),
+            Cell::tone(
+                fmt::money(rest.iter().map(|s| s.cost).sum::<Usd>()),
+                Tone::Dim,
+            ),
             Cell::new(""),
             Cell::tone(
                 format!(
                     "≈{:.1} pts",
-                    rest.iter().map(|s| s.limit_points).sum::<f64>()
+                    rest.iter().map(|s| s.limit_points).sum::<Pct>()
                 ),
                 Tone::Dim,
             ),
         ]);
     }
-    if let Some(o) = w.outside_points.filter(|o| *o >= 2.0) {
+    if let Some(o) = w.outside_points.filter(|o| *o >= Pct::new(2.0)) {
         t.row(vec![
             Cell::tone("(elsewhere)", Tone::Warn),
             Cell::tone("?", Tone::Dim),

@@ -15,6 +15,7 @@ use serde::Serialize;
 use crate::app::context::Ctx;
 use crate::core::limits::{self, Level, Reading, Share, WindowInputs, WindowKind};
 use crate::core::period::Span;
+use crate::core::units::{Pct, Usd, UsdPerPct};
 use crate::index::Index;
 use crate::index::query::{Dim, Filter};
 
@@ -26,29 +27,31 @@ pub struct WindowReport {
     /// When the limit was reset by hand inside this window (Claude Code's limit reset).
     pub manual_reset: Option<chrono::DateTime<chrono::Utc>>,
     /// USD per point measured on this account alone.
-    pub own_usd_per_point: Option<f64>,
+    pub own_usd_per_point: Option<UsdPerPct>,
     /// USD per point used for the estimates (own, or the tier reference).
-    pub usd_per_point: Option<f64>,
+    pub usd_per_point: Option<UsdPerPct>,
     /// The account whose ratio served as the reference, when not this one.
     pub reference: Option<String>,
-    pub cost_in_window: f64,
-    pub estimate_now: f64,
+    pub cost_in_window: Usd,
+    pub estimate_now: Pct,
     /// ≈ points explained by spend visible on this machine.
-    pub visible_points: Option<f64>,
+    pub visible_points: Option<Pct>,
     /// ≈ points from claude.ai, the desktop app, other computers…
-    pub outside_points: Option<f64>,
-    pub burn_usd_per_hour: f64,
-    pub points_per_hour: Option<f64>,
+    pub outside_points: Option<Pct>,
+    /// Dollars per hour.
+    pub burn_usd_per_hour: Usd,
+    /// Points per hour.
+    pub points_per_hour: Option<Pct>,
     #[serde(skip)]
     pub eta: Option<Duration>,
     pub eta_seconds: Option<i64>,
     pub shares: Vec<Share>,
     /// ≈ API-equivalent dollars of a full window.
-    pub window_usd: Option<f64>,
+    pub window_usd: Option<Usd>,
     /// Estimated utilization through the window: cumulative spend, scaled to end at
     /// `estimate_now`; one point per `curve_step` from `window.start`.
     #[serde(skip)]
-    pub curve: Vec<f64>,
+    pub curve: Vec<Pct>,
     #[serde(skip)]
     pub curve_step: Duration,
     /// Utilization readings inside the window (what Claude Code really fetched).
@@ -59,17 +62,18 @@ pub struct WindowReport {
 impl WindowReport {
     /// How full the window is now (by the estimate).
     pub fn level(&self) -> Level {
-        Level::of(self.estimate_now)
+        Level::of(self.estimate_now.get())
     }
 
     /// Utilization at the reset at the current pace (see `core::limits::projection_at_reset`).
-    pub fn projection_at_reset(&self, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+    pub fn projection_at_reset(&self, now: chrono::DateTime<chrono::Utc>) -> Option<Pct> {
         limits::projection_at_reset(
-            self.estimate_now,
-            self.points_per_hour,
+            self.estimate_now.get(),
+            self.points_per_hour.map(Pct::get),
             now,
             self.window.end,
         )
+        .map(Pct::new)
     }
 }
 
@@ -94,7 +98,7 @@ fn load_window(
     history: &[Reading],
 ) -> anyhow::Result<(WindowInputs, Marks)> {
     let filter = Filter {
-        account: Some(account.to_string()),
+        account: Some(crate::core::ids::AccountId::new(account)),
         ..Default::default()
     };
     let now_end = ctx.now + Duration::seconds(1);
@@ -106,17 +110,20 @@ fn load_window(
     let window = place.window;
     let mut points = Vec::new();
     for (span, utilization) in limits::calibration_points(history, r) {
-        points.push((utilization, idx.settled_total(account, span, ctx.now)?));
+        let spent = Usd::new(idx.settled_total(account, span, ctx.now)?);
+        points.push((Pct::new(utilization), spent));
     }
     let (_, since) = limits::counting_from(r, &place);
-    let spent_since = idx.total(until_now(since), &filter)?.cost;
-    let cost_in_window = idx.total(until_now(window.start), &filter)?.cost;
-    let cost_burn = idx
-        .total(
+    // The index sums dollars as numbers; they become `Usd` here, at the edge of the rules.
+    let spent_since = Usd::new(idx.total(until_now(since), &filter)?.cost);
+    let cost_in_window = Usd::new(idx.total(until_now(window.start), &filter)?.cost);
+    let cost_burn = Usd::new(
+        idx.total(
             until_now(ctx.now - Duration::minutes(limits::BURN_MINUTES)),
             &filter,
         )?
-        .cost;
+        .cost,
+    );
     let by_project = idx
         .spend_by(Dim::Project, until_now(window.start), &filter)?
         .into_iter()
@@ -127,7 +134,7 @@ fn load_window(
                 } else {
                     row.label
                 },
-                row.cost,
+                Usd::new(row.cost),
             )
         })
         .collect();
@@ -135,7 +142,11 @@ fn load_window(
         (Vec::new(), Duration::hours(1), Vec::new())
     } else {
         let step = limits::curve_step(window);
-        let series = idx.spend_series(until_now(window.start), step.num_minutes(), &filter)?;
+        let series = idx
+            .spend_series(until_now(window.start), step.num_minutes(), &filter)?
+            .into_iter()
+            .map(Usd::new)
+            .collect();
         let marks = history
             .iter()
             .filter(|x| x.fetched_at >= window.start && x.fetched_at <= ctx.now)
@@ -159,7 +170,7 @@ fn load_window(
 
 /// The best own ratio per plan tier and window kind: the account with the least hidden usage.
 pub struct Reference {
-    pub usd_per_point: f64,
+    pub usd_per_point: UsdPerPct,
     pub account: String,
 }
 
@@ -283,7 +294,8 @@ mod tests {
     use crate::index::scenarios::{World, account, assistant, at, owner, weekly};
     use crate::ui::style::{ColorChoice, Painter};
 
-    fn close(a: f64, b: f64) -> bool {
+    fn close(a: impl Into<f64>, b: impl Into<f64>) -> bool {
+        let (a, b): (f64, f64) = (a.into(), b.into());
         (a - b).abs() < 1e-9
     }
 
@@ -305,6 +317,7 @@ mod tests {
             now: at(now),
             login_labels: Default::default(),
             login_tiers: Default::default(),
+            problems: Vec::new(),
         }
     }
 
@@ -317,6 +330,7 @@ mod tests {
         let w = World::new(&["work"]);
         let resets = "2026-11-24T00:00:00Z";
         let seat = |used: f64, fetched: &str| SeatInfo {
+            seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
             utilization: Some(weekly("acc-a", fetched, used, resets)),
@@ -381,6 +395,7 @@ mod tests {
         );
         let resets = "2026-11-24T00:00:00Z";
         let seat = |used: f64, fetched: &str| SeatInfo {
+            seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
             utilization: Some(weekly("acc-a", fetched, used, resets)),
@@ -460,6 +475,7 @@ mod tests {
         );
         let resets = "2026-11-24T00:00:00Z";
         let seat = |used: f64, fetched: &str| SeatInfo {
+            seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
             utilization: Some(weekly("acc-a", fetched, used, resets)),
@@ -523,6 +539,7 @@ mod tests {
         let w = World::new(&["work"]);
         let resets = "2026-11-24T00:00:00Z";
         let seat = |used: f64, fetched: &str| SeatInfo {
+            seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
             utilization: Some(weekly("acc-a", fetched, used, resets)),
@@ -543,13 +560,123 @@ mod tests {
         );
         let limits_window = all_reports(&ctx, &idx).unwrap()[0].windows[0].window;
         assert_eq!(limits_window.start, at("2026-11-19T00:00:00Z"));
-        for account in [Some("acc-a"), None] {
-            let week = ctx.limit_week(&idx, account).unwrap().unwrap();
+        for account in [Some("acc-a".into()), None] {
+            let week = ctx.limit_week(&idx, account.as_ref()).unwrap().unwrap();
             assert_eq!(week.start, limits_window.start, "{account:?}");
             assert_eq!(week.end, ctx.now + Duration::seconds(1));
         }
         let span = crate::core::period::Period::LimitWeek
             .span(ctx.now, ctx.limit_week(&idx, None).unwrap());
         assert_eq!(span.start, at("2026-11-19T00:00:00Z"));
+    }
+
+    /// Review H7: `--account` takes a uuid, an email or a saved login's label and resolves it once,
+    /// so `report --account <email> --period week` counts the same window and spend as the uuid.
+    /// A name that fits two accounts is an error listing both; an unknown one says what to give.
+    #[test]
+    fn an_account_named_any_way_gives_the_same_week_and_totals() {
+        let w = World::new(&["work", "home"]);
+        let resets = "2026-11-24T00:00:00Z";
+        let acct = |uuid: &str, email: &str| crate::claude::config_json::Account {
+            email: Some(email.into()),
+            ..account(uuid, "2026-11-01T00:00:00Z")
+        };
+        let infos = |used: f64, fetched: &str| {
+            vec![
+                SeatInfo {
+                    seat: w.id("work"),
+                    label: "work".into(),
+                    account: Some(acct("acc-a", "a@example.com")),
+                    utilization: Some(weekly("acc-a", fetched, used, resets)),
+                },
+                SeatInfo {
+                    seat: w.id("home"),
+                    label: "home".into(),
+                    account: Some(acct("acc-b", "b@example.com")),
+                    utilization: Some(weekly("acc-b", fetched, 10.0, resets)),
+                },
+            ]
+        };
+        let m = "claude-sonnet-5-5";
+        w.append(
+            "work",
+            "s1",
+            &[
+                owner("acc-a"),
+                assistant(
+                    "q1",
+                    "2026-11-18T12:00:00Z",
+                    m,
+                    "/w/shop",
+                    (1_000_000, 0),
+                    &[],
+                ),
+                assistant(
+                    "q2",
+                    "2026-11-19T12:00:00Z",
+                    m,
+                    "/w/shop",
+                    (1_000_000, 0),
+                    &[],
+                ),
+            ],
+        );
+        let mut idx = w.index("i.sqlite");
+        let book = PriceBook::builtin();
+        for (used, fetched) in [
+            (70.0, "2026-11-19T00:00:00Z"),
+            (3.0, "2026-11-19T02:00:00Z"),
+        ] {
+            w.refresh(&mut idx, &infos(used, fetched), &book);
+        }
+        let mut ctx = ctx_of(
+            &w,
+            infos(3.0, "2026-11-19T02:00:00Z"),
+            "2026-11-20T12:00:00Z",
+        );
+        // A saved login names acc-a too.
+        {
+            let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir()).unwrap();
+            let secret = crate::claude::credentials::Secret::new(
+                serde_json::json!({"accessToken": "a", "refreshToken": "r-a"}),
+            );
+            v.edit(|tx| {
+                tx.put(
+                    &secret,
+                    None,
+                    Some(&acct("acc-a", "a@example.com")),
+                    Some("main"),
+                    None,
+                )
+            })
+            .unwrap();
+        }
+        let span_and_total = |name: &str| {
+            let id = ctx.resolve_account(&idx, name).unwrap();
+            let week = ctx.limit_week(&idx, Some(&id)).unwrap();
+            let span = crate::core::period::Period::LimitWeek.span(ctx.now, week);
+            let f = Filter {
+                account: Some(id.clone()),
+                ..Default::default()
+            };
+            (id, span, idx.total(span, &f).unwrap().cost)
+        };
+        let by_uuid = span_and_total("acc-a");
+        assert_eq!(by_uuid.0.as_str(), "acc-a");
+        // The window in force starts at the reset by hand (11-19 00:00): only q2, 1M input at
+        // Sonnet 5.5's $2 per MTok = $2.
+        assert_eq!(by_uuid.1.start, at("2026-11-19T00:00:00Z"));
+        assert!(close(by_uuid.2, 2.0), "{}", by_uuid.2);
+        for name in ["a@example.com", "A@Example.com", "main", " acc-a "] {
+            assert_eq!(span_and_total(name), by_uuid, "{name}");
+        }
+        // One name, two accounts: an error that lists both.
+        ctx.config.accounts.insert("acc-b".into(), "main".into());
+        let e = ctx.resolve_account(&idx, "main").unwrap_err();
+        assert_eq!(crate::errors::code_of(&e), Some("ambiguous-account"));
+        let msg = e.to_string();
+        assert!(msg.contains("(acc-a)") && msg.contains("(acc-b)"), "{msg}");
+        let e = ctx.resolve_account(&idx, "nobody@example.com").unwrap_err();
+        assert_eq!(crate::errors::code_of(&e), Some("no-account"));
     }
 }

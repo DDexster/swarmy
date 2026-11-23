@@ -29,6 +29,10 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             )
         );
     }
+    // What could not be read: numbers below may be off because of it.
+    for problem in &ctx.problems {
+        println!("{}", warn(problem));
+    }
     let mut t = Table::new(&[
         ("SEAT", Align::Left),
         ("DIR", Align::Left),
@@ -39,7 +43,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     ]);
     t.flex_col = 1;
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let live = registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs);
+        let live = registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs);
         let acct = si
             .account
             .as_ref()
@@ -128,7 +132,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     println!("{}", p.paint("LIVE SESSIONS", Tone::Header));
     let mut any = false;
     for s in &ctx.seats {
-        for l in registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs) {
+        for l in registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs) {
             any = true;
             let (st, tone) = match &l.status {
                 SessionStatus::Busy => ("busy".to_string(), Tone::Good),
@@ -141,7 +145,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 p.paint("●", tone),
                 l.name
                     .clone()
-                    .unwrap_or_else(|| l.session_id[..8].to_string()),
+                    .unwrap_or_else(|| l.session_id.short().to_string()),
                 s.label,
                 p.paint(&st, tone),
                 p.paint(
@@ -495,6 +499,7 @@ mod tests {
             now: at(NOW),
             login_labels: Default::default(),
             login_tiers: Default::default(),
+            problems: Vec::new(),
         };
         let text = |idx: &mut Index| storage(&ctx, idx).unwrap().join("\n");
         let before = text(&mut idx);

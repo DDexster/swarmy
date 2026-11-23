@@ -21,6 +21,9 @@ pub mod query;
 #[cfg(test)]
 pub(crate) mod scenarios;
 pub mod schema;
+#[cfg(test)]
+mod seat_scenarios;
+pub(crate) mod seats;
 pub mod storage;
 mod write;
 
@@ -36,7 +39,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::claude::config_json::{Account, Utilization};
 use crate::claude::files::{self, FileKind, TranscriptFile};
 use crate::claude::project::Resolver;
-use crate::claude::seats::Seat;
+use crate::claude::seats::{Seat, SeatId};
 use crate::claude::transcript;
 use crate::core::pricing::PriceBook;
 
@@ -50,11 +53,13 @@ pub struct Index {
     conn: Connection,
     /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
     /// again only when a file was added to it.
-    session_dirs: HashMap<(String, String), ListedDirs>,
+    session_dirs: HashMap<(SeatId, String), ListedDirs>,
     /// The last price book dated by `dated_prices`, by the fingerprint of the undated one.
     dated: Option<(String, PriceBook)>,
     /// Settled spend already summed (`query::settled_total`).
     settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
+    /// The seats (id, label) last named in the `seats` table (`seats::adopt_seats`).
+    adopted: Option<Vec<(SeatId, String)>>,
 }
 
 /// A settled total: (settled generation, price fingerprint, account, span start, span end).
@@ -109,9 +114,40 @@ type ListedDirs = (
     Vec<TranscriptFile>,
 );
 
+// Seat ids are stored as their text (`core` knows nothing of SQLite).
+impl rusqlite::ToSql for SeatId {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::Borrowed(
+            rusqlite::types::ValueRef::Text(self.as_str().as_bytes()),
+        ))
+    }
+}
+
+impl rusqlite::types::FromSql for SeatId {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        String::column_result(v).map(SeatId::from_stored)
+    }
+}
+
+impl rusqlite::ToSql for crate::core::ids::SessionId {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        Ok(rusqlite::types::ToSqlOutput::Borrowed(
+            rusqlite::types::ValueRef::Text(self.as_str().as_bytes()),
+        ))
+    }
+}
+
+impl rusqlite::types::FromSql for crate::core::ids::SessionId {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        String::column_result(v).map(crate::core::ids::SessionId::new)
+    }
+}
+
 /// What `.claude.json` of a seat says right now.
 #[derive(Debug, Clone, Default)]
 pub struct SeatInfo {
+    pub seat: SeatId,
+    /// For display only.
     pub label: String,
     pub account: Option<Account>,
     pub utilization: Option<Utilization>,
@@ -203,6 +239,7 @@ impl Index {
             session_dirs: HashMap::new(),
             dated: None,
             settled: Default::default(),
+            adopted: None,
         })
     }
 
@@ -232,7 +269,7 @@ impl Index {
     pub fn refresh_hot(
         &mut self,
         seats: &[Seat],
-        live: &[(String, String)],
+        live: &[(SeatId, String)],
         seat_info: &[SeatInfo],
         resolver: &mut Resolver,
         prices: &PriceBook,
@@ -261,8 +298,8 @@ impl Index {
                 out.push(r?);
             }
         }
-        for (seat_label, sid) in live {
-            let Some(seat) = seats.iter().find(|s| &s.label == seat_label) else {
+        for (seat_id, sid) in live {
+            let Some(seat) = seats.iter().find(|s| &s.id == seat_id) else {
                 continue;
             };
             out.extend(self.session_files(seat, sid));
@@ -275,7 +312,7 @@ impl Index {
 
     /// The files of a live session, listed again only when one of its dirs changed.
     fn session_files(&mut self, seat: &Seat, sid: &str) -> Vec<TranscriptFile> {
-        let key = (seat.label.clone(), sid.to_string());
+        let key = (seat.id.clone(), sid.to_string());
         let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         if let Some((dirs, cached)) = self.session_dirs.get(&key)
             && !dirs.is_empty()
@@ -322,6 +359,8 @@ impl Index {
     ) -> anyhow::Result<RefreshStats> {
         let started = Instant::now();
         let files_total = all.len();
+        // Rows an older swarmy keyed by label move to their seat's id before anything is written.
+        self.adopt_seats(seats)?;
         let work = self.plan(&all, seats)?;
         let from_start = work.iter().any(|w| w.start == 0);
         let mut stats = self.ingest(work, seat_info, resolver, prices, progress)?;
@@ -537,7 +576,7 @@ impl Index {
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(account_uuid) DO UPDATE SET email = excluded.email, display_name = excluded.display_name,
                        org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at",
-                    params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.label, now],
+                    params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now],
                 )?;
             }
             if let Some(u) = &si.utilization {
@@ -565,7 +604,7 @@ impl Index {
         }
         // What each seat has logged in now, with the time the seat itself recorded it. A change of
         // account re-attributes the seat's requests from that moment on.
-        let mut reattribute: Vec<(String, i64)> = Vec::new();
+        let mut reattribute: Vec<(SeatId, i64)> = Vec::new();
         for si in seat_info {
             let Some(a) = &si.account else { continue };
             let mut events: Vec<(i64, &str)> = Vec::new();
@@ -583,7 +622,7 @@ impl Index {
                 let before: Option<String> = tx
                     .query_row(
                         "SELECT account_uuid FROM seat_accounts WHERE seat = ?1 AND ts <= ?2 ORDER BY ts DESC LIMIT 1",
-                        params![si.label, ts],
+                        params![si.seat, ts],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -594,10 +633,10 @@ impl Index {
                 let added = tx.execute(
                     "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)
                      ON CONFLICT(seat, ts) DO NOTHING",
-                    params![si.label, ts, acc],
+                    params![si.seat, ts, acc],
                 )?;
                 if added > 0 {
-                    reattribute.push((si.label.clone(), ts));
+                    reattribute.push((si.seat.clone(), ts));
                 }
             }
         }
@@ -644,7 +683,7 @@ impl Index {
         // Transcripts written before Claude Code recorded owners: the seat's current account.
         for si in seat_info {
             if let Some(a) = &si.account {
-                tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.label])?;
+                tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.seat])?;
             }
         }
         // Projects of new working directories; a new rule revision recomputes every cwd, raw or

@@ -15,7 +15,8 @@ fn group(int: u64) -> String {
 }
 
 /// `$1,234.56`; small amounts keep a meaningful digit: `$0.042`.
-pub fn money(x: f64) -> String {
+pub fn money(x: impl Into<f64>) -> String {
+    let x: f64 = x.into();
     if !x.is_finite() {
         return "-".into();
     }
@@ -33,7 +34,8 @@ pub fn money(x: f64) -> String {
 }
 
 /// Money for the dashboard: cents only below $1,000 (`$8,675`, `$12.40`).
-pub fn usd(x: f64) -> String {
+pub fn usd(x: impl Into<f64>) -> String {
+    let x: f64 = x.into();
     if x.is_finite() && x.abs() >= 1000.0 {
         let neg = x < 0.0;
         format!(
@@ -89,7 +91,8 @@ pub fn clock(d: Duration) -> String {
     }
 }
 
-pub fn pct(x: f64) -> String {
+pub fn pct(x: impl Into<f64>) -> String {
+    let x: f64 = x.into();
     if x >= 9.95 || x == 0.0 {
         format!("{x:.0}%")
     } else {

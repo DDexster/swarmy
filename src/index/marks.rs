@@ -14,12 +14,12 @@ use rusqlite::Connection;
 
 use super::compact::canonical;
 use crate::claude::files::TranscriptFile;
-use crate::claude::seats::Seat;
+use crate::claude::seats::{Seat, SeatId};
 
 /// The seats a compaction ran over, for one refresh.
 pub(super) struct Marks {
-    /// Labels of the seats whose config dir is in `rollup_seats`.
-    rolled_seats: HashSet<String>,
+    /// The seats whose config dir is in `rollup_seats`.
+    rolled_seats: HashSet<SeatId>,
 }
 
 impl Marks {
@@ -34,7 +34,7 @@ impl Marks {
             seats
                 .iter()
                 .filter(|s| dirs.contains(&canonical(&s.dir)))
-                .map(|s| s.label.clone())
+                .map(|s| s.id.clone())
                 .collect()
         };
         Ok(Marks { rolled_seats })
@@ -81,10 +81,10 @@ mod tests {
     use crate::claude::files::FileKind;
     use crate::index::schema;
 
-    fn file(seat: &str, session: &str) -> TranscriptFile {
+    fn file(seat: &Seat, session: &str) -> TranscriptFile {
         TranscriptFile {
             path: format!("/x/{session}.jsonl").into(),
-            seat: seat.into(),
+            seat: seat.id.clone(),
             session_id: session.into(),
             agent_id: String::new(),
             kind: FileKind::Main,
@@ -94,15 +94,13 @@ mod tests {
     #[test]
     fn the_rule() {
         let t = tempfile::tempdir().unwrap();
-        let seat = |label: &str| Seat {
-            label: label.into(),
-            dir: t.path().join(label),
-            claude_json: t.path().join(label).join(".claude.json"),
-            is_default: false,
-            found_by: Vec::new(),
+        std::fs::create_dir_all(t.path().join("old")).unwrap();
+        let seat = |label: &str| {
+            let dir = t.path().join(label);
+            Seat::new(label, dir.clone(), dir.join(".claude.json"), false)
         };
         let seats = [seat("old"), seat("new")];
-        std::fs::create_dir_all(&seats[0].dir).unwrap();
+        let (old, new) = (&seats[0], &seats[1]);
         let c = Connection::open_in_memory().unwrap();
         schema::migrate(&c).unwrap();
         c.execute_batch(
@@ -111,8 +109,8 @@ mod tests {
         .unwrap();
         // Nothing compacted yet: only known sessions.
         let m = Marks::load(&c, &seats).unwrap();
-        assert!(m.applies(&c, &file("new", "known"), 0).unwrap());
-        assert!(!m.applies(&c, &file("old", "fork"), 0).unwrap());
+        assert!(m.applies(&c, &file(new, "known"), 0).unwrap());
+        assert!(!m.applies(&c, &file(old, "fork"), 0).unwrap());
         c.execute(
             "INSERT INTO rollup_seats VALUES (?1, 'old')",
             [canonical(&seats[0].dir)],
@@ -120,10 +118,10 @@ mod tests {
         .unwrap();
         let m = Marks::load(&c, &seats).unwrap();
         // A known session (on any seat), a compacted seat, never past the stored offset.
-        assert!(m.applies(&c, &file("new", "known"), 0).unwrap());
-        assert!(m.applies(&c, &file("old", "fork"), 0).unwrap());
-        assert!(!m.applies(&c, &file("new", "fresh"), 0).unwrap());
-        assert!(!m.applies(&c, &file("old", "known"), 10).unwrap());
+        assert!(m.applies(&c, &file(new, "known"), 0).unwrap());
+        assert!(m.applies(&c, &file(old, "fork"), 0).unwrap());
+        assert!(!m.applies(&c, &file(new, "fresh"), 0).unwrap());
+        assert!(!m.applies(&c, &file(old, "known"), 10).unwrap());
         assert!(rolled_up(true, 100, 99));
         assert!(!rolled_up(true, 100, 100));
         assert!(!rolled_up(false, 100, 99));

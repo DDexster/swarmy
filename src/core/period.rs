@@ -109,7 +109,7 @@ impl Span {
 
 /// The UTC instant of the local midnight that starts day `d` (a quarter hour in every zone).
 pub fn local_midnight(d: NaiveDate) -> DateTime<Utc> {
-    let naive = d.and_hms_opt(0, 0, 0).unwrap();
+    let naive = d.and_time(chrono::NaiveTime::MIN);
     Local
         .from_local_datetime(&naive)
         .earliest()
@@ -148,7 +148,7 @@ impl Period {
                 end,
             },
             Period::Month => Span {
-                start: local_midnight(today.with_day(1).unwrap()),
+                start: local_midnight(today - chrono::Duration::days(i64::from(today.day0()))),
                 end,
             },
             Period::LimitWeek => limit_week.unwrap_or(Span {

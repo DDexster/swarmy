@@ -1,0 +1,231 @@
+//! The one way swarmy replaces a file: [`atomic_write`] (review L5/M8). The vault, `swarmy setup`
+//! (Claude Code's `settings.json`), the fleet summary and the status-line files all go through
+//! it, so every write has the same guarantee: a crash leaves the old file or the new one, never
+//! half of one, and two writers (two threads, two processes) never share a temp file.
+
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The permissions of the new file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// 0600 on Unix: the vault, swarmy's own state, Claude Code's credentials.
+    Private,
+    /// The mode of the file being replaced (0644 under the usual umask for a new one): files
+    /// that belong to someone else, such as Claude Code's `settings.json`.
+    KeepExisting,
+}
+
+/// Temp-file names are unique per process, per thread and per call.
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `.<name>.swarmy-<pid>-<thread>-<seq>.tmp` next to `path`.
+fn temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    let invalid = |what: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{what}: {}", path.display()),
+        )
+    };
+    let dir = path
+        .parent()
+        .ok_or_else(|| invalid("path without a parent"))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| invalid("path without a file name"))?
+        .to_string_lossy();
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    // `ThreadId`'s Debug is `ThreadId(N)`; keep the digits.
+    let thread: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect();
+    Ok(dir.join(format!(
+        ".{name}.swarmy-{}-{thread}-{seq}.tmp",
+        std::process::id()
+    )))
+}
+
+/// A temp file written and fsynced next to its target, not yet visible under the target's name.
+/// Dropped without [`Staged::commit`], it is removed.
+#[derive(Debug)]
+pub struct Staged {
+    tmp: PathBuf,
+    committed: bool,
+}
+
+/// Writes `bytes` to a new temp file next to `path` and fsyncs it.
+pub fn stage(path: &Path, bytes: &[u8], mode: Mode) -> std::io::Result<Staged> {
+    let tmp = temp_path(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if mode == Mode::Private {
+            opts.mode(0o600);
+        }
+    }
+    let staged = Staged {
+        tmp,
+        committed: false,
+    };
+    let mut f = opts.open(&staged.tmp)?;
+    if mode == Mode::KeepExisting
+        && let Ok(m) = std::fs::metadata(path)
+    {
+        f.set_permissions(m.permissions())?;
+    }
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(staged)
+}
+
+impl Staged {
+    pub fn path(&self) -> &Path {
+        &self.tmp
+    }
+
+    /// Renames the temp file over `path` and fsyncs the directory, so the new name survives a
+    /// crash too.
+    pub fn commit(mut self, path: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.tmp, path)?;
+        self.committed = true;
+        sync_dir(path)
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.committed {
+            // Nothing to do when it is already gone; any other failure leaves a stray temp file
+            // that names its writer.
+            if let Err(e) = std::fs::remove_file(&self.tmp)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::diag::log(
+                    "fsutil",
+                    &format!("cannot remove {}: {e}", self.tmp.display()),
+                );
+            }
+        }
+    }
+}
+
+/// Fsyncs the directory holding `path` (Unix; elsewhere the rename is all there is).
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        let dir = if dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            dir
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Writes through a unique temp file in the same directory, fsyncs it, renames it over `path`
+/// and fsyncs the directory. Creates the parent directory when it is missing.
+pub fn atomic_write(path: &Path, bytes: &[u8], mode: Mode) -> std::io::Result<()> {
+    if let Some(d) = path.parent()
+        && !d.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(d)?;
+    }
+    stage(path, bytes, mode)?.commit(path)
+}
+
+/// Moves a file or directory to `to` (same file system), refusing to replace anything there:
+/// swarmy's own data moving to a new place (the vault's per-seat backups, keyed by seat id now).
+pub fn move_into_place(from: &Path, to: &Path) -> std::io::Result<()> {
+    if to.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} exists", to.display()),
+        ));
+    }
+    std::fs::rename(from, to)?;
+    sync_dir(to)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn replaces_the_file_and_leaves_no_temp() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("sub/state.json");
+        atomic_write(&p, b"one", Mode::Private).unwrap();
+        atomic_write(&p, b"two", Mode::Private).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "two");
+        assert!(leftovers(&t.path().join("sub")).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn modes() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let private = t.path().join("secret.json");
+        atomic_write(&private, b"x", Mode::Private).unwrap();
+        assert_eq!(mode(&private), 0o600);
+        // Someone else's file keeps its mode.
+        let theirs = t.path().join("settings.json");
+        std::fs::write(&theirs, "{}").unwrap();
+        std::fs::set_permissions(&theirs, std::fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write(&theirs, b"{\"a\":1}", Mode::KeepExisting).unwrap();
+        assert_eq!(mode(&theirs), 0o640);
+    }
+
+    #[test]
+    fn temp_names_are_unique_across_threads() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("fleet.json");
+        let names: Vec<PathBuf> = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..8).map(|_| s.spawn(|| temp_path(&p).unwrap())).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let unique: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len());
+        // Concurrent writers: every write lands whole, the last rename wins, no temp is left.
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let p = &p;
+                s.spawn(move || {
+                    for _ in 0..20 {
+                        atomic_write(p, format!("writer {i}").as_bytes(), Mode::Private).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(std::fs::read_to_string(&p).unwrap().starts_with("writer "));
+        assert!(leftovers(t.path()).is_empty());
+    }
+
+    #[test]
+    fn a_staged_file_dropped_is_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("x.json");
+        let s = stage(&p, b"x", Mode::Private).unwrap();
+        assert!(s.path().exists());
+        drop(s);
+        assert!(leftovers(t.path()).is_empty());
+        assert!(!p.exists());
+    }
+}

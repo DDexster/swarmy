@@ -379,6 +379,7 @@ mod tests {
             now: at(NOW),
             login_labels: Default::default(),
             login_tiers: Default::default(),
+            problems: Vec::new(),
         }
     }
 

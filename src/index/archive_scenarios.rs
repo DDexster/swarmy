@@ -326,16 +326,19 @@ mod tests {
         let info = |work: &str, since: &str| {
             vec![
                 SeatInfo {
+                    seat: Default::default(),
                     label: "work".into(),
                     account: Some(account(work, since)),
                     utilization: None,
                 },
                 SeatInfo {
+                    seat: Default::default(),
                     label: "home".into(),
                     account: Some(account("acc-b", "2026-09-01T00:00:00Z")),
                     utilization: None,
                 },
                 SeatInfo {
+                    seat: Default::default(),
                     label: "lab".into(),
                     account: Some(account("acc-a", "2026-09-01T00:00:00Z")),
                     utilization: None,
@@ -405,6 +408,7 @@ mod tests {
             now: at(NOW),
             login_labels: Default::default(),
             login_tiers: Default::default(),
+            problems: Vec::new(),
         }
     }
 
@@ -450,7 +454,7 @@ mod tests {
                 ..Default::default()
             },
             Filter {
-                seat: Some("home".into()),
+                seat: Some(w.id("home")),
                 ..Default::default()
             },
             Filter {
@@ -519,22 +523,32 @@ mod tests {
         );
         // Limits: the windows in force and the calibration over older windows.
         let reports = crate::limits::all_reports(&ctx(w), idx).unwrap();
-        let curves: Vec<Vec<f64>> = reports
+        let curves: Vec<Vec<crate::core::units::Pct>> = reports
             .iter()
             .flat_map(|r| r.windows.iter().map(|x| x.curve.clone()))
             .collect();
         out.insert("limits".into(), v(&reports));
         out.insert("limit_curves".into(), v(curves));
         // Live totals over every agent's and session's lifetime.
-        let agents: Vec<(String, String, String)> = {
+        let agents: Vec<(
+            crate::core::ids::SeatId,
+            crate::core::ids::SessionId,
+            String,
+        )> = {
             let mut st = idx
                 .conn
                 .prepare("SELECT seat, session_id, agent_id FROM agents ORDER BY 1, 2, 3")
                 .unwrap();
-            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-                .unwrap()
-                .collect::<Result<_, _>>()
-                .unwrap()
+            st.query_map([], |r| {
+                Ok((
+                    r.get::<_, crate::core::ids::SeatId>(0)?,
+                    r.get::<_, crate::core::ids::SessionId>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
         };
         let mut live = serde_json::Map::new();
         for (seat, session, agent) in &agents {
@@ -830,10 +844,7 @@ mod tests {
         let mut idx = w.index("i.sqlite");
         w.refresh(&mut idx, &[], &PriceBook::builtin());
         let keys = |live: &[(&str, &str)]| -> Vec<String> {
-            let live = live
-                .iter()
-                .map(|(a, b)| (a.to_string(), b.to_string()))
-                .collect();
+            let live = live.iter().map(|(a, b)| (w.id(a), (*b).into())).collect();
             idx.live_agent_rows(
                 at("2026-11-10T11:30:00Z"),
                 at("2026-11-09T12:00:00Z"),

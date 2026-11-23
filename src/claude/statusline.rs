@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::claude::config_json::Utilization;
+use crate::core::ids::SeatId;
 use crate::core::limits::{Level, Reading, WindowKind};
 
 /// What `swarmy statusline` keeps of one call.
@@ -117,14 +117,15 @@ impl Window {
     }
 }
 
-/// The file a seat's readings go to: named by a hash of its config dir, so `swarmy statusline`
-/// needs nothing but `CLAUDE_CONFIG_DIR` to find it.
+/// The file a seat's readings go to: named by its seat id (a hash of its config dir), so
+/// `swarmy statusline` needs nothing but `CLAUDE_CONFIG_DIR` to find it.
 pub fn file_for(data_dir: &Path, config_dir: &Path) -> PathBuf {
-    let canon = std::fs::canonicalize(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
-    let h = Sha256::digest(canon.to_string_lossy().as_bytes());
-    data_dir
-        .join("statusline")
-        .join(format!("{}.json", &hex::encode(h)[..16]))
+    file_of(data_dir, &crate::claude::seats::seat_id(config_dir))
+}
+
+/// The status-line file of a seat id.
+pub fn file_of(data_dir: &Path, seat: &SeatId) -> PathBuf {
+    data_dir.join("statusline").join(format!("{seat}.json"))
 }
 
 /// The config dir of the Claude Code that runs us: `CLAUDE_CONFIG_DIR`, else `~/.claude`.
@@ -155,15 +156,11 @@ pub fn live_from(input: &Input, config_dir: &Path, at: DateTime<Utc>) -> Option<
     })
 }
 
-/// Writes atomically (a temp file renamed over the old one); errors are ignored by the caller,
-/// a status line must never fail.
+/// Writes atomically (`fsutil::atomic_write`); errors are ignored by the caller, a status line
+/// must never fail.
 pub fn write(path: &Path, live: &LiveLimits) -> std::io::Result<()> {
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, serde_json::to_vec(live).unwrap_or_default())?;
-    std::fs::rename(&tmp, path)
+    let bytes = serde_json::to_vec(live)?;
+    crate::fsutil::atomic_write(path, &bytes, crate::fsutil::Mode::Private)
 }
 
 pub fn read(path: &Path) -> Option<LiveLimits> {
@@ -229,7 +226,7 @@ pub struct Extra {
     /// (session id, name, what, tmux).
     pub waiting: Vec<(String, String, String, Option<String>)>,
     /// This seat's key in the fleet summary.
-    pub seat_key: String,
+    pub seat_key: SeatId,
     pub mask: bool,
     pub color: bool,
     pub segments: Vec<String>,
@@ -338,7 +335,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                     Some(f) => f
                         .needs_you
                         .iter()
-                        .filter(|n| n.session_id != me)
+                        .filter(|n| n.session_id.as_str() != me)
                         .map(|n| (n.name.clone(), n.what.clone(), n.tmux.clone()))
                         .collect(),
                     None => x
@@ -388,7 +385,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 let Some(sc) = x
                     .fleet
                     .as_ref()
-                    .and_then(|f| f.sessions.get(&me))
+                    .and_then(|f| f.sessions.get(me.as_str()))
                     .filter(|s| s.agents > 0)
                 else {
                     continue;
@@ -531,7 +528,7 @@ pub fn render(input: &Input, x: &Extra, now: DateTime<Utc>) -> String {
                 let Some(b) = x
                     .fleet
                     .as_ref()
-                    .and_then(|f| f.sessions.get(&me))
+                    .and_then(|f| f.sessions.get(me.as_str()))
                     .map(|s| s.burn_usd_h)
                     .filter(|b| *b > 0.0)
                 else {
@@ -681,8 +678,12 @@ pub fn run(
             o.five_hour != live.five_hour
                 || o.seven_day != live.seven_day
                 || (now - o.at).num_minutes() >= 5
-        }) {
-            let _ = write(&file, &live);
+        }) && let Err(e) = write(&file, &live)
+        {
+            crate::diag::log(
+                "statusline",
+                &format!("cannot write {}: {e}", file.display()),
+            );
         }
     }
     let fleet = crate::fleet::read_fresh(&crate::fleet::path(&dirs.data), conf.fresh_seconds, now);
@@ -707,7 +708,7 @@ pub fn run(
             .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
             .map(|w| {
                 (
-                    w.session_id.clone(),
+                    w.session_id.to_string(),
                     w.label(),
                     w.what.clone(),
                     w.tmux.clone(),
@@ -715,10 +716,7 @@ pub fn run(
             })
             .collect()
     };
-    let seat_key = file
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let seat_key = crate::claude::seats::seat_id(&dir);
     let columns: usize = std::env::var("COLUMNS")
         .ok()
         .and_then(|c| c.parse().ok())
@@ -835,7 +833,7 @@ mod tests {
         Extra {
             fleet,
             waiting: Vec::new(),
-            seat_key: "seat1".into(),
+            seat_key: SeatId::from_stored("0123456789abcdef"),
             mask: false,
             color: false,
             segments: crate::config::StatuslineConf::default().segments,
@@ -882,7 +880,7 @@ mod tests {
             },
         );
         f.seats.insert(
-            "seat1".into(),
+            SeatId::from_stored("0123456789abcdef"),
             SeatLimit {
                 runs_out_at: Some(now + chrono::Duration::hours(7)),
                 resets_at: Some(now + chrono::Duration::days(3)),

@@ -18,7 +18,7 @@ pub use attention::attention;
 pub use burn::burn;
 pub use efficiency::efficiency;
 pub use history::history;
-pub use limits::mana;
+pub use limits::limits_seats;
 pub use models::models;
 pub use projects::projects;
 pub use swarm::swarm;

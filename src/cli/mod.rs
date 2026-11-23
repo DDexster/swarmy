@@ -110,10 +110,11 @@ pub enum Format {
 
 #[derive(Args, Debug, Clone)]
 pub struct FilterArgs {
-    /// Only this account (uuid or email).
+    /// Only this account: its uuid, its email or a saved login's label (resolved once; a name
+    /// that fits several accounts is an error that lists them).
     #[arg(long)]
     pub account: Option<String>,
-    /// Only this seat (config dir label).
+    /// Only this seat (its label, or its id from `swarmy doctor`).
     #[arg(long)]
     pub seat: Option<String>,
     /// Only this project (name or path).
@@ -125,13 +126,27 @@ pub struct FilterArgs {
 }
 
 impl FilterArgs {
-    pub fn to_filter(&self) -> Filter {
-        Filter {
-            account: self.account.clone(),
-            seat: self.seat.clone(),
+    /// The filter with what was typed resolved once, here at the edge: a seat label to its id,
+    /// an account uuid, email or login label to the account (review H7).
+    pub fn to_filter(
+        &self,
+        ctx: &crate::app::context::Ctx,
+        idx: &crate::index::Index,
+    ) -> anyhow::Result<Filter> {
+        let seat = match &self.seat {
+            Some(s) => Some(ctx.resolve_seat(s)?.id.clone()),
+            None => None,
+        };
+        let account = match &self.account {
+            Some(a) => Some(ctx.resolve_account(idx, a)?),
+            None => None,
+        };
+        Ok(Filter {
+            account,
+            seat,
             project: self.project.clone(),
             model: self.model.clone(),
-        }
+        })
     }
 }
 
@@ -174,7 +189,12 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Some(Command::Statusline { then }) => {
             // Runs after every model response: no index, no scanning, just record and print.
             let dirs = crate::config::Dirs::resolve()?;
-            let config = crate::config::Config::load(&dirs).unwrap_or_default();
+            // A status line must never fail: a bad config.toml falls back to the defaults, and
+            // says so on the debug channel (`swarmy doctor` reports it too).
+            let config = crate::config::Config::load(&dirs).unwrap_or_else(|e| {
+                crate::diag::log("config", &format!("{e:#}"));
+                crate::config::Config::default()
+            });
             crate::claude::statusline::run(&dirs, &config.statusline, then.as_deref())
         }
         Some(Command::Man) => {
@@ -208,7 +228,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                 v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
             }
             // Account names come from the saved logins just made.
-            ctx.drop_unconfirmed();
+            ctx.check_unconfirmed();
             match record {
                 Some(out) => {
                     let (w, h) = size
@@ -269,7 +289,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 /// it runs, else straight from the session registries.
 fn jump(list: bool) -> anyhow::Result<()> {
     let dirs = crate::config::Dirs::resolve()?;
-    let config = crate::config::Config::load(&dirs).unwrap_or_default();
+    let config = crate::config::Config::load(&dirs)?;
     let now = chrono::Utc::now();
     // (name, what, tmux)
     let waiting: Vec<(String, String, Option<String>)> = match crate::fleet::read_fresh(

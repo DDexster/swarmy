@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+pub use crate::core::ids::SeatId;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Seat {
-    /// Short name: `default` for `~/.claude`, `work` for `~/.claude-work`, else the dir name.
+    /// The seat's identity, from its canonical dir: what the index and the vault store.
+    pub id: SeatId,
+    /// Short name for display only: `default` for `~/.claude`, `work` for `~/.claude-work`, else
+    /// the dir name, or the `label` of `config.toml`; may change between runs.
     pub label: String,
     pub dir: PathBuf,
     /// `~/.claude.json` for the default dir, `<dir>/.claude.json` for the others.
@@ -21,7 +26,31 @@ pub struct Seat {
     pub found_by: Vec<&'static str>,
 }
 
+/// The id of a config dir: [`SeatId::of_canonical_dir`] of its canonical path (the path as
+/// given when it cannot be resolved, e.g. a dir that is gone).
+pub fn seat_id(dir: &Path) -> SeatId {
+    let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    SeatId::of_canonical_dir(&canon)
+}
+
 impl Seat {
+    /// A seat of `dir`, its id derived from the path.
+    pub fn new(
+        label: impl Into<String>,
+        dir: PathBuf,
+        claude_json: PathBuf,
+        is_default: bool,
+    ) -> Seat {
+        Seat {
+            id: seat_id(&dir),
+            label: label.into(),
+            dir,
+            claude_json,
+            is_default,
+            found_by: Vec::new(),
+        }
+    }
+
     pub fn projects_dir(&self) -> PathBuf {
         self.dir.join("projects")
     }
@@ -141,6 +170,8 @@ pub fn discover(c: &Candidates) -> Vec<Seat> {
                 }
             });
             Seat {
+                // `dir` is canonical already (the key of `found`).
+                id: SeatId::of_canonical_dir(&dir),
                 label,
                 dir,
                 claude_json,
@@ -149,7 +180,7 @@ pub fn discover(c: &Candidates) -> Vec<Seat> {
             }
         })
         .collect();
-    // Default first, then by label; labels made unique.
+    // Default first, then by label; labels made unique (for display: ids never change).
     seats.sort_by(|a, b| b.is_default.cmp(&a.is_default).then(a.label.cmp(&b.label)));
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     for s in &mut seats {
@@ -209,6 +240,55 @@ mod tests {
             None,
             "below Claude Code's minimum"
         );
+    }
+
+    /// Review H3: a seat's id comes from its dir, never from its label. Discovering again with
+    /// another dir of the same name (which takes the label and pushes this one to `work-2`) or
+    /// with a `label` in config.toml changes no id.
+    #[test]
+    fn ids_survive_relabelling() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path();
+        for d in [
+            ".claude-work/projects",
+            "zz/claude-work/projects",
+            "aa/.claude-work/projects",
+        ] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let ids = |seats: &[Seat]| -> BTreeMap<PathBuf, (SeatId, String)> {
+            seats
+                .iter()
+                .map(|s| (s.dir.clone(), (s.id.clone(), s.label.clone())))
+                .collect()
+        };
+        let first = discover(&Candidates {
+            home,
+            env_dirs: vec![home.join("zz/claude-work")],
+            configured: vec![],
+        });
+        let before = ids(&first);
+        assert_eq!(first.len(), 2);
+        let second = discover(&Candidates {
+            home,
+            env_dirs: vec![home.join("zz/claude-work"), home.join("aa/.claude-work")],
+            configured: vec![(home.join(".claude-work"), Some("job".into()))],
+        });
+        let after = ids(&second);
+        assert_eq!(second.len(), 3);
+        let mut relabelled = 0;
+        for (dir, (id, label)) in &before {
+            let (id2, label2) = &after[dir];
+            assert_eq!(id, id2, "{} keeps its id", dir.display());
+            relabelled += usize::from(label != label2);
+            assert_eq!(*id, seat_id(dir));
+        }
+        assert!(
+            relabelled >= 1,
+            "the labels did move: {before:?} → {after:?}"
+        );
+        let unique: std::collections::BTreeSet<_> = after.values().map(|v| &v.0).collect();
+        assert_eq!(unique.len(), 3);
     }
 
     #[test]

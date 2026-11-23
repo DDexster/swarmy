@@ -166,7 +166,7 @@ impl App {
             }
             KeyCode::Char('T') => {
                 self.theme = self.theme.next();
-                self.toast(format!("theme: {}", self.theme.name), Tone::Info);
+                self.toast(format!("theme: {}", self.theme.name.as_str()), Tone::Info);
             }
             KeyCode::Char('L') => {
                 self.layout = match self.layout {
@@ -238,7 +238,7 @@ impl App {
                     self.focus_panel(Panel::Agent);
                 }
             }
-            Panel::Mana => {
+            Panel::Limits => {
                 self.vault_key(k);
             }
             Panel::Attention if k.code == KeyCode::Enter => {
@@ -369,7 +369,10 @@ impl App {
                 }
                 Err(e) => self.toast(e, Tone::Bad),
             },
-            ["theme", t] => self.theme = Theme::named(Some(t)),
+            ["theme", t] => match t.parse() {
+                Ok(name) => self.theme = Theme::named(Some(name)),
+                Err(e) => self.toast(e, Tone::Bad),
+            },
             ["layout", l] => {
                 self.layout = match *l {
                     "wall" => LayoutMode::Wall,

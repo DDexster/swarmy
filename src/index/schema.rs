@@ -14,7 +14,9 @@
 //!
 //! **Fact tables** hold what swarmy observed over time and nothing else records: which account
 //! each seat had logged in and since when (`seat_accounts`), the accounts seen (`accounts`), limit
-//! readings (`readings`), and the dates Claude Code's prices were first seen (`observed_prices`).
+//! readings (`readings`), the dates Claude Code's prices were first seen (`observed_prices`), and
+//! the label and dir last seen for each seat id (`seats`; every `seat` column holds a seat id,
+//! `index::seats`).
 //! They are never dropped; `FACTS_VERSION` steps migrate them.
 //!
 //! The rules of the data are constraints in the schema, so every write path is checked, and the
@@ -37,7 +39,7 @@ pub const CACHE_VERSION: &str = "6";
 const DIMENSIONS_SINCE: u32 = 6;
 
 /// Version of the fact tables; each step up has a migration in `migrate_facts`.
-pub const FACTS_VERSION: u32 = 1;
+pub const FACTS_VERSION: u32 = 2;
 
 /// Read from the transcripts row by row: dropped and read again when `CACHE_VERSION` changes.
 pub const RAW_TABLES: &[&str] = &[
@@ -78,6 +80,7 @@ pub const FACT_TABLES: &[&str] = &[
     "accounts",
     "readings",
     "observed_prices",
+    "seats",
 ];
 
 /// Keys of `meta` that describe the raw tables and go with them (`projects_rev` describes
@@ -352,6 +355,16 @@ CREATE TABLE IF NOT EXISTS observed_prices (
   rates TEXT NOT NULL CHECK (json_valid(rates)),
   PRIMARY KEY (model, seen_at)
 );
+
+-- What each seat id (`core::ids::SeatId`, from the config dir) was last called, for display: a
+-- label changes nothing else. `dir` is NULL for a label an older swarmy stored in place of an id,
+-- until a seat with that label adopts its rows (`index::seats`).
+CREATE TABLE IF NOT EXISTS seats (
+  seat TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  dir TEXT,
+  seen_at INTEGER NOT NULL
+);
 "#
     )
 }
@@ -529,9 +542,11 @@ fn migrate_archive(conn: &Connection) -> anyhow::Result<()> {
         None => 0,
     };
     if version > ARCHIVE_VERSION {
-        anyhow::bail!(
-            "the index was written by a newer swarmy (archive version {version}); update swarmy"
-        );
+        return Err(crate::errors::IndexError::NewerVersion {
+            what: "archive",
+            version,
+        }
+        .into());
     }
     // 0 → 1: the rollup tables, empty; nothing is rolled up yet.
     conn.execute_batch(&super::archive::archive_sql())?;
@@ -548,9 +563,11 @@ fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
         None => 0,
     };
     if version > FACTS_VERSION {
-        anyhow::bail!(
-            "the index was written by a newer swarmy (facts version {version}); update swarmy"
-        );
+        return Err(crate::errors::IndexError::NewerVersion {
+            what: "facts",
+            version,
+        }
+        .into());
     }
     // 0 → 1: the fact tables of cache versions ≤ 5 had no constraints. Copy them into the new
     // tables, leaving out rows the new rules refuse.
@@ -583,6 +600,10 @@ fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
         };
         conn.execute_batch(&copy)?;
         conn.execute_batch(&format!("DROP TABLE {t}_v0;"))?;
+    }
+    // 1 → 2: seats are keyed by id; the labels stored so far wait in `seats` for their seat.
+    if version < 2 {
+        super::seats::list_legacy_labels(conn)?;
     }
     set_meta(conn, "facts_version", &FACTS_VERSION.to_string())?;
     Ok(())
@@ -824,6 +845,7 @@ mod tests {
              INSERT INTO accounts(account_uuid, email) VALUES ('acc-a', 'a@example.com');
              INSERT INTO readings VALUES ('acc-a', 'seven_day', 1, 40, 9);
              INSERT INTO observed_prices VALUES ('m', 1, '2026-11-01', 'work', '{}');
+             INSERT INTO seats VALUES ('0123456789abcdef', 'work', '/d', 1);
              INSERT INTO requests(msg_id, seat, session_id, agent_id, ts, model) VALUES ('m', 's', 'x', '', 1, 'm');
              UPDATE meta SET value = '0' WHERE key = 'schema_version';",
         )

@@ -15,7 +15,7 @@ use rusqlite::{Connection, TransactionBehavior, named_params, params};
 use super::archive::{self, MIN_RAW_DAYS, file_hash};
 use super::insights::command_key;
 use super::{Index, from_ms, ms, schema};
-use crate::claude::seats::Seat;
+use crate::claude::seats::{Seat, SeatId};
 use crate::core::period::{BUCKET_MS, local_midnight};
 use crate::core::pricing::PriceBook;
 use crate::core::storage::{TOOL_ROLLUP_BYTES, USAGE_ROLLUP_BYTES, raw_bytes};
@@ -203,9 +203,9 @@ impl Index {
         progress: &mut dyn FnMut(&CompactReport),
     ) -> anyhow::Result<CompactReport> {
         let book = self.dated_prices(prices, Utc::now())?;
-        let seat_dirs: Vec<(String, String)> = seats
+        let seat_dirs: Vec<(String, SeatId)> = seats
             .iter()
-            .map(|s| (canonical(&s.dir), s.label.clone()))
+            .map(|s| (canonical(&s.dir), s.id.clone()))
             .collect();
         let mut report = CompactReport {
             cutoff: cut,
@@ -243,11 +243,11 @@ impl Index {
                 owners: delete_chunk(&tx, c0, c1)?,
                 ..m
             };
-            for (dir, label) in &seat_dirs {
+            for (dir, id) in &seat_dirs {
                 tx.execute(
                     "INSERT INTO rollup_seats(seat_dir, seat) VALUES (?1, ?2)
                      ON CONFLICT(seat_dir) DO UPDATE SET seat = excluded.seat",
-                    params![dir, label],
+                    params![dir, id],
                 )?;
             }
             let until = archive::rolled_until(&tx)?.max(c1);

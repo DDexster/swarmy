@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::claude::project::Alias;
 use crate::core::pricing::{PriceBook, RateOverrides, Rates};
+use crate::errors::ConfigError;
 
 #[derive(Debug, Clone)]
 pub struct Dirs {
@@ -76,9 +77,62 @@ pub struct Config {
     pub subscription: std::collections::BTreeMap<String, f64>,
     /// Minutes without transcript activity after which an unfinished agent counts as stalled.
     pub stall_minutes: Option<u64>,
-    pub theme: Option<String>,
+    /// The dashboard's colours; a name not in [`ThemeName`] is a config error (review L3).
+    pub theme: Option<ThemeName>,
     /// How long per-request detail is kept, and the size the index may grow to.
     pub storage: StorageConf,
+}
+
+/// The dashboard's colour themes, by the name `config.toml` and `:theme` use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    #[default]
+    Ops,
+    Phosphor,
+    Amber,
+    Plain,
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 4] = [
+        ThemeName::Ops,
+        ThemeName::Phosphor,
+        ThemeName::Amber,
+        ThemeName::Plain,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThemeName::Ops => "ops",
+            ThemeName::Phosphor => "phosphor",
+            ThemeName::Amber => "amber",
+            ThemeName::Plain => "plain",
+        }
+    }
+
+    /// The theme after this one, for the key that cycles them.
+    pub fn next(self) -> ThemeName {
+        let i = Self::ALL
+            .iter()
+            .position(|t| *t == self)
+            .map_or(0, |i| i + 1);
+        Self::ALL[i % Self::ALL.len()]
+    }
+}
+
+impl std::str::FromStr for ThemeName {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<ThemeName, String> {
+        Self::ALL
+            .into_iter()
+            .find(|t| t.as_str() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = Self::ALL.iter().map(|t| t.as_str()).collect();
+                format!("unknown theme '{s}' (themes: {})", names.join(", "))
+            })
+    }
 }
 
 /// `[storage]` in config.toml (`docs/design/storage.md` §5).
@@ -131,16 +185,18 @@ pub struct PriceConf {
 impl Config {
     pub fn load(dirs: &Dirs) -> anyhow::Result<Config> {
         let p = dirs.config_file();
+        let invalid = |message: String| ConfigError::Invalid {
+            path: p.clone(),
+            message,
+        };
         match std::fs::read_to_string(&p) {
             Ok(text) => {
-                let c: Config =
-                    toml::from_str(&text).with_context(|| format!("invalid {}", p.display()))?;
-                c.validate()
-                    .map_err(|e| anyhow::anyhow!("invalid {}: {e}", p.display()))?;
+                let c: Config = toml::from_str(&text).map_err(|e| invalid(e.to_string()))?;
+                c.validate().map_err(invalid)?;
                 Ok(c)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(e).with_context(|| format!("cannot read {}", p.display())),
+            Err(source) => Err(ConfigError::Unreadable { path: p, source }.into()),
         }
     }
 
@@ -201,6 +257,39 @@ pub fn expand_home(p: &str, home: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// First review L3: a misspelt theme is an error naming the themes, not a silent default.
+    #[test]
+    fn themes_are_checked() {
+        let c: Config = toml::from_str("theme = \"amber\"").unwrap();
+        assert_eq!(c.theme, Some(ThemeName::Amber));
+        let e = toml::from_str::<Config>("theme = \"ambr\"")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ambr") && e.contains("phosphor"), "{e}");
+        assert_eq!("plain".parse::<ThemeName>(), Ok(ThemeName::Plain));
+        assert!(
+            "Ops"
+                .parse::<ThemeName>()
+                .unwrap_err()
+                .contains("ops, phosphor, amber, plain")
+        );
+        let mut t = ThemeName::default();
+        for _ in 0..ThemeName::ALL.len() {
+            t = t.next();
+        }
+        assert_eq!(t, ThemeName::Ops, "the cycle visits every theme");
+        // Loaded from a file, the error names the file and has a code.
+        let d = tempfile::tempdir().unwrap();
+        let dirs = Dirs {
+            data: d.path().join("data"),
+            config: d.path().to_path_buf(),
+            home: d.path().to_path_buf(),
+        };
+        std::fs::write(dirs.config_file(), "theme = \"ambr\"\n").unwrap();
+        let e = Config::load(&dirs).unwrap_err();
+        assert_eq!(crate::errors::code_of(&e), Some("config-invalid"));
+    }
 
     #[test]
     fn parses_a_full_config() {

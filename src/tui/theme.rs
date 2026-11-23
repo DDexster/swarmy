@@ -2,13 +2,14 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::config::ThemeName;
 use crate::core::limits::Level;
 use crate::core::models::Family;
 use crate::live::State;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
-    pub name: &'static str,
+    pub name: ThemeName,
     pub bg: Color,
     pub fg: Color,
     pub dim: Color,
@@ -38,7 +39,7 @@ pub struct Theme {
 }
 
 const OPS: Theme = Theme {
-    name: "ops",
+    name: ThemeName::Ops,
     bg: Color::Rgb(10, 13, 18),
     fg: Color::Rgb(205, 214, 224),
     dim: Color::Rgb(140, 150, 164),
@@ -63,7 +64,7 @@ const OPS: Theme = Theme {
 };
 
 const PHOSPHOR: Theme = Theme {
-    name: "phosphor",
+    name: ThemeName::Phosphor,
     bg: Color::Rgb(2, 10, 4),
     fg: Color::Rgb(120, 255, 140),
     dim: Color::Rgb(40, 140, 60),
@@ -88,7 +89,7 @@ const PHOSPHOR: Theme = Theme {
 };
 
 const AMBER: Theme = Theme {
-    name: "amber",
+    name: ThemeName::Amber,
     bg: Color::Rgb(12, 8, 2),
     fg: Color::Rgb(255, 190, 90),
     dim: Color::Rgb(160, 110, 40),
@@ -113,7 +114,7 @@ const AMBER: Theme = Theme {
 };
 
 const PLAIN: Theme = Theme {
-    name: "plain",
+    name: ThemeName::Plain,
     bg: Color::Reset,
     fg: Color::Reset,
     dim: Color::DarkGray,
@@ -137,21 +138,18 @@ const PLAIN: Theme = Theme {
     animate: false,
 };
 
-pub const NAMES: [&str; 4] = ["ops", "phosphor", "amber", "plain"];
-
 impl Theme {
-    pub fn named(name: Option<&str>) -> Theme {
-        match name.unwrap_or("ops") {
-            "phosphor" => PHOSPHOR,
-            "amber" => AMBER,
-            "plain" => PLAIN,
-            _ => OPS,
+    pub fn named(name: Option<ThemeName>) -> Theme {
+        match name.unwrap_or_default() {
+            ThemeName::Ops => OPS,
+            ThemeName::Phosphor => PHOSPHOR,
+            ThemeName::Amber => AMBER,
+            ThemeName::Plain => PLAIN,
         }
     }
 
     pub fn next(self) -> Theme {
-        let i = NAMES.iter().position(|n| *n == self.name).unwrap_or(0);
-        Theme::named(Some(NAMES[(i + 1) % NAMES.len()]))
+        Theme::named(Some(self.name.next()))
     }
 
     pub fn base(&self) -> Style {

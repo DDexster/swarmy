@@ -126,11 +126,7 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         Span::styled(fit("where", kw), faint(app)),
         Span::styled(a.project.clone(), th.bold(th.dir)),
         Span::styled(
-            format!(
-                " · {} · {}",
-                a.seat,
-                &a.session_id[..8.min(a.session_id.len())]
-            ),
+            format!(" · {} · {}", a.seat_label, a.session_id.short()),
             Style::new().fg(th.fg),
         ),
     ]));

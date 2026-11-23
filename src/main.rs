@@ -12,7 +12,10 @@ fn main() {
         }) {
             std::process::exit(0);
         }
-        eprintln!("swarmy: {e:#}");
+        match swarmy::errors::code_of(&e) {
+            Some(code) => eprintln!("swarmy: {e:#} [{code}]"),
+            None => eprintln!("swarmy: {e:#}"),
+        }
         std::process::exit(1);
     }
 }

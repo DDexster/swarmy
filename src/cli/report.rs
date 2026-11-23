@@ -11,10 +11,10 @@ use crate::app::context::Ctx;
 
 pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
-    let filter = a.filter.to_filter();
+    let filter = a.filter.to_filter(ctx, &idx)?;
     let span = a
         .period
-        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_deref())?);
+        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_ref())?);
     let mut rows = idx.spend_by(a.by, span, &filter)?;
     let total = idx.total(span, &filter)?;
     if a.by == Dim::Account {
@@ -94,7 +94,7 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
             ),
             Tone::Dim
         ),
-        p.paint(&filter_label(&filter), Tone::Dim)
+        p.paint(&filter_label(ctx, &filter), Tone::Dim)
     );
     println!();
     if rows.is_empty() {
@@ -209,13 +209,13 @@ pub fn local(t: chrono::DateTime<chrono::Utc>) -> String {
         .to_string()
 }
 
-pub fn filter_label(f: &Filter) -> String {
+pub fn filter_label(ctx: &Ctx, f: &Filter) -> String {
     let mut parts = Vec::new();
     if let Some(a) = &f.account {
         parts.push(format!("account={a}"));
     }
     if let Some(s) = &f.seat {
-        parts.push(format!("seat={s}"));
+        parts.push(format!("seat={}", ctx.seat_label(s)));
     }
     if let Some(p) = &f.project {
         parts.push(format!("project={p}"));

@@ -68,7 +68,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
     toast(f, app, area);
     if app.mask {
-        mask_user(f, area);
+        // Login labels made from an email's local part look like any word; blank them (and the
+        // OS user name) wherever they were drawn.
+        let mut words =
+            crate::ui::mask::words(app.vault.logins.iter().filter_map(|l| l.email.as_deref()));
+        words.extend(user_word().map(str::to_string));
+        for w in &words {
+            mask_word(f, area, w);
+        }
     }
 }
 
@@ -84,8 +91,7 @@ fn user_word() -> Option<&'static str> {
     .as_deref()
 }
 
-fn mask_user(f: &mut Frame, area: Rect) {
-    let Some(word) = user_word() else { return };
+fn mask_word(f: &mut Frame, area: Rect, word: &str) {
     let chars: Vec<char> = word.chars().collect();
     let n = chars.len() as u16;
     let buf = f.buffer_mut();
@@ -116,7 +122,7 @@ fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
     }
     match p {
         Panel::Swarm => panels::swarm(f, app, area),
-        Panel::Mana => panels::mana(f, app, area, big),
+        Panel::Limits => panels::limits_seats(f, app, area, big),
         Panel::Burn => panels::burn(f, app, area),
         Panel::Attention => panels::attention(f, app, area),
         Panel::Agent => panels::agent(f, app, area),
@@ -128,9 +134,9 @@ fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
     }
 }
 
-/// Rows the MANA · SEATS table needs: borders, header, one per seat and parked login, a hint.
-fn mana_height(app: &App) -> u16 {
-    app.mana_rows().len() as u16 + 4
+/// Rows the LIMITS · SEATS table needs: borders, header, one per seat and parked login, a hint.
+fn limits_height(app: &App) -> u16 {
+    app.limits_rows().len() as u16 + 4
 }
 
 /// Everything at once (from about 250×55).
@@ -139,9 +145,9 @@ fn wall(f: &mut Frame, app: &mut App, body: Rect) {
     // panel stays on screen, smaller.
     let wide = body.width >= 240;
     let band_a = if body.height >= 70 {
-        (mana_height(app) + 9).clamp(14, 21)
+        (limits_height(app) + 9).clamp(14, 21)
     } else {
-        mana_height(app).clamp(8, 14)
+        limits_height(app).clamp(8, 14)
     };
     let band_c = if wide {
         if body.height >= 75 {
@@ -157,7 +163,7 @@ fn wall(f: &mut Frame, app: &mut App, body: Rect) {
     let band_b = body.height.saturating_sub(band_a + band_c);
     let rows = vsplit_fixed(body, &[band_a, band_b, band_c]);
     let a = hsplit(rows[0], if wide { &[46, 26, 28] } else { &[50, 28, 22] });
-    draw_panel(f, app, Panel::Mana, a[0], false);
+    draw_panel(f, app, Panel::Limits, a[0], false);
     draw_panel(f, app, Panel::Attention, a[1], false);
     draw_panel(f, app, Panel::Burn, a[2], false);
     let b = hsplit(rows[1], if wide { &[64, 36] } else { &[60, 40] });
@@ -183,7 +189,7 @@ fn wall(f: &mut Frame, app: &mut App, body: Rect) {
 
 /// Narrower or shorter terminals (from about 110×40): the same panels stacked.
 fn column(f: &mut Frame, app: &mut App, body: Rect) {
-    let band_a = mana_height(app).clamp(8, 13);
+    let band_a = limits_height(app).clamp(8, 13);
     let rest = body.height.saturating_sub(band_a);
     let swarm = rest * 40 / 100;
     let agent = rest * 22 / 100;
@@ -197,7 +203,7 @@ fn column(f: &mut Frame, app: &mut App, body: Rect) {
             &[62, 38, 0]
         },
     );
-    draw_panel(f, app, Panel::Mana, a[0], false);
+    draw_panel(f, app, Panel::Limits, a[0], false);
     draw_panel(f, app, Panel::Attention, a[1], false);
     draw_panel(f, app, Panel::Burn, a[2], false);
     draw_panel(f, app, Panel::Swarm, rows[1], false);
@@ -225,11 +231,11 @@ fn tabs(f: &mut Frame, app: &mut App, body: Rect) {
     use super::app::Tab;
     match app.tab {
         Tab::Ops => {
-            let mana = mana_height(app).clamp(6, 10).min(body.height / 3);
+            let limits_h = limits_height(app).clamp(6, 10).min(body.height / 3);
             let strip = if body.height > 28 { 8 } else { 0 };
-            let swarm = body.height.saturating_sub(mana + strip);
-            let rows = vsplit_fixed(body, &[mana, swarm, strip]);
-            draw_panel(f, app, Panel::Mana, rows[0], false);
+            let swarm = body.height.saturating_sub(limits_h + strip);
+            let rows = vsplit_fixed(body, &[limits_h, swarm, strip]);
+            draw_panel(f, app, Panel::Limits, rows[0], false);
             draw_panel(f, app, Panel::Swarm, rows[1], false);
             if strip > 0 {
                 draw_panel(f, app, Panel::Attention, rows[2], false);
@@ -240,7 +246,7 @@ fn tabs(f: &mut Frame, app: &mut App, body: Rect) {
             draw_panel(f, app, Panel::Swarm, c[0], false);
             draw_panel(f, app, Panel::Agent, c[1], false);
         }
-        Tab::Mana => draw_panel(f, app, Panel::Mana, body, true),
+        Tab::Limits => draw_panel(f, app, Panel::Limits, body, true),
         Tab::Spend => {
             let c = hsplit(body, &[52, 48]);
             let l = vsplit_fixed(c[0], &[c[0].height / 2, c[0].height - c[0].height / 2]);
@@ -350,7 +356,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             r.windows
                 .iter()
                 .filter(|w| !w.reset_passed)
-                .map(|w| (r.name.clone(), w.estimate_now, w.reading.resets_at))
+                .map(|w| (r.name.clone(), w.estimate_now.get(), w.reading.resets_at))
                 .max_by(|a, b| a.1.total_cmp(&b.1))
         })
         .max_by(|a, b| a.1.total_cmp(&b.1))
@@ -411,7 +417,7 @@ fn panel_keys(p: Panel) -> &'static str {
     match p {
         Panel::Swarm => "↑↓ select · Enter details · J tmux · / filter",
         Panel::Agent => "↑↓ scroll tools · J tmux",
-        Panel::Mana => {
+        Panel::Limits => {
             "↑↓ · Enter switch · S best · c save · a add · r rename · d forget · R re-read"
         }
         Panel::Attention => "↑↓ · Enter go there · n/N next",
@@ -513,4 +519,44 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used + w(&g)))));
     spans.push(Span::styled(g, Style::new().fg(th.faint)));
     f.render_widget(Paragraph::new(Line::from(spans)).style(th.base()), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::theme::Theme;
+
+    /// First review defect: `--mask` left the login label made from an email's local part on
+    /// screen (it has no `@`). Whatever draws it, the finished frame shows it blanked.
+    #[test]
+    fn a_label_made_from_an_email_is_masked() {
+        let t = tempfile::tempdir().unwrap();
+        let login: crate::vault::Login = serde_json::from_value(serde_json::json!({
+            "id": "l1", "label": "zelda", "account_uuid": "u1", "email": "zelda@example.com",
+            "plan": null, "meta": {"fingerprint": "f", "subscription_type": null, "rate_limit_tier": null,
+                "access_expires_at": null, "refresh_expires_at": null, "scopes": []},
+            "oauth_account": null, "captured_at": "2026-11-01T00:00:00Z",
+            "updated_at": "2026-11-01T00:00:00Z", "mounted": null
+        }))
+        .unwrap();
+        let screen = |mask: bool| -> String {
+            let mut app = App::new(Theme::named(None), mask, true, Vec::new(), t.path().into());
+            app.boot = None;
+            app.vault.logins = vec![login.clone()];
+            app.toast(
+                "seat 'work' now uses 'zelda-2'",
+                crate::tui::app::Tone::Good,
+            );
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            buf.content().iter().map(|c| c.symbol()).collect()
+        };
+        let plain = screen(false);
+        assert!(plain.contains("zelda-2"), "the toast is on screen: {plain}");
+        let masked = screen(true);
+        assert!(!masked.contains("zelda"), "{masked}");
+        assert!(masked.contains("•••••-2"));
+    }
 }

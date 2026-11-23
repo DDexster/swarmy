@@ -12,6 +12,7 @@ use crate::claude::seats::Seat;
 use crate::core::limits::WindowKind;
 use crate::limits::{AccountReport, all_reports};
 use crate::ui::fmt;
+use crate::ui::mask;
 use crate::ui::style::Tone;
 use crate::ui::table::{Align, Cell, Table};
 use crate::vault::{self, Vault};
@@ -86,7 +87,7 @@ fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
 
 /// Claude Code processes using this seat right now.
 fn live_in(ctx: &Ctx, s: &Seat) -> usize {
-    let registered = registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs).len();
+    let registered = registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs).len();
     let by_env = ctx
         .procs
         .claude
@@ -115,7 +116,7 @@ fn weekly(
         .windows
         .iter()
         .find(|w| w.reading.kind == WindowKind::SevenDay)?;
-    Some((w.estimate_now, w.window.end, w.reset_passed))
+    Some((w.estimate_now.get(), w.window.end, w.reset_passed))
 }
 
 pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
@@ -128,7 +129,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             let s = seat(ctx, &key)?;
             match v.edit(|tx| tx.capture(s, label.as_deref()))? {
                 Some(id) => {
-                    let l = v.logins().iter().find(|l| l.id == id).unwrap();
+                    let l = v.find(&id)?;
                     println!(
                         "{} saved the login of seat '{}' as '{}' ({})",
                         p.paint("[ OK ]", Tone::Good),
@@ -232,13 +233,12 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 if !status.success() {
                     eprintln!("claude exited with {status}");
                 }
-                let tmp = Seat {
-                    label: format!("scratch-{label}"),
-                    claude_json: scratch.join(".claude.json"),
-                    dir: scratch.clone(),
-                    is_default: false,
-                    found_by: vec![],
-                };
+                let tmp = Seat::new(
+                    format!("scratch-{label}"),
+                    scratch.clone(),
+                    scratch.join(".claude.json"),
+                    false,
+                );
                 let s = vault::read_seat(&tmp)?;
                 let secret = s.secret.context("no login was made in the scratch seat")?;
                 v.edit(|tx| {
@@ -257,7 +257,10 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 );
                 Ok(())
             })();
-            let _ = std::fs::remove_dir_all(&scratch);
+            // A scratch dir left behind holds a login: say where it is.
+            if let Err(e) = std::fs::remove_dir_all(&scratch) {
+                eprintln!("cannot remove {}: {e}", scratch.display());
+            }
             result
         }
         AccountsCmd::Rename { login, new_label } => {
@@ -295,7 +298,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         ("LIVE", Align::Right),
     ]);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let st = states.get(&s.label).cloned().unwrap_or_default();
+        let st = states.get(&s.id).cloned().unwrap_or_default();
         let acct = si.account.as_ref().map(|a| a.account_uuid.clone());
         let w = weekly(&reports, acct.as_deref());
         let (week, tone, resets) = match w {
@@ -314,7 +317,17 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         t.row(vec![
             Cell::tone(&s.label, Tone::Bold),
             match (&st.saved_as, &st.fingerprint) {
-                (Some(l), _) => Cell::tone(format!("{l} ✓"), Tone::Good),
+                (Some(l), _) => {
+                    let email = v
+                        .logins()
+                        .iter()
+                        .find(|x| &x.label == l)
+                        .and_then(|x| x.email.as_deref());
+                    Cell::tone(
+                        format!("{} ✓", mask::login_label(l, email, ctx.mask)),
+                        Tone::Good,
+                    )
+                }
                 (None, Some(_)) => Cell::tone("not saved", Tone::Warn),
                 (None, None) => Cell::tone("-", Tone::Dim),
             },
@@ -366,13 +379,13 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         ("LOGIN EXPIRES", Align::Left),
         ("GRANT", Align::Left),
     ]);
-    let mut best: Option<(f64, &str)> = None;
+    let mut best: Option<(f64, String)> = None;
     for l in v.logins() {
         let w = weekly(&reports, l.account_uuid.as_deref());
         let week = match w {
             Some((u, _, reset)) => {
-                if l.mounted.is_none() && best.is_none_or(|(b, _)| u < b) {
-                    best = Some((u, &l.label));
+                if l.mounted.is_none() && best.as_ref().is_none_or(|(b, _)| u < *b) {
+                    best = Some((u, mask::login_label(&l.label, l.email.as_deref(), ctx.mask)));
                 }
                 Cell::tone(
                     format!(
@@ -403,20 +416,22 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
             )
         });
         t.row(vec![
-            Cell::tone(&l.label, Tone::Bold),
-            Cell::new(if ctx.mask {
-                "•••".into()
-            } else {
-                l.email.clone().unwrap_or_default()
-            }),
+            Cell::tone(
+                mask::login_label(&l.label, l.email.as_deref(), ctx.mask),
+                Tone::Bold,
+            ),
+            Cell::new(mask::email(
+                l.email.as_deref().unwrap_or_default(),
+                ctx.mask,
+            )),
             match &l.mounted {
-                Some(s) => Cell::tone(s.clone(), Tone::Good),
+                Some(s) => Cell::tone(ctx.seat_label(s), Tone::Good),
                 None => Cell::tone("-", Tone::Dim),
             },
             week,
             expires.unwrap_or_else(|| Cell::tone("-", Tone::Dim)),
             Cell::tone(
-                l.meta.fingerprint[..8.min(l.meta.fingerprint.len())].to_string(),
+                crate::core::ids::short(&l.meta.fingerprint).to_string(),
                 Tone::Dim,
             ),
         ]);

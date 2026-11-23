@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::claude::registry::LiveSession;
+use crate::core::ids::{SeatId, SessionId};
 use crate::core::models::Family;
 use crate::core::tools::ToolClass;
 use crate::index::live::{AgentKey, AgentRow, DoneAgent};
@@ -18,8 +19,10 @@ pub use state::{Options, State, StateInputs, agent_state};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
-    pub seat: String,
-    pub session_id: String,
+    pub seat: SeatId,
+    /// The seat's label, for display only.
+    pub seat_label: String,
+    pub session_id: SessionId,
     /// Empty for the main thread.
     pub agent_id: String,
     pub parent: Option<String>,
@@ -128,7 +131,7 @@ pub fn build(
     prev_all: Option<&Snapshot>,
 ) -> anyhow::Result<Snapshot> {
     let recent = now - Duration::minutes(opts.stall_minutes.max(30));
-    let live_keys: HashSet<(String, String)> = live
+    let live_keys: HashSet<(SeatId, SessionId)> = live
         .iter()
         .map(|l| (l.seat.clone(), l.session_id.clone()))
         .collect();
@@ -144,13 +147,22 @@ pub fn build(
         rows.push(row);
     }
     // Live sessions that have no transcript yet still show up.
+    let mut labels: Option<std::collections::HashMap<SeatId, String>> = None;
     for l in live {
         if !rows
             .iter()
             .any(|r| r.agent_id.is_empty() && r.seat == l.seat && r.session_id == l.session_id)
         {
+            if labels.is_none() {
+                labels = Some(idx.seat_labels()?.into_iter().collect());
+            }
+            let seat_label = labels
+                .as_ref()
+                .and_then(|m| m.get(&l.seat).cloned())
+                .unwrap_or_else(|| l.seat.to_string());
             rows.push(AgentRow {
                 seat: l.seat.clone(),
+                seat_label,
                 session_id: l.session_id.clone(),
                 agent_id: String::new(),
                 kind: "main".into(),
@@ -238,7 +250,7 @@ pub fn build(
             live_session
                 .and_then(|l| l.name.clone())
                 .or_else(|| r.title.clone())
-                .unwrap_or_else(|| r.session_id[..8.min(r.session_id.len())].to_string())
+                .unwrap_or_else(|| r.session_id.short().to_string())
         } else {
             r.description.clone().unwrap_or_else(|| r.agent_id.clone())
         };
@@ -254,6 +266,7 @@ pub fn build(
             });
         agents.push(Agent {
             seat: r.seat.clone(),
+            seat_label: r.seat_label.clone(),
             session_id: r.session_id.clone(),
             agent_id: r.agent_id.clone(),
             parent: if r.agent_id.is_empty() {
@@ -376,8 +389,7 @@ pub fn build(
     let midnight = now
         .with_timezone(&chrono::Local)
         .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap();
+        .and_time(chrono::NaiveTime::MIN);
     let midnight = midnight
         .and_local_timezone(chrono::Local)
         .earliest()
@@ -527,8 +539,8 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
     let mut out = Vec::new();
     fn push_children(
         all: &[Agent],
-        seat: &str,
-        session: &str,
+        seat: &SeatId,
+        session: &SessionId,
         parent: &str,
         depth: u32,
         used: &mut HashSet<String>,
@@ -536,8 +548,8 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
     ) {
         for a in all.iter().filter(|a| {
             !a.is_main()
-                && a.seat == seat
-                && a.session_id == session
+                && a.seat == *seat
+                && a.session_id == *session
                 && a.parent.as_deref().unwrap_or("") == parent
         }) {
             if used.insert(a.key()) {
@@ -676,8 +688,9 @@ mod tests {
 
     fn agent(id: &str, parent: Option<&str>, state: State) -> Agent {
         Agent {
-            seat: "s".into(),
-            session_id: "x".into(),
+            seat: SeatId::from_stored("0123456789abcdef"),
+            seat_label: "s".into(),
+            session_id: SessionId::new("x"),
             agent_id: id.into(),
             parent: parent.map(str::to_string),
             depth: 0,

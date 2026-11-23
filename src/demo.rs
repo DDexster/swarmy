@@ -209,11 +209,8 @@ pub fn start(root: &Path) -> anyhow::Result<Demo> {
         )?;
         history(&dir, s, si as u64, now);
         seats.push(Seat {
-            label: s.label.into(),
-            claude_json: dir.join(".claude.json"),
-            dir,
-            is_default: false,
             found_by: vec!["demo"],
+            ..Seat::new(s.label, dir.clone(), dir.join(".claude.json"), false)
         });
     }
     let stop = Arc::new(AtomicBool::new(false));

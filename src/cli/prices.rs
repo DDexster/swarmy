@@ -13,8 +13,14 @@ use crate::app::context::Ctx;
 pub fn run(ctx: &Ctx, format: Format) -> anyhow::Result<()> {
     let today = ctx.now.with_timezone(&chrono::Local).date_naive();
     // Claude Code's prices carry the day the index first saw them.
-    let prices =
-        crate::index::Index::open(&ctx.dirs.index_file())?.dated_prices(&ctx.prices, ctx.now)?;
+    let mut idx = crate::index::Index::open(&ctx.dirs.index_file())?;
+    let prices = idx.dated_prices(&ctx.prices, ctx.now)?;
+    // A cached price names the seat it came from; seats gone since keep their last label.
+    let gone: BTreeMap<_, _> = idx.seat_labels()?.into_iter().collect();
+    let seat_label = |id: &crate::core::ids::SeatId| match ctx.seats.iter().find(|s| &s.id == id) {
+        Some(s) => s.label.clone(),
+        None => gone.get(id).cloned().unwrap_or_else(|| id.to_string()),
+    };
     let mut models: BTreeMap<String, ()> = BTreeMap::new();
     for e in prices.entries() {
         if !e.model.ends_with('*') {
@@ -80,7 +86,7 @@ pub fn run(ctx: &Ctx, format: Format) -> anyhow::Result<()> {
                     .map(|x| format!("×{x}"))
                     .unwrap_or_else(|| "-".into()),
             ),
-            Cell::tone(e.source.label(), Tone::Dim),
+            Cell::tone(e.source.label(seat_label), Tone::Dim),
         ]);
     }
     println!("{}", t.render(p));

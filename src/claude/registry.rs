@@ -10,6 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::procs::{ProcTable, proc_start_ticks};
+use crate::core::ids::{SeatId, SessionId};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -32,9 +33,9 @@ struct RawSession {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveSession {
-    pub seat: String,
+    pub seat: SeatId,
     pub pid: u32,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub cwd: String,
     pub name: Option<String>,
     pub status: SessionStatus,
@@ -83,7 +84,7 @@ pub fn session_pids(sessions_dir: &Path) -> Vec<u32> {
 }
 
 /// Live sessions of one seat. Stale files are ignored, never deleted.
-pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -> Vec<LiveSession> {
+pub fn live_sessions(seat: &SeatId, sessions_dir: &Path, procs: &ProcTable) -> Vec<LiveSession> {
     let Ok(rd) = std::fs::read_dir(sessions_dir) else {
         return Vec::new();
     };
@@ -99,7 +100,8 @@ pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -
         let Ok(r) = serde_json::from_str::<RawSession>(&text) else {
             continue;
         };
-        if r.pid == 0 || !procs.alive(r.pid) {
+        // A record without a session id names nothing the index knows (review M10).
+        if r.pid == 0 || r.session_id.is_empty() || !procs.alive(r.pid) {
             continue;
         }
         if let (Some(want), Some(have)) = (&r.proc_start, proc_start_ticks(r.pid))
@@ -108,9 +110,9 @@ pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -
             continue; // the pid was reused by another process
         }
         out.push(LiveSession {
-            seat: seat_label.to_string(),
+            seat: seat.clone(),
             pid: r.pid,
-            session_id: r.session_id,
+            session_id: SessionId::new(r.session_id),
             cwd: r.cwd,
             name: r.name,
             status: SessionStatus::parse(r.status.as_deref(), r.waiting_for.as_deref()),
@@ -128,7 +130,7 @@ pub fn live_sessions(seat_label: &str, sessions_dir: &Path, procs: &ProcTable) -
 /// A session blocked on the user.
 #[derive(Debug, Clone)]
 pub struct Waiting {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub name: Option<String>,
     pub what: String,
     pub tmux: Option<String>,
@@ -166,7 +168,7 @@ pub fn waiting_sessions(sessions_dir: &Path) -> Vec<Waiting> {
             continue;
         }
         out.push(Waiting {
-            session_id: r.session_id,
+            session_id: SessionId::new(r.session_id),
             name: r.name,
             what: r.waiting_for.unwrap_or_else(|| "input".into()),
             tmux: r.tmux.filter(|t| !t.is_empty()),
@@ -219,9 +221,18 @@ mod tests {
         )
         .unwrap();
         std::fs::write(t.path().join("x.key"), "secret").unwrap();
+        // Review M10: no session id is no session (it would show as an empty short id).
+        let other = std::process::id();
+        std::fs::write(
+            t.path().join("1.json"),
+            format!(r#"{{"pid":{other},"cwd":"/w","startedAt":1795348783929}}"#),
+        )
+        .unwrap();
         let procs = ProcTable::snapshot();
-        let s = live_sessions("default", t.path(), &procs);
+        let seat = SeatId::from_stored("0123456789abcdef");
+        let s = live_sessions(&seat, t.path(), &procs);
         assert_eq!(s.len(), 1);
+        assert_eq!(s[0].seat, seat);
         assert_eq!(s[0].session_id, "s1");
         assert_eq!(s[0].status, SessionStatus::Waiting("input needed".into()));
         assert_eq!(s[0].tmux.as_deref(), Some("0:@0.%6"));

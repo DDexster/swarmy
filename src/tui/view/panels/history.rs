@@ -163,7 +163,7 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
         format!(
             "max {}/day · 14 days {}{}",
             fmt::usd(max),
-            fmt::usd(days.iter().map(|d| d.1).sum()),
+            fmt::usd(days.iter().map(|d| d.1).sum::<f64>()),
             if focused { " · ←→ pick a day" } else { "" }
         ),
         faint(app),

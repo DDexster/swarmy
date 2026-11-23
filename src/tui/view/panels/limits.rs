@@ -11,11 +11,12 @@ use ratatui::widgets::canvas::{Canvas, Line as CLine};
 
 use super::{dim, faint};
 use crate::core::limits::{Level, WindowKind};
-use crate::tui::app::{App, ManaRow, Panel};
+use crate::core::units::Pct;
+use crate::tui::app::{App, LimitsRow, Panel};
 use crate::tui::view::kit::*;
 use crate::ui::fmt;
 
-pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
+pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     let hot = app
         .alerts
         .get("vault")
@@ -25,14 +26,14 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     let inner = frame(
         f,
         app,
-        Panel::Mana,
+        Panel::Limits,
         area,
         &format!("{n_acc} accounts · Enter switch · S best"),
         hot,
     );
     let app: &App = app;
     let th = app.theme;
-    let rows = app.mana_rows();
+    let rows = app.limits_rows();
     let width = inner.width as usize;
     // Narrow panels drop the account column (the seat and login usually say enough).
     let acct_w = if inner.width < 120 { 0usize } else { 18 };
@@ -80,8 +81,8 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
         ),
         faint(app),
     ))];
-    let cur = app.cur(Panel::Mana);
-    let focused = app.focus == Panel::Mana;
+    let cur = app.cur(Panel::Limits);
+    let focused = app.focus == Panel::Limits;
     let now = Utc::now();
     let mut first_login = true;
     for (i, r) in rows.iter().enumerate() {
@@ -91,7 +92,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             th.bold(th.accent),
         )];
         let (account, quiet) = match r {
-            ManaRow::Seat(label) => {
+            LimitsRow::Seat(label) => {
                 let s = app.analytics.seats.iter().find(|x| &x.label == label);
                 let state = s.map(|x| x.state.clone()).unwrap_or_default();
                 let login = s.and_then(|x| x.login.clone());
@@ -129,7 +130,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 }
                 (acct, false)
             }
-            ManaRow::Login(label) => {
+            LimitsRow::Login(label) => {
                 if first_login {
                     first_login = false;
                     lines.push(Line::from(vec![
@@ -162,7 +163,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 (acct, true)
             }
         };
-        let (five, week, reset) = app.mana_of(account.as_deref());
+        let (five, week, reset) = app.limits_of(account.as_deref());
         let shown: Vec<Option<f64>> = if has_five {
             vec![five, week]
         } else {
@@ -206,7 +207,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 .find(|w| w.reading.kind == WindowKind::SevenDay)
         });
         let status: (String, Color) = match r {
-            ManaRow::Seat(label) => {
+            LimitsRow::Seat(label) => {
                 let live = app
                     .analytics
                     .seats
@@ -248,7 +249,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                     if eta.is_some() { th.warn } else { th.dim },
                 )
             }
-            ManaRow::Login(label) => {
+            LimitsRow::Login(label) => {
                 let l = app.vault.logins.iter().find(|x| &x.label == label);
                 let read = weekly
                     .map(|w| {
@@ -302,7 +303,7 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
         } else {
             (rest, None)
         };
-        mana_curve(f, app, chart);
+        limit_curve(f, app, chart);
         if let Some(side) = side {
             let side = Rect {
                 x: side.x + 2,
@@ -312,14 +313,14 @@ pub fn mana(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             put(
                 f,
                 side,
-                mana_shares(app, side.width as usize, side.height as usize, detail),
+                limit_shares(app, side.width as usize, side.height as usize, detail),
             );
         }
     }
 }
 
 /// Where each account's week went: projects with their share of the used limit.
-fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Line<'static>> {
+fn limit_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Line<'static>> {
     let th = app.theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, rep) in app.analytics.limits.iter().enumerate() {
@@ -359,7 +360,7 @@ fn mana_shares(app: &App, width: usize, height: usize, _detail: bool) -> Vec<Lin
                 Style::new().fg(th.accent),
             ));
         }
-        if let Some(o) = win.outside_points.filter(|o| *o >= 2.0) {
+        if let Some(o) = win.outside_points.filter(|o| *o >= Pct::new(2.0)) {
             head.push(Span::styled(
                 format!(" · ≈{o:.0}% used elsewhere (claude.ai, other machines)"),
                 Style::new().fg(th.warn),
@@ -410,7 +411,7 @@ pub fn account_color(th: &crate::tui::theme::Theme, i: usize) -> Color {
 /// The limit window as a curve per account: estimated utilization from the window start to now
 /// (solid), the readings Claude Code fetched (dots), the projection to the reset at the current
 /// pace (dotted), the 100% line and "now".
-fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
+fn limit_curve(f: &mut Frame, app: &App, area: Rect) {
     use chrono::Duration;
     use ratatui::widgets::canvas::Points;
     let th = app.theme;
@@ -454,12 +455,12 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|(_, w)| {
             w.projection_at_reset(now)
-                .map(|at_reset| (hours(w.window.end), at_reset))
+                .map(|at_reset| (hours(w.window.end), at_reset.get()))
         })
         .collect();
     let peak = wins
         .iter()
-        .map(|(_, w)| w.estimate_now)
+        .map(|(_, w)| w.estimate_now.get())
         .chain(proj.iter().flatten().map(|p| p.1.min(100.0)))
         .fold(100.0f64, f64::max)
         .min(400.0);
@@ -476,10 +477,10 @@ fn mana_curve(f: &mut Frame, app: &App, area: Rect) {
                 w.curve
                     .iter()
                     .enumerate()
-                    .map(|(k, v)| ((start + (k as f64 + 1.0) * step).min(hours(now)), *v)),
+                    .map(|(k, v)| ((start + (k as f64 + 1.0) * step).min(hours(now)), v.get())),
             );
             let marks = w.marks.iter().map(|(t, u)| (hours(*t), *u)).collect();
-            let pr = p.map(|(xe, ye)| (hours(now), w.estimate_now, xe, ye));
+            let pr = p.map(|(xe, ye)| (hours(now), w.estimate_now.get(), xe, ye));
             (account_color(&th, *i), pts, marks, pr)
         })
         .collect();

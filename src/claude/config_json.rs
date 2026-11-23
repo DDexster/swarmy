@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -76,6 +78,17 @@ pub struct ClaudeJson {
 pub fn read(path: &Path) -> anyhow::Result<ClaudeJson> {
     let text = std::fs::read_to_string(path)?;
     parse(&text)
+}
+
+/// A seat's `.claude.json`: empty when the seat has none yet (a fresh config dir), an error
+/// when it is there but cannot be read or parsed, so a damaged file is never taken for a seat
+/// without an account (first review H5).
+pub fn read_seat_file(path: &Path) -> anyhow::Result<ClaudeJson> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse(&text).with_context(|| format!("{} is damaged", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClaudeJson::default()),
+        Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
+    }
 }
 
 pub fn parse(text: &str) -> anyhow::Result<ClaudeJson> {

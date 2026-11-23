@@ -49,11 +49,11 @@ pub fn settings_file(seat: &Seat) -> PathBuf {
 fn read_settings(path: &Path) -> anyhow::Result<Map<String, Value>> {
     match std::fs::read_to_string(path) {
         Ok(t) if t.trim().is_empty() => Ok(Map::new()),
-        Ok(t) => match serde_json::from_str::<Value>(&t)
-            .with_context(|| format!("{} is not valid JSON", path.display()))?
-        {
-            Value::Object(m) => Ok(m),
-            _ => anyhow::bail!("{} is not a JSON object", path.display()),
+        Ok(t) => match serde_json::from_str::<Value>(&t) {
+            Ok(Value::Object(m)) => Ok(m),
+            Ok(_) | Err(_) => {
+                Err(crate::errors::SetupError::SettingsDamaged(path.to_path_buf()).into())
+            }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Map::new()),
         Err(e) => Err(e).with_context(|| format!("cannot read {}", path.display())),
@@ -190,9 +190,9 @@ fn write_settings(path: &Path, settings: &Map<String, Value>) -> anyhow::Result<
     };
     let mut text = serde_json::to_string_pretty(&Value::Object(settings.clone()))?;
     text.push('\n');
-    let tmp = path.with_extension("json.swarmy-tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)?;
+    // Claude Code's file: it keeps its mode.
+    crate::fsutil::atomic_write(path, text.as_bytes(), crate::fsutil::Mode::KeepExisting)
+        .with_context(|| format!("cannot write {}", path.display()))?;
     Ok(backup)
 }
 
@@ -241,15 +241,19 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
     let todo: Vec<&Seat> = ctx
         .seats
         .iter()
-        .filter(|s| {
-            let settings = read_settings(&settings_file(s)).unwrap_or_default();
-            with_status_line(
+        .filter(|s| match read_settings(&settings_file(s)) {
+            Ok(settings) => with_status_line(
                 settings,
                 &exe,
                 a.remove,
                 ctx.config.statusline.refresh_seconds,
             )
-            .is_some()
+            .is_some(),
+            // Never taken for an empty file: that seat is left out, and says why.
+            Err(e) => {
+                println!("  {} {e:#}", p.paint("skipped:", Tone::Warn));
+                false
+            }
         })
         .collect();
     println!();
@@ -323,7 +327,7 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
             .iter()
             .filter(|s| {
                 states
-                    .get(&s.label)
+                    .get(&s.id)
                     .is_some_and(|st| st.fingerprint.is_some() && st.saved_as.is_none())
             })
             .collect();

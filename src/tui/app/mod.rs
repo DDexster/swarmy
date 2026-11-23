@@ -35,7 +35,7 @@ use crate::vault::{Vault, VaultTx};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Panel {
     Swarm,
-    Mana,
+    Limits,
     Burn,
     Attention,
     Agent,
@@ -49,7 +49,7 @@ pub enum Panel {
 impl Panel {
     pub const ALL: [Panel; 10] = [
         Panel::Swarm,
-        Panel::Mana,
+        Panel::Limits,
         Panel::Burn,
         Panel::Attention,
         Panel::Agent,
@@ -63,7 +63,7 @@ impl Panel {
     pub fn number(self) -> u8 {
         match self {
             Panel::Swarm => 1,
-            Panel::Mana => 2,
+            Panel::Limits => 2,
             Panel::Burn => 3,
             Panel::Attention => 4,
             Panel::Agent => 5,
@@ -85,7 +85,7 @@ impl Panel {
     pub fn title(self) -> &'static str {
         match self {
             Panel::Swarm => "SWARM",
-            Panel::Mana => "LIMITS · SEATS",
+            Panel::Limits => "LIMITS · SEATS",
             Panel::Burn => "BURN",
             Panel::Attention => "ATTENTION",
             Panel::Agent => "AGENT",
@@ -134,7 +134,7 @@ impl Shape {
 pub enum Tab {
     Ops,
     Agent,
-    Mana,
+    Limits,
     Spend,
     System,
 }
@@ -142,7 +142,7 @@ pub enum Tab {
 pub const TABS: [(Tab, &str, Panel); 5] = [
     (Tab::Ops, "OPS", Panel::Swarm),
     (Tab::Agent, "AGENT", Panel::Agent),
-    (Tab::Mana, "LIMITS", Panel::Mana),
+    (Tab::Limits, "LIMITS", Panel::Limits),
     (Tab::Spend, "SPEND", Panel::Projects),
     (Tab::System, "SYSTEM", Panel::System),
 ];
@@ -164,9 +164,9 @@ pub struct Boot {
     pub skip: bool,
 }
 
-/// One row of the MANA · SEATS panel.
+/// One row of the LIMITS · SEATS panel.
 #[derive(Debug, Clone)]
-pub enum ManaRow {
+pub enum LimitsRow {
     Seat(String),
     Login(String),
 }
@@ -312,7 +312,7 @@ impl App {
                 terms.iter().all(|t| match t.split_once(':') {
                     Some(("p", v)) => a.project.to_lowercase().contains(v),
                     Some(("m", v)) => a.model.as_deref().unwrap_or("").to_lowercase().contains(v),
-                    Some(("s", v)) => a.seat.to_lowercase().contains(v),
+                    Some(("s", v)) => a.seat_label.to_lowercase().contains(v),
                     Some(("state", v)) => format!("{:?}", a.state).to_lowercase().contains(v),
                     _ => a.name.to_lowercase().contains(t) || a.project.to_lowercase().contains(t),
                 })
@@ -353,7 +353,7 @@ impl App {
     // ───────────── accounts ─────────────
 
     /// The 5-hour and weekly estimate of an account, with the weekly reset.
-    pub fn mana_of(
+    pub fn limits_of(
         &self,
         account: Option<&str>,
     ) -> (Option<f64>, Option<f64>, Option<DateTime<Utc>>) {
@@ -367,14 +367,14 @@ impl App {
             .windows
             .iter()
             .find(|w| w.reading.kind == WindowKind::FiveHour)
-            .map(|w| w.estimate_now);
+            .map(|w| w.estimate_now.get());
         let week = rep
             .windows
             .iter()
             .find(|w| w.reading.kind == WindowKind::SevenDay);
         (
             five,
-            week.map(|w| w.estimate_now),
+            week.map(|w| w.estimate_now.get()),
             week.map(|w| w.window.end),
         )
     }
@@ -385,15 +385,15 @@ impl App {
             .iter()
             .find(|r| r.account_uuid == uuid)
             .map(|r| r.name.clone())
-            .unwrap_or_else(|| format!("acct-{}", &uuid[..uuid.len().min(8)]))
+            .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short(uuid)))
     }
 
-    /// Rows of the MANA · SEATS panel: every seat, then every saved login that is in no seat.
-    pub fn mana_rows(&self) -> Vec<ManaRow> {
-        let mut rows: Vec<ManaRow> = self
+    /// Rows of the LIMITS · SEATS panel: every seat, then every saved login that is in no seat.
+    pub fn limits_rows(&self) -> Vec<LimitsRow> {
+        let mut rows: Vec<LimitsRow> = self
             .seats
             .iter()
-            .map(|s| ManaRow::Seat(s.label.clone()))
+            .map(|s| LimitsRow::Seat(s.label.clone()))
             .collect();
         let mut parked: Vec<&crate::vault::Login> = self
             .vault
@@ -402,13 +402,17 @@ impl App {
             .filter(|l| l.mounted.is_none())
             .collect();
         parked.sort_by(|a, b| {
-            let (fa, wa, _) = self.mana_of(a.account_uuid.as_deref());
-            let (fb, wb, _) = self.mana_of(b.account_uuid.as_deref());
+            let (fa, wa, _) = self.limits_of(a.account_uuid.as_deref());
+            let (fb, wb, _) = self.limits_of(b.account_uuid.as_deref());
             let ka = fa.unwrap_or(0.0).max(wa.unwrap_or(200.0));
             let kb = fb.unwrap_or(0.0).max(wb.unwrap_or(200.0));
             ka.total_cmp(&kb)
         });
-        rows.extend(parked.into_iter().map(|l| ManaRow::Login(l.label.clone())));
+        rows.extend(
+            parked
+                .into_iter()
+                .map(|l| LimitsRow::Login(l.label.clone())),
+        );
         rows
     }
 
@@ -421,6 +425,7 @@ impl App {
             limits: &self.analytics.limits,
             seats: &self.analytics.seats,
             logins: &self.vault.logins,
+            problems: &self.analytics.problems,
             mask: self.mask,
             now: Utc::now(),
         })
@@ -444,7 +449,7 @@ impl App {
                 self.select_agent(k);
                 self.focus_panel(Panel::Swarm);
             }
-            AttnTarget::Mana => self.focus_panel(Panel::Mana),
+            AttnTarget::Limits => self.focus_panel(Panel::Limits),
             AttnTarget::None => {}
         }
     }
@@ -600,7 +605,7 @@ impl App {
             Shape::Wall => vec![
                 Panel::Swarm,
                 Panel::Agent,
-                Panel::Mana,
+                Panel::Limits,
                 Panel::Attention,
                 Panel::Burn,
                 Panel::Projects,
@@ -611,7 +616,7 @@ impl App {
             Shape::Column => vec![
                 Panel::Swarm,
                 Panel::Agent,
-                Panel::Mana,
+                Panel::Limits,
                 Panel::Attention,
                 Panel::Burn,
                 Panel::Projects,
@@ -620,9 +625,9 @@ impl App {
                 Panel::Models,
             ],
             Shape::Tabs => match self.tab {
-                Tab::Ops => vec![Panel::Swarm, Panel::Mana, Panel::Attention],
+                Tab::Ops => vec![Panel::Swarm, Panel::Limits, Panel::Attention],
                 Tab::Agent => vec![Panel::Swarm, Panel::Agent],
-                Tab::Mana => vec![Panel::Mana],
+                Tab::Limits => vec![Panel::Limits],
                 Tab::Spend => vec![
                     Panel::Projects,
                     Panel::Efficiency,
@@ -644,7 +649,7 @@ impl App {
             if !self.visible_panels().contains(&p) {
                 self.tab = match p {
                     Panel::Agent => Tab::Agent,
-                    Panel::Mana | Panel::Burn => Tab::Mana,
+                    Panel::Limits | Panel::Burn => Tab::Limits,
                     Panel::Projects | Panel::Models | Panel::History => Tab::Spend,
                     Panel::System => Tab::System,
                     _ => Tab::Ops,
@@ -656,7 +661,7 @@ impl App {
         } else if !self.visible_panels().contains(&p) {
             self.zoom = Some(p);
         }
-        if p == Panel::Mana && !self.vault.loaded {
+        if p == Panel::Limits && !self.vault.loaded {
             self.vault_reload();
         }
     }

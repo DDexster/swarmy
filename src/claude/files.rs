@@ -36,7 +36,7 @@ impl FileKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptFile {
     pub path: PathBuf,
-    pub seat: String,
+    pub seat: super::seats::SeatId,
     pub session_id: String,
     /// Empty for the main thread.
     pub agent_id: String,
@@ -87,7 +87,7 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
             sessions.push(sid.clone());
             out.push(TranscriptFile {
                 path: f,
-                seat: seat.label.clone(),
+                seat: seat.id.clone(),
                 session_id: sid,
                 agent_id: String::new(),
                 kind: FileKind::Main,
@@ -107,7 +107,7 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
                 if let Some(aid) = agent_id_of(&f) {
                     out.push(TranscriptFile {
                         path: f,
-                        seat: seat.label.clone(),
+                        seat: seat.id.clone(),
                         session_id: sid.clone(),
                         agent_id: aid,
                         kind: FileKind::Subagent,
@@ -121,7 +121,7 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
                         if let Some(aid) = agent_id_of(&f) {
                             out.push(TranscriptFile {
                                 path: f,
-                                seat: seat.label.clone(),
+                                seat: seat.id.clone(),
                                 session_id: sid.clone(),
                                 agent_id: aid,
                                 kind: FileKind::Workflow(run_id.clone()),
@@ -151,7 +151,7 @@ pub fn list_session(seat: &Seat, session_id: &str) -> Vec<TranscriptFile> {
         if main.exists() {
             out.push(TranscriptFile {
                 path: main,
-                seat: seat.label.clone(),
+                seat: seat.id.clone(),
                 session_id: session_id.into(),
                 agent_id: String::new(),
                 kind: FileKind::Main,
@@ -162,7 +162,7 @@ pub fn list_session(seat: &Seat, session_id: &str) -> Vec<TranscriptFile> {
             if let Some(aid) = agent_id_of(&f) {
                 out.push(TranscriptFile {
                     path: f,
-                    seat: seat.label.clone(),
+                    seat: seat.id.clone(),
                     session_id: session_id.into(),
                     agent_id: aid,
                     kind: FileKind::Subagent,
@@ -176,7 +176,7 @@ pub fn list_session(seat: &Seat, session_id: &str) -> Vec<TranscriptFile> {
                     if let Some(aid) = agent_id_of(&f) {
                         out.push(TranscriptFile {
                             path: f,
-                            seat: seat.label.clone(),
+                            seat: seat.id.clone(),
                             session_id: session_id.into(),
                             agent_id: aid,
                             kind: FileKind::Workflow(run_id.clone()),
@@ -236,13 +236,12 @@ mod tests {
         )
         .unwrap();
         std::fs::write(p.join("s1/subagents/workflows/wf_1/agent-w1.jsonl"), "").unwrap();
-        let seat = Seat {
-            label: "default".into(),
-            dir: t.path().into(),
-            claude_json: t.path().join(".claude.json"),
-            is_default: true,
-            found_by: vec![],
-        };
+        let seat = Seat::new(
+            "default",
+            t.path().into(),
+            t.path().join(".claude.json"),
+            true,
+        );
         let files = list(&seat);
         let kinds: Vec<_> = files
             .iter()

@@ -21,6 +21,10 @@ unused_imports = "deny"
 allow_attributes_without_reason = "deny"
 dbg_macro = "deny"
 todo = "deny"
+# Production code never panics on a value it did not check (tests may: clippy.toml).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
 
 [features]
 default = ["bundled-sqlite"]

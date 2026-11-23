@@ -12,7 +12,7 @@ use super::analytics::{self, SlowParts};
 use super::jobs::{
     COMPACT_CATCH_UP, COMPACT_CATCH_UP_ECO, COMPACT_CHUNKS_PER_RUN, Job, Schedule, TICK_STEP,
 };
-use super::{Msg, SystemView, Wants, debug};
+use super::{Msg, SystemView, Wants, debug, lock};
 use crate::app::context::Ctx;
 use crate::claude::procs::ProcTable;
 use crate::claude::registry::{self, LiveSession};
@@ -93,7 +93,7 @@ pub(super) fn worker(
         let mut marks: Vec<(&str, Instant)> = Vec::new();
         ctx.now = Utc::now();
         let tp = Instant::now();
-        let want_system = wants.lock().unwrap().system;
+        let want_system = lock(&wants).system;
         if let Some(s) = sys.as_mut() {
             if want_system && jobs.due(Job::SystemProcs) {
                 ctx.procs = ProcTable::snapshot_with_cpu(s);
@@ -141,7 +141,7 @@ pub(super) fn worker(
         let live_sessions: Vec<LiveSession> = ctx
             .seats
             .iter()
-            .flat_map(|s| registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs))
+            .flat_map(|s| registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs))
             .collect();
         let full_refresh = jobs.due(Job::FullRefresh);
         let res = if full_refresh {
@@ -155,9 +155,9 @@ pub(super) fn worker(
                 &mut quiet,
             )
         } else {
-            let keys: Vec<(String, String)> = live_sessions
+            let keys: Vec<(crate::core::ids::SeatId, String)> = live_sessions
                 .iter()
-                .map(|l| (l.seat.clone(), l.session_id.clone()))
+                .map(|l| (l.seat.clone(), l.session_id.to_string()))
                 .collect();
             idx.refresh_hot(
                 &ctx.seats,
@@ -230,7 +230,11 @@ pub(super) fn worker(
                     if changed || jobs.due(Job::FleetKeepAlive) {
                         let mut f = fl.clone();
                         f.written_at = Utc::now();
-                        let _ = crate::fleet::write(&crate::fleet::path(&ctx.dirs.data), &f);
+                        // The status lines fall back to scanning the registries without it.
+                        if let Err(e) = crate::fleet::write(&crate::fleet::path(&ctx.dirs.data), &f)
+                        {
+                            crate::diag::log("fleet", &format!("cannot write the summary: {e}"));
+                        }
                         fleet_last = Some(fl);
                         jobs.done(Job::Fleet);
                         jobs.done(Job::FleetKeepAlive);
@@ -263,7 +267,7 @@ pub(super) fn worker(
             }
         }
         marks.push(("build+send", Instant::now()));
-        let w = wants.lock().unwrap().clone();
+        let w = lock(&wants).clone();
         let tt = Instant::now();
         if let Some(a) = &w.agent
             && let Ok(t) = live::tool_timeline(&idx, a, 200)
@@ -296,13 +300,13 @@ pub(super) fn worker(
                 }
                 jobs.done(Job::DiskSizes);
             }
-            if wants.lock().unwrap().refresh_analytics {
+            if lock(&wants).refresh_analytics {
                 // A login may have just changed: re-read the seats' accounts.
                 if let Err(e) = ctx.reload_seat_info() {
                     send(Msg::Error(format!("{e:#}")));
                 }
             }
-            wants.lock().unwrap().refresh_analytics = false;
+            lock(&wants).refresh_analytics = false;
             let ta = Instant::now();
             if jobs.due(Job::DaysHeat)
                 && let Some(parts) = days_and_heat(&ctx, &idx)
@@ -374,7 +378,7 @@ pub(super) fn worker(
         jobs.eco = eco.load(Ordering::Relaxed);
         for _ in 0..jobs.tick_steps() {
             std::thread::sleep(TICK_STEP);
-            if wants.lock().unwrap().refresh_analytics {
+            if lock(&wants).refresh_analytics {
                 break;
             }
         }
@@ -521,10 +525,6 @@ fn fleet_of(
     }
     f.needs_you.sort_by_key(|n| n.since);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let key = crate::claude::statusline::file_for(&ctx.dirs.data, &s.dir)
-            .file_stem()
-            .map(|x| x.to_string_lossy().into_owned())
-            .unwrap_or_default();
         let Some(acct) = si.account.as_ref().map(|a| a.account_uuid.clone()) else {
             continue;
         };
@@ -537,11 +537,11 @@ fn fleet_of(
                 })
             });
         f.seats.insert(
-            key,
+            s.id.clone(),
             SeatLimit {
                 label: s.label.clone(),
-                account: ctx.account_name(&acct),
-                week_used: week.map(|w| w.estimate_now),
+                account_name: ctx.account_name(&acct),
+                week_used: week.map(|w| w.estimate_now.get()),
                 runs_out_at: week.and_then(|w| w.eta).map(|d| ctx.now + d),
                 resets_at: week.map(|w| w.reading.resets_at),
             },
@@ -554,7 +554,7 @@ fn fleet_of(
 fn statusline_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
     ctx.seats
         .iter()
-        .map(|s| crate::claude::statusline::file_for(&ctx.dirs.data, &s.dir))
+        .map(|s| crate::claude::statusline::file_of(&ctx.dirs.data, &s.id))
         .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         .collect()
 }
@@ -578,11 +578,16 @@ fn system_view(ctx: &Ctx, live: &[LiveSession], sys: Option<&sysinfo::System>) -
             .collect();
         kids.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
         kids.truncate(6);
+        let seat = ctx
+            .seats
+            .iter()
+            .find(|s| s.id == l.seat)
+            .map_or_else(|| l.seat.to_string(), |s| s.label.clone());
         v.instances.push((
-            l.seat.clone(),
+            seat,
             l.name
                 .clone()
-                .unwrap_or_else(|| l.session_id[..8].to_string()),
+                .unwrap_or_else(|| l.session_id.short().to_string()),
             l.pid,
             cpu,
             mem,

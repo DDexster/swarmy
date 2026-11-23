@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use super::period::Span;
+use super::units::{Pct, Usd, UsdPerPct};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub enum WindowKind {
@@ -221,20 +222,24 @@ pub fn effective_start(
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Share {
     pub key: String,
-    pub cost: f64,
+    pub cost: Usd,
     /// Share of the window's spend, 0..=1.
     pub share: f64,
     /// ≈ points of the limit this key consumed.
-    pub limit_points: f64,
+    pub limit_points: Pct,
 }
 
 /// Splits `utilization` points between keys in proportion to their cost.
-pub fn attribute(utilization: f64, costs: &[(String, f64)]) -> Vec<Share> {
-    let total: f64 = costs.iter().map(|(_, c)| c.max(0.0)).sum();
+pub fn attribute(utilization: Pct, costs: &[(String, Usd)]) -> Vec<Share> {
+    let total: Usd = costs.iter().map(|(_, c)| c.max(Usd::ZERO)).sum();
     let mut out: Vec<Share> = costs
         .iter()
         .map(|(k, c)| {
-            let share = if total > 0.0 { c.max(0.0) / total } else { 0.0 };
+            let share = if total > Usd::ZERO {
+                c.max(Usd::ZERO) / total
+            } else {
+                0.0
+            };
             Share {
                 key: k.clone(),
                 cost: *c,
@@ -248,33 +253,31 @@ pub fn attribute(utilization: f64, costs: &[(String, f64)]) -> Vec<Share> {
 }
 
 /// USD of API-equivalent spend per 1 point of utilization, from one reading.
-pub fn usd_per_point(utilization: f64, cost_until_reading: f64) -> Option<f64> {
-    (utilization >= 1.0 && cost_until_reading > 0.0).then(|| cost_until_reading / utilization)
+pub fn usd_per_point(utilization: Pct, cost_until_reading: Usd) -> Option<UsdPerPct> {
+    UsdPerPct::measured(cost_until_reading, utilization)
 }
 
 /// Median of several `usd_per_point` estimates (one per stored reading).
-pub fn calibrate(samples: &[f64]) -> Option<f64> {
+pub fn calibrate(samples: &[UsdPerPct]) -> Option<UsdPerPct> {
     let mut v: Vec<f64> = samples
         .iter()
-        .copied()
-        .filter(|x| x.is_finite() && *x > 0.0)
+        .filter(|x| x.is_usable())
+        .map(|x| x.get())
         .collect();
-    if v.is_empty() {
-        return None;
-    }
     v.sort_by(f64::total_cmp);
     let n = v.len();
-    Some(if n % 2 == 1 {
-        v[n / 2]
-    } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
-    })
+    let median = match n {
+        0 => return None,
+        _ if n % 2 == 1 => v.get(n / 2).copied(),
+        _ => Some((v.get(n / 2 - 1)? + v.get(n / 2)?) / 2.0),
+    };
+    median.map(UsdPerPct::new)
 }
 
 /// Utilization now: the last reading plus what was spent since, converted at `usd_per_point`.
-pub fn estimate_now(reading: f64, spent_since: f64, usd_per_point: Option<f64>) -> f64 {
+pub fn estimate_now(reading: Pct, spent_since: Usd, usd_per_point: Option<UsdPerPct>) -> Pct {
     match usd_per_point {
-        Some(r) if r > 0.0 => reading + spent_since / r,
+        Some(r) if r.is_usable() => reading + spent_since / r,
         _ => reading,
     }
 }
@@ -413,8 +416,8 @@ pub fn calibration_points(history: &[Reading], r: &Reading) -> Vec<(Span, f64)> 
 }
 
 /// The account's own USD per point: the median over `(utilization, spend until it)` pairs.
-pub fn own_ratio(points: &[(f64, f64)]) -> Option<f64> {
-    let samples: Vec<f64> = points
+pub fn own_ratio(points: &[(Pct, Usd)]) -> Option<UsdPerPct> {
+    let samples: Vec<UsdPerPct> = points
         .iter()
         .filter_map(|(u, c)| usd_per_point(*u, *c))
         .collect();
@@ -422,7 +425,7 @@ pub fn own_ratio(points: &[(f64, f64)]) -> Option<f64> {
 }
 
 /// Whether a tier reference ratio replaces the account's own (see [`REFERENCE_MARGIN`]).
-pub fn reference_wins(own: Option<f64>, reference: f64) -> bool {
+pub fn reference_wins(own: Option<UsdPerPct>, reference: UsdPerPct) -> bool {
     own.is_none_or(|o| reference > o * REFERENCE_MARGIN)
 }
 
@@ -437,17 +440,17 @@ pub struct WindowInputs {
     pub reading: Reading,
     pub place: WindowPlace,
     /// USD per point measured on this account alone ([`own_ratio`]).
-    pub own_usd_per_point: Option<f64>,
+    pub own_usd_per_point: Option<UsdPerPct>,
     /// Spend since the point [`counting_from`] names.
-    pub spent_since: f64,
+    pub spent_since: Usd,
     /// Spend from the window start until now.
-    pub cost_in_window: f64,
+    pub cost_in_window: Usd,
     /// Spend over the last [`BURN_MINUTES`].
-    pub cost_burn: f64,
+    pub cost_burn: Usd,
     /// Spend in the window per project.
-    pub by_project: Vec<(String, f64)>,
+    pub by_project: Vec<(String, Usd)>,
     /// Spend per [`curve_step`] from the window start (empty when the window rolled over).
-    pub series: Vec<f64>,
+    pub series: Vec<Usd>,
     pub series_step: Duration,
 }
 
@@ -455,53 +458,61 @@ pub struct WindowInputs {
 #[derive(Debug, Clone, PartialEq)]
 pub struct WindowEstimate {
     /// USD per point used: the reference's when given, else the account's own.
-    pub usd_per_point: Option<f64>,
-    pub estimate_now: f64,
+    pub usd_per_point: Option<UsdPerPct>,
+    pub estimate_now: Pct,
     /// ≈ points explained by spend visible on this machine.
-    pub visible_points: Option<f64>,
+    pub visible_points: Option<Pct>,
     /// ≈ points from claude.ai, the desktop app, other computers…
-    pub outside_points: Option<f64>,
-    pub burn_usd_per_hour: f64,
-    pub points_per_hour: Option<f64>,
+    pub outside_points: Option<Pct>,
+    /// Dollars per hour.
+    pub burn_usd_per_hour: Usd,
+    /// Points per hour.
+    pub points_per_hour: Option<Pct>,
     /// When it runs out at this pace, if before the reset ([`runs_out`]).
     pub eta: Option<Duration>,
     pub shares: Vec<Share>,
     /// ≈ API-equivalent dollars of a full window.
-    pub window_usd: Option<f64>,
+    pub window_usd: Option<Usd>,
     /// Cumulative spend through the window, scaled to end at `estimate_now`.
-    pub curve: Vec<f64>,
+    pub curve: Vec<Pct>,
 }
 
 /// Estimates one window. `reference` is the tier reference ratio already chosen with
 /// [`reference_wins`].
 pub fn window_estimate(
     i: &WindowInputs,
-    reference: Option<f64>,
+    reference: Option<UsdPerPct>,
     now: DateTime<Utc>,
 ) -> WindowEstimate {
     let usd_per_point = reference.or(i.own_usd_per_point);
     let (base, _) = counting_from(&i.reading, &i.place);
-    let estimate_now = estimate_now(base, i.spent_since, usd_per_point);
+    let estimate_now = estimate_now(Pct::new(base), i.spent_since, usd_per_point);
     // What the spend seen here explains can not exceed the estimate; the rest is elsewhere.
     let visible_points = usd_per_point.map(|u| (i.cost_in_window / u).min(estimate_now));
-    let outside_points = visible_points.map(|v| (estimate_now - v).max(0.0));
+    let outside_points = visible_points.map(|v| (estimate_now - v).max(Pct::ZERO));
     let burn_usd_per_hour = i.cost_burn * 60.0 / BURN_MINUTES as f64;
     let points_per_hour = usd_per_point.map(|u| burn_usd_per_hour / u);
-    let eta = runs_out(estimate_now, points_per_hour, now, i.place.window.end);
+    let eta = runs_out(
+        estimate_now.get(),
+        points_per_hour.map(Pct::get),
+        now,
+        i.place.window.end,
+    );
     let shares = attribute(visible_points.unwrap_or(estimate_now), &i.by_project);
-    let total: f64 = i.series.iter().sum();
-    let scale = if total > 0.0 {
-        estimate_now / total
+    let total: Usd = i.series.iter().sum();
+    // Points per dollar of the curve: it ends at the estimate.
+    let scale = if total > Usd::ZERO {
+        estimate_now.get() / total.get()
     } else {
         0.0
     };
-    let mut acc = 0.0;
+    let mut acc = Usd::ZERO;
     let curve = i
         .series
         .iter()
         .map(|c| {
-            acc += c;
-            acc * scale
+            acc += *c;
+            Pct::new(acc.get() * scale)
         })
         .collect();
     WindowEstimate {
@@ -513,7 +524,7 @@ pub fn window_estimate(
         points_per_hour,
         eta,
         shares,
-        window_usd: usd_per_point.map(|u| u * 100.0),
+        window_usd: usd_per_point.map(|u| Pct::new(100.0) * u),
         curve,
     }
 }
@@ -524,42 +535,49 @@ mod tests {
 
     #[test]
     fn attribution_by_hand() {
-        // 77% used; ukroblik $810, car-anatomy $120, other $70 (total $1000).
-        // ukroblik: 0.81 → 62.37 points; car-anatomy: 0.12 → 9.24; other: 0.07 → 5.39.
+        // 77% used; shop $810, blog $120, other $70 (total $1000).
+        // shop: 0.81 → 62.37 points; blog: 0.12 → 9.24; other: 0.07 → 5.39.
         let s = attribute(
-            77.0,
+            Pct::new(77.0),
             &[
-                ("other".into(), 70.0),
-                ("ukroblik".into(), 810.0),
-                ("car-anatomy".into(), 120.0),
+                ("other".into(), Usd::new(70.0)),
+                ("shop".into(), Usd::new(810.0)),
+                ("blog".into(), Usd::new(120.0)),
             ],
         );
-        assert_eq!(s[0].key, "ukroblik");
+        assert_eq!(s[0].key, "shop");
         assert!((s[0].share - 0.81).abs() < 1e-12);
-        assert!((s[0].limit_points - 62.37).abs() < 1e-9);
-        assert!((s[1].limit_points - 9.24).abs() < 1e-9);
-        assert!((s[2].limit_points - 5.39).abs() < 1e-9);
-        let total: f64 = s.iter().map(|x| x.limit_points).sum();
+        assert!((s[0].limit_points.get() - 62.37).abs() < 1e-9);
+        assert!((s[1].limit_points.get() - 9.24).abs() < 1e-9);
+        assert!((s[2].limit_points.get() - 5.39).abs() < 1e-9);
+        let total: f64 = s.iter().map(|x| x.limit_points.get()).sum();
         assert!((total - 77.0).abs() < 1e-9);
     }
 
     #[test]
     fn zero_spend_attributes_nothing() {
-        let s = attribute(10.0, &[("a".into(), 0.0)]);
-        assert_eq!(s[0].limit_points, 0.0);
+        let s = attribute(Pct::new(10.0), &[("a".into(), Usd::ZERO)]);
+        assert_eq!(s[0].limit_points, Pct::ZERO);
     }
 
     #[test]
     fn calibration_and_estimate() {
         // $1000 spent for 50% → $20 per point. $100 more since then → +5 points.
-        let r = usd_per_point(50.0, 1000.0).unwrap();
-        assert_eq!(r, 20.0);
-        assert_eq!(estimate_now(50.0, 100.0, Some(r)), 55.0);
-        assert_eq!(calibrate(&[30.0, 10.0, 20.0]), Some(20.0));
-        assert_eq!(calibrate(&[10.0, 20.0]), Some(15.0));
+        let r = usd_per_point(Pct::new(50.0), Usd::new(1000.0)).unwrap();
+        assert_eq!(r, UsdPerPct::new(20.0));
+        assert_eq!(
+            estimate_now(Pct::new(50.0), Usd::new(100.0), Some(r)),
+            Pct::new(55.0)
+        );
+        let rates = |v: &[f64]| v.iter().map(|x| UsdPerPct::new(*x)).collect::<Vec<_>>();
+        assert_eq!(
+            calibrate(&rates(&[30.0, 10.0, 20.0])),
+            Some(UsdPerPct::new(20.0))
+        );
+        assert_eq!(calibrate(&rates(&[10.0, 20.0])), Some(UsdPerPct::new(15.0)));
         assert_eq!(calibrate(&[]), None);
         // Below 1% the ratio is too noisy to trust.
-        assert_eq!(usd_per_point(0.5, 10.0), None);
+        assert_eq!(usd_per_point(Pct::new(0.5), Usd::new(10.0)), None);
     }
 
     #[test]
@@ -724,12 +742,24 @@ mod tests {
     #[test]
     fn reference_wins_only_beyond_twenty_percent() {
         // No own ratio: any reference is better than nothing.
-        assert!(reference_wins(None, 0.3));
+        assert!(reference_wins(None, UsdPerPct::new(0.3)));
         // Own $1.00 per point: a reference has to exceed $1.20.
-        assert!(reference_wins(Some(1.0), 1.3));
-        assert!(!reference_wins(Some(1.0), 1.2), "exactly 20% more is noise");
-        assert!(!reference_wins(Some(1.0), 1.1));
-        assert!(!reference_wins(Some(1.0), 0.5));
+        assert!(reference_wins(
+            Some(UsdPerPct::new(1.0)),
+            UsdPerPct::new(1.3)
+        ));
+        assert!(
+            !reference_wins(Some(UsdPerPct::new(1.0)), UsdPerPct::new(1.2)),
+            "exactly 20% more is noise"
+        );
+        assert!(!reference_wins(
+            Some(UsdPerPct::new(1.0)),
+            UsdPerPct::new(1.1)
+        ));
+        assert!(!reference_wins(
+            Some(UsdPerPct::new(1.0)),
+            UsdPerPct::new(0.5)
+        ));
     }
 
     #[test]
@@ -778,8 +808,13 @@ mod tests {
         assert_eq!(pts[11].1, 9.0);
         // 10% after $4 → $0.40/pt; 30% after $14 → $14/30; 0.5% is too little to trust.
         // Median of the two: (12/30 + 14/30) / 2 = 13/30.
-        let r = own_ratio(&[(10.0, 4.0), (30.0, 14.0), (0.5, 10.0)]).unwrap();
-        assert!((r - 13.0 / 30.0).abs() < 1e-12);
+        let r = own_ratio(&[
+            (Pct::new(10.0), Usd::new(4.0)),
+            (Pct::new(30.0), Usd::new(14.0)),
+            (Pct::new(0.5), Usd::new(10.0)),
+        ])
+        .unwrap();
+        assert!((r.get() - 13.0 / 30.0).abs() < 1e-12);
         assert_eq!(own_ratio(&[]), None);
     }
 
@@ -800,25 +835,25 @@ mod tests {
         WindowInputs {
             reading: r,
             place: window_of(&r, &[r], hour(76)),
-            own_usd_per_point: Some(0.5),
-            spent_since: 5.0,
-            cost_in_window: 15.0,
-            cost_burn: 2.0,
-            by_project: vec![("b".into(), 5.0), ("a".into(), 10.0)],
-            series: vec![5.0, 0.0, 10.0],
+            own_usd_per_point: Some(UsdPerPct::new(0.5)),
+            spent_since: Usd::new(5.0),
+            cost_in_window: Usd::new(15.0),
+            cost_burn: Usd::new(2.0),
+            by_project: vec![("b".into(), Usd::new(5.0)), ("a".into(), Usd::new(10.0))],
+            series: [5.0, 0.0, 10.0].map(Usd::new).to_vec(),
             series_step: Duration::hours(1),
         }
     }
 
-    fn near(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-9
+    fn near(a: impl Into<f64>, b: f64) -> bool {
+        (a.into() - b).abs() < 1e-9
     }
 
     #[test]
     fn window_estimate_with_its_own_ratio() {
         let e = window_estimate(&inputs(), None, hour(76));
         // $0.50 per point: 30 + $5 / 0.5 = 40%.
-        assert_eq!(e.usd_per_point, Some(0.5));
+        assert_eq!(e.usd_per_point, Some(UsdPerPct::new(0.5)));
         assert!(near(e.estimate_now, 40.0));
         // $15 in the window explain 30 points; the other 10 come from elsewhere.
         assert!(near(e.visible_points.unwrap(), 30.0));
@@ -844,8 +879,8 @@ mod tests {
         // The reference $1.00 per point replaces the own $0.50: 30 + 5 / 1 = 35%; the $15 seen
         // here explain 15 points, 20 come from elsewhere; 2 points/h → (100 − 35) / 2 = 32.5 h,
         // after the reset in 24 h, so no runs-out time.
-        let e = window_estimate(&inputs(), Some(1.0), hour(76));
-        assert_eq!(e.usd_per_point, Some(1.0));
+        let e = window_estimate(&inputs(), Some(UsdPerPct::new(1.0)), hour(76));
+        assert_eq!(e.usd_per_point, Some(UsdPerPct::new(1.0)));
         assert!(near(e.estimate_now, 35.0));
         assert!(near(e.visible_points.unwrap(), 15.0));
         assert!(near(e.outside_points.unwrap(), 20.0));
@@ -860,9 +895,9 @@ mod tests {
         let r = wk(10, 30.0);
         let i = WindowInputs {
             place: window_of(&r, &[r], hour(120)),
-            own_usd_per_point: Some(2.0),
-            spent_since: 6.0,
-            cost_in_window: 6.0,
+            own_usd_per_point: Some(UsdPerPct::new(2.0)),
+            spent_since: Usd::new(6.0),
+            cost_in_window: Usd::new(6.0),
             series: Vec::new(),
             ..inputs()
         };
@@ -878,9 +913,9 @@ mod tests {
         // No ratio and nothing spent: the reading itself, nothing derived.
         let i = WindowInputs {
             own_usd_per_point: None,
-            spent_since: 0.0,
-            cost_in_window: 0.0,
-            cost_burn: 0.0,
+            spent_since: Usd::new(0.0),
+            cost_in_window: Usd::new(0.0),
+            cost_burn: Usd::new(0.0),
             by_project: Vec::new(),
             series: Vec::new(),
             ..inputs()

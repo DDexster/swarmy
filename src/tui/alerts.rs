@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use super::SeatRow;
 use crate::core::limits::{self, Level};
 use crate::core::models::{context_window, short_name};
+#[cfg(test)]
+use crate::core::units::{Pct, Usd};
 use crate::limits::AccountReport;
 use crate::live::{PastKind, Snapshot, State};
 use crate::ui::fmt;
@@ -37,7 +39,7 @@ pub struct Attn {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AttnTarget {
     Agent(String),
-    Mana,
+    Limits,
     None,
 }
 
@@ -80,6 +82,8 @@ pub struct Scene<'a> {
     pub seats: &'a [SeatRow],
     /// Saved logins (the vault as the LIMITS · SEATS panel shows it).
     pub logins: &'a [Login],
+    /// What could not be read (a damaged `.claude.json`, the vault): numbers may be off.
+    pub problems: &'a [String],
     /// `--mask`: file paths are blanked.
     pub mask: bool,
     pub now: DateTime<Utc>,
@@ -88,7 +92,18 @@ pub struct Scene<'a> {
 /// Everything that needs a look, most urgent first.
 pub fn attention(s: &Scene) -> Vec<Attn> {
     let now = s.now;
-    let mut out = Vec::new();
+    let mut out: Vec<Attn> = s
+        .problems
+        .iter()
+        .map(|p| Attn {
+            severity: severity::ERRORS,
+            glyph: "✖",
+            tone: Tone::Bad,
+            text: p.clone(),
+            since: None,
+            target: AttnTarget::Limits,
+        })
+        .collect();
     for a in &s.snapshot.agents {
         let name = if a.is_main() {
             format!("{} · {}", a.name, a.project)
@@ -167,7 +182,7 @@ pub fn attention(s: &Scene) -> Vec<Attn> {
                     seat.label
                 ),
                 since: seat.state.unverified_since,
-                target: AttnTarget::Mana,
+                target: AttnTarget::Limits,
             });
         } else if seat.state.fingerprint.is_some() && seat.login.is_none() {
             out.push(Attn {
@@ -179,7 +194,7 @@ pub fn attention(s: &Scene) -> Vec<Attn> {
                     seat.label
                 ),
                 since: None,
-                target: AttnTarget::Mana,
+                target: AttnTarget::Limits,
             });
         }
     }
@@ -193,7 +208,7 @@ pub fn attention(s: &Scene) -> Vec<Attn> {
                 tone: Tone::Warn,
                 text: format!("login {} expires in {}", l.label, fmt::duration(t - now)),
                 since: None,
-                target: AttnTarget::Mana,
+                target: AttnTarget::Limits,
             });
         }
     }
@@ -250,7 +265,7 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
                         }
                     ),
                     since: None,
-                    target: AttnTarget::Mana,
+                    target: AttnTarget::Limits,
                 });
             } else if let Some(eta) = w.eta.filter(|d| d.num_hours() < RUNS_OUT_SOON_HOURS) {
                 out.push(Attn {
@@ -264,7 +279,7 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
                         (now + eta).with_timezone(&chrono::Local).format("%a %H:%M")
                     ),
                     since: None,
-                    target: AttnTarget::Mana,
+                    target: AttnTarget::Limits,
                 });
             } else if w.level() == Level::Bad {
                 out.push(Attn {
@@ -273,7 +288,7 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
                     tone: Tone::Warn,
                     text: format!("{label}: {} used", fmt::pct(w.estimate_now)),
                     since: None,
-                    target: AttnTarget::Mana,
+                    target: AttnTarget::Limits,
                 });
             }
         }
@@ -281,7 +296,7 @@ fn limit_items(s: &Scene, out: &mut Vec<Attn>) {
 }
 
 /// A line for the event log. `flash` is what to highlight for a moment: an agent key,
-/// `mana:<account>` (a limit crossed) or `restored:<account>` (a limit reset).
+/// `limit:<account>` (a limit crossed) or `restored:<account>` (a limit reset).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Notice {
     pub glyph: &'static str,
@@ -425,12 +440,12 @@ pub fn limit_events(prev: &[AccountReport], next: &[AccountReport]) -> Events {
                 .iter()
                 .find(|r| r.account_uuid == rep.account_uuid)
                 .and_then(|r| r.windows.iter().find(|x| x.reading.kind == w.reading.kind))
-                .map(|x| (x.estimate_now, x.window));
+                .map(|x| (x.estimate_now.get(), x.window));
             let Some((p, prev_window)) = before else {
                 continue;
             };
             for th in LIMIT_CROSSINGS {
-                if p < th && w.estimate_now >= th {
+                if p < th && w.estimate_now.get() >= th {
                     ev.notices.push(
                         Notice::new(
                             "▲",
@@ -441,7 +456,7 @@ pub fn limit_events(prev: &[AccountReport], next: &[AccountReport]) -> Events {
                             ),
                             Tone::Bad,
                         )
-                        .flash(format!("mana:{}", rep.account_uuid)),
+                        .flash(format!("limit:{}", rep.account_uuid)),
                     );
                     ev.ring |= th >= RING_AT;
                 }
@@ -519,6 +534,7 @@ mod tests {
     fn agent(session: &str, id: &str, state: State) -> Agent {
         Agent {
             seat: "work".into(),
+            seat_label: "work".into(),
             session_id: session.into(),
             agent_id: id.into(),
             parent: None,
@@ -569,11 +585,11 @@ mod tests {
                 own_usd_per_point: None,
                 usd_per_point: None,
                 reference: None,
-                cost_in_window: 0.0,
-                estimate_now: used,
+                cost_in_window: Usd::ZERO,
+                estimate_now: Pct::new(used),
                 visible_points: None,
                 outside_points: None,
-                burn_usd_per_hour: 0.0,
+                burn_usd_per_hour: Usd::ZERO,
                 points_per_hour: None,
                 eta: eta_hours.map(Duration::hours),
                 eta_seconds: eta_hours.map(|h| h * 3600),
@@ -588,6 +604,7 @@ mod tests {
 
     fn seat(label: &str, account: Option<&str>, login: Option<&str>) -> SeatRow {
         SeatRow {
+            id: label.into(),
             label: label.into(),
             account: account.map(String::from),
             login: login.map(String::from),
@@ -610,9 +627,25 @@ mod tests {
             limits,
             seats,
             logins: &[],
+            problems: &[],
             mask,
             now: now(),
         }
+    }
+
+    /// First review H5: a file that could not be read is said in ATTENTION, not shown as if
+    /// the seat had no account.
+    #[test]
+    fn what_could_not_be_read_is_attention() {
+        let snap = Snapshot::default();
+        let problems = ["seat work: /x/.claude.json is damaged".to_string()];
+        let items = attention(&Scene {
+            problems: &problems,
+            ..scene(&snap, &[], &[], false)
+        });
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].severity, severity::ERRORS);
+        assert!(items[0].text.contains("damaged"));
     }
 
     #[test]
@@ -632,7 +665,7 @@ mod tests {
         assert_eq!(items[1].severity, severity::PARKED_LIMIT);
         assert_eq!(items[1].tone, Tone::Info);
         assert!(items[1].text.ends_with("(saved login, not in a seat)"));
-        assert!(items.iter().all(|a| a.target == AttnTarget::Mana));
+        assert!(items.iter().all(|a| a.target == AttnTarget::Limits));
     }
 
     #[test]
@@ -829,7 +862,7 @@ mod tests {
         let ev = limit_events(&[report("a", 75.0, None)], &[report("a", 85.0, None)]);
         let texts: Vec<&str> = ev.notices.iter().map(|n| n.text.as_str()).collect();
         assert_eq!(texts, vec!["LIMIT a-login weekly crossed 80%"]);
-        assert_eq!(ev.notices[0].flash.as_deref(), Some("mana:a"));
+        assert_eq!(ev.notices[0].flash.as_deref(), Some("limit:a"));
         assert!(!ev.ring);
         let ev = limit_events(&[report("a", 85.0, None)], &[report("a", 100.0, None)]);
         let texts: Vec<&str> = ev.notices.iter().map(|n| n.text.as_str()).collect();

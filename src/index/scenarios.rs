@@ -3,7 +3,7 @@
 //! computed by hand in the comments. `World` is the fixture, shared with the limits tests.
 
 #[cfg(test)]
-pub(crate) use tests::{World, account, assistant, at, owner, weekly};
+pub(crate) use tests::{World, account, assistant, at, dump, owner, weekly};
 
 #[cfg(test)]
 mod tests {
@@ -125,16 +125,20 @@ mod tests {
                 .map(|l| {
                     let d = dir.path().join(format!("claude-{l}"));
                     std::fs::create_dir_all(d.join("projects").join("-w-proj")).unwrap();
-                    Seat {
-                        label: l.to_string(),
-                        claude_json: d.join(".claude.json"),
-                        dir: d,
-                        is_default: false,
-                        found_by: Vec::new(),
-                    }
+                    Seat::new(l.to_string(), d.clone(), d.join(".claude.json"), false)
                 })
                 .collect();
             World { dir, seats }
+        }
+
+        /// The id of the seat labelled `label`.
+        pub(crate) fn id(&self, label: &str) -> crate::core::ids::SeatId {
+            self.seats
+                .iter()
+                .find(|s| s.label == label)
+                .unwrap()
+                .id
+                .clone()
         }
 
         fn transcript(&self, seat: &str, session: &str) -> PathBuf {
@@ -213,13 +217,24 @@ mod tests {
                     name: "docs".into(),
                 },
             ]);
-            idx.refresh(&self.seats, info, &mut resolver, prices, &mut |_| {})
+            // Tests name a seat's info by label; the index keys it by the seat's id.
+            let info: Vec<SeatInfo> = info
+                .iter()
+                .cloned()
+                .map(|mut i| {
+                    if i.seat.as_str().is_empty() {
+                        i.seat = self.id(&i.label);
+                    }
+                    i
+                })
+                .collect();
+            idx.refresh(&self.seats, &info, &mut resolver, prices, &mut |_| {})
                 .unwrap();
         }
     }
 
     /// Every row of a query, as text, for comparing two indexes.
-    fn dump(idx: &Index, sql: &str) -> Vec<String> {
+    pub(crate) fn dump(idx: &Index, sql: &str) -> Vec<String> {
         let mut st = idx.conn.prepare(sql).unwrap();
         let n = st.column_count();
         st.query_map([], |r| {
@@ -381,6 +396,7 @@ mod tests {
             ],
         );
         let info = [SeatInfo {
+            seat: Default::default(),
             label: "work".into(),
             account: Some(account("acc-b", "2026-11-10T11:00:00Z")),
             utilization: None,
@@ -523,7 +539,7 @@ mod tests {
     fn cache_book(input: f64, output: f64) -> PriceBook {
         let mut b = PriceBook::builtin();
         let cache = serde_json::json!({"claude-sonnet-5-5": {"inputTokens": input, "outputTokens": output}});
-        b.merge_claude_code_cache("work", &cache);
+        b.merge_claude_code_cache(&"work".into(), &cache);
         b
     }
 
@@ -667,7 +683,7 @@ mod tests {
         let mut idx = w.index("i.sqlite");
         let mut book = PriceBook::builtin();
         book.merge_claude_code_cache(
-            "work",
+            &"work".into(),
             &serde_json::json!({"claude-new-9": {"inputTokens": 7, "outputTokens": 35}}),
         );
         let dated = idx.dated_prices(&book, at("2026-11-20T12:00:00Z")).unwrap();
@@ -884,7 +900,11 @@ mod tests {
         // Sanity: the fixture counts what it should.
         assert_eq!(want[0].len(), 2, "two prompts");
         assert_eq!(want[1].len(), 2, "two API errors");
-        assert_eq!(want[2], vec!["work|s1|1".to_string()], "one compaction");
+        assert_eq!(
+            want[2],
+            vec![format!("{}|s1|1", w.id("work"))],
+            "one compaction"
+        );
         assert_eq!(
             want[4],
             ["r1|2", "r2|1", "sa1|1"].map(String::from).to_vec()
@@ -947,7 +967,7 @@ mod tests {
         assert_eq!(after[2], want[2], "and its compaction");
         assert_eq!(
             after[1],
-            vec!["work|s1||1794304860000|rate_limit".to_string()],
+            vec![format!("{}|s1||1794304860000|rate_limit", w.id("work"))],
             "the main thread's error (10:01) stays, the subagent's is gone"
         );
 
@@ -964,6 +984,7 @@ mod tests {
         let w = World::new(&["work", "home"]);
         let resets = |jitter: &str| format!("2026-11-25T{jitter}Z");
         let seat = |label: &str, used: f64, fetched: &str, reset: &str| SeatInfo {
+            seat: Default::default(),
             label: label.into(),
             account: Some(account("acc-a", "2026-11-01T00:00:00Z")),
             utilization: Some(weekly("acc-a", fetched, used, reset)),

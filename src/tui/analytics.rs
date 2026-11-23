@@ -80,13 +80,23 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
     let mut vault_logins = Vec::new();
     let mut seats = Vec::new();
     let mut states = std::collections::BTreeMap::new();
-    if let Ok(mut v) = Vault::open(&ctx.dirs.vault_dir()) {
-        states = v.edit(|tx| tx.seat_states(&ctx.seats)).unwrap_or_default();
-        vault_logins = v.logins().to_vec();
+    let mut problems = ctx.problems.clone();
+    // An unreadable vault is said so in ATTENTION, never shown as an empty one.
+    match Vault::open(&ctx.dirs.vault_dir()) {
+        Ok(mut v) => {
+            match v.edit(|tx| tx.seat_states(&ctx.seats)) {
+                Ok(s) => states = s,
+                Err(e) => problems.push(format!("vault: seats not checked: {e:#}")),
+            }
+            vault_logins = v.logins().to_vec();
+        }
+        Err(e) => problems.push(format!("vault unreadable: {e:#}")),
     }
+    problems.dedup();
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let state = states.get(&s.label).cloned().unwrap_or_default();
+        let state = states.get(&s.id).cloned().unwrap_or_default();
         seats.push(SeatRow {
+            id: s.id.clone(),
             label: s.label.clone(),
             account: if state.unverified_since.is_some() {
                 None
@@ -96,10 +106,10 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
             login: state.saved_as.clone().or_else(|| {
                 vault_logins
                     .iter()
-                    .find(|l| l.mounted.as_deref() == Some(&s.label))
+                    .find(|l| l.mounted.as_ref() == Some(&s.id))
                     .map(|l| l.label.clone())
             }),
-            live: registry::live_sessions(&s.label, &s.sessions_dir(), &ctx.procs).len(),
+            live: registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs).len(),
             state,
         });
     }
@@ -116,8 +126,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
     }
     let midnight = chrono::Local::now()
         .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
+        .and_time(chrono::NaiveTime::MIN)
         .and_local_timezone(chrono::Local)
         .earliest()
         .map(|t| t.with_timezone(&Utc))
@@ -293,6 +302,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         },
         logins: vault_logins,
         seats,
+        problems,
         transcripts_bytes: disk.to_vec(),
         index_bytes: std::fs::metadata(ctx.dirs.index_file())
             .map(|m| m.len())

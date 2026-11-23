@@ -9,6 +9,8 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::ids::SeatId;
+use super::units::Usd;
 use super::usage::Usage;
 
 /// USD per million tokens; `web_search` is USD per request.
@@ -118,17 +120,28 @@ pub struct LongContext {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub enum PriceSource {
     Builtin,
-    /// `additionalModelCostsCache` of a Claude Code config dir.
-    ClaudeCode(String),
+    /// `additionalModelCostsCache` of a Claude Code config dir (the seat it was read from).
+    ClaudeCode(SeatId),
     User,
 }
 
 impl PriceSource {
-    pub fn label(&self) -> String {
+    /// How `swarmy prices` names the source; `seat_label` names a seat id.
+    pub fn label(&self, seat_label: impl Fn(&SeatId) -> String) -> String {
         match self {
             PriceSource::Builtin => "built-in".into(),
-            PriceSource::ClaudeCode(seat) => format!("claude code ({seat})"),
+            PriceSource::ClaudeCode(seat) => format!("claude code ({})", seat_label(seat)),
             PriceSource::User => "config.toml".into(),
+        }
+    }
+
+    /// The source without the seat it was read from: which seat carried a cache changes no
+    /// price, so it must not change the fingerprint (no reprice on a seat rename).
+    fn kind(&self) -> &'static str {
+        match self {
+            PriceSource::Builtin => "builtin",
+            PriceSource::ClaudeCode(_) => "claude_code",
+            PriceSource::User => "user",
         }
     }
 }
@@ -146,7 +159,7 @@ pub struct PriceEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Cost {
-    pub usd: f64,
+    pub usd: Usd,
     /// False when no price is known for the model: the cost is then 0, flagged, never silent.
     pub priced: bool,
 }
@@ -156,6 +169,10 @@ pub struct PriceBook {
     entries: Vec<PriceEntry>,
 }
 
+#[expect(
+    clippy::panic,
+    reason = "evaluated at compile time for the built-in table: a bad date fails the build"
+)]
 const fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     match NaiveDate::from_ymd_opt(y, m, d) {
         Some(x) => x,
@@ -343,7 +360,7 @@ impl PriceBook {
     /// What the cache leaves out (fast mode, long context, a missing cache rate) is derived from
     /// the built-in entry of the same model. Entries are undated (`from: None`): the index dates
     /// them by when it first saw them (`Index::dated_prices`). Invalid rates are skipped.
-    pub fn merge_claude_code_cache(&mut self, seat: &str, cache: &serde_json::Value) {
+    pub fn merge_claude_code_cache(&mut self, seat: &SeatId, cache: &serde_json::Value) {
         let Some(map) = cache.as_object() else { return };
         for (model, v) in map {
             let f = |k: &str| v.get(k).and_then(|x| x.as_f64());
@@ -376,7 +393,7 @@ impl PriceBook {
                 model: model.clone(),
                 from: None,
                 rates,
-                source: PriceSource::ClaudeCode(seat.to_string()),
+                source: PriceSource::ClaudeCode(seat.clone()),
             });
         }
     }
@@ -479,7 +496,7 @@ impl PriceBook {
     pub fn cost(&self, model: &str, day: NaiveDate, usage: &Usage, fast: bool) -> Cost {
         let parts = self.cost_parts(model, day, usage, fast);
         Cost {
-            usd: parts.map_or(0.0, |p| p.total()),
+            usd: parts.map_or(Usd::ZERO, |p| p.total()),
             priced: parts.is_some(),
         }
     }
@@ -516,13 +533,24 @@ impl PriceBook {
         }
     }
 
-    /// Changes whenever any price changes, so stored costs know when to be recomputed.
+    /// Changes whenever any price changes, so stored costs know when to be recomputed. Which
+    /// seat a cached price came from is left out: renaming or re-ordering seats reprices nothing.
     pub fn fingerprint(&self) -> String {
         let mut h = Sha256::new();
         for e in &self.entries {
-            h.update(serde_json::to_vec(e).unwrap_or_default());
+            h.update(e.model.as_bytes());
+            h.update([0]);
+            h.update(e.from.map(|d| d.to_string()).unwrap_or_default().as_bytes());
+            h.update([0]);
+            h.update(e.source.kind().as_bytes());
+            h.update([0]);
+            // Rates are plain numbers: serializing them cannot fail.
+            h.update(serde_json::to_vec(&e.rates).unwrap_or_default());
+            h.update([0]);
         }
-        hex::encode(&h.finalize()[..8])
+        let mut s = hex::encode(h.finalize());
+        s.truncate(16);
+        s
     }
 }
 
@@ -530,18 +558,18 @@ impl PriceBook {
 /// panel's split and the totals come from the same numbers.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct CostParts {
-    pub input: f64,
+    pub input: Usd,
     /// 5-minute and 1-hour cache writes.
-    pub cache_write: f64,
-    pub cache_read: f64,
-    pub output: f64,
-    pub web: f64,
+    pub cache_write: Usd,
+    pub cache_read: Usd,
+    pub output: Usd,
+    pub web: Usd,
     /// What the cache reads saved against paying the input rate for them (not part of the cost).
-    pub cache_saved: f64,
+    pub cache_saved: Usd,
 }
 
 impl CostParts {
-    pub fn total(&self) -> f64 {
+    pub fn total(&self) -> Usd {
         self.input + self.cache_write + self.cache_read + self.output + self.web
     }
 }
@@ -567,20 +595,20 @@ pub fn cost_parts_in_band(r: &Rates, u: &Usage, fast: bool, long: bool) -> CostP
     } else {
         1.0
     };
-    let tok = |n: u64, rate: f64, mult: f64| n as f64 * rate * mult / 1_000_000.0 * speed;
+    let tok = |n: u64, rate: f64, mult: f64| Usd::new(n as f64 * rate * mult / 1_000_000.0 * speed);
     CostParts {
         input: tok(u.input, r.input, pin),
         cache_write: tok(u.cache_write_5m, r.cache_write_5m, pin)
             + tok(u.cache_write_1h, r.cache_write_1h, pin),
         cache_read: tok(u.cache_read, r.cache_read, pin),
         output: tok(u.output, r.output, pout),
-        web: u.web_search as f64 * r.web_search * speed,
+        web: Usd::new(u.web_search as f64 * r.web_search * speed),
         cache_saved: tok(u.cache_read, (r.input - r.cache_read).max(0.0), pin),
     }
 }
 
 /// USD for one request at the given rates.
-pub fn cost_with(r: &Rates, u: &Usage, fast: bool) -> f64 {
+pub fn cost_with(r: &Rates, u: &Usage, fast: bool) -> Usd {
     cost_parts(r, u, fast).total()
 }
 
@@ -605,7 +633,8 @@ mod tests {
         NaiveDate::from_ymd_opt(2026, 11, 22).unwrap()
     }
 
-    fn close(a: f64, b: f64) -> bool {
+    fn close(a: impl Into<f64>, b: impl Into<f64>) -> bool {
+        let (a, b): (f64, f64) = (a.into(), b.into());
         (a - b).abs() < 1e-12
     }
 
@@ -702,7 +731,7 @@ mod tests {
         let cache = serde_json::json!({"claude-opus-5-5": {"inputTokens": 3, "outputTokens": 15,
             "promptCacheWriteTokens": 3.75, "promptCacheWrite1hTokens": 6, "promptCacheReadTokens": 0.3,
             "webSearchRequests": 0.01}});
-        b.merge_claude_code_cache("default", &cache);
+        b.merge_claude_code_cache(&"default".into(), &cache);
         let e = b.lookup("claude-opus-5-5", day()).unwrap();
         assert_eq!(e.rates.input, 3.0);
         assert_eq!(
@@ -830,18 +859,18 @@ mod tests {
         // ratio (0.20 / 8 = 2.5%) applies, so reads cost $0.20, not 10% = $0.80.
         let mut b = PriceBook::builtin();
         let cache = serde_json::json!({"claude-fable-5-2": {"inputTokens": 8, "outputTokens": 40}});
-        b.merge_claude_code_cache("work", &cache);
+        b.merge_claude_code_cache(&"work".into(), &cache);
         let e = b.lookup("claude-fable-5-2", day()).unwrap();
         assert_eq!(e.source, PriceSource::ClaudeCode("work".into()));
         assert!(close(e.rates.cache_read, 0.2), "{}", e.rates.cache_read);
         // A model nobody else prices falls back to the general 10%.
         let cache = serde_json::json!({"claude-new-9": {"inputTokens": 2, "outputTokens": 10}});
-        b.merge_claude_code_cache("work", &cache);
+        b.merge_claude_code_cache(&"work".into(), &cache);
         let e = b.lookup("claude-new-9", day()).unwrap();
         assert!(close(e.rates.cache_read, 0.2), "{}", e.rates.cache_read);
         // Negative prices in a cache are skipped.
         let cache = serde_json::json!({"claude-bad-1": {"inputTokens": -2, "outputTokens": 10}});
-        b.merge_claude_code_cache("work", &cache);
+        b.merge_claude_code_cache(&"work".into(), &cache);
         assert!(b.lookup("claude-bad-1", day()).is_none());
     }
 
@@ -881,7 +910,7 @@ mod tests {
             let c = book.cost(model, day(), &u, fast);
             assert!(c.priced);
             assert!(close(p.total(), c.usd), "{model} fast={fast}");
-            assert!(p.cache_saved > 0.0);
+            assert!(p.cache_saved > Usd::ZERO);
         }
         // Fast-mode Opus 5.5 by hand ($4 input, $20 output per MTok, $0.01 per search, fast ×2):
         // input 300k × 4 = $1.20 → $2.40; output 4k × 20 = $0.08 → $0.16; web 3 × 0.01 = $0.03
@@ -913,7 +942,7 @@ mod tests {
         let both = book
             .cost_parts_in_band("claude-haiku-5-5", day(), &u, false, true)
             .unwrap();
-        assert!(close(2.0 * one.input, both.input) && close(2.0 * one.output, both.output));
+        assert!(close(one.input * 2.0, both.input) && close(one.output * 2.0, both.output));
         // Outside the band the same sums take the plain rates: input 300k × 0.10 = $0.03.
         let plain = book
             .cost_parts_in_band("claude-haiku-5-5", day(), &u, false, false)

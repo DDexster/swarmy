@@ -74,7 +74,7 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
                 .find(|s| &s.label == item)
                 .and_then(|s| s.account.clone()),
         };
-        let (five, week, reset) = app.mana_of(account.as_deref());
+        let (five, week, reset) = app.limits_of(account.as_deref());
         let acct = account
             .as_deref()
             .map(|a| mask_name(app, &app.account_label(a)))

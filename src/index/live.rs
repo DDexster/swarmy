@@ -7,12 +7,15 @@ use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 
 use super::{Index, ms};
+use crate::core::ids::{SeatId, SessionId};
 
 /// One agent (or main thread, `agent_id` empty) with its session's title and directory.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentRow {
-    pub seat: String,
-    pub session_id: String,
+    pub seat: SeatId,
+    /// The seat's label, for display (`seats`).
+    pub seat_label: String,
+    pub session_id: SessionId,
     pub agent_id: String,
     pub kind: String,
     pub agent_type: Option<String>,
@@ -31,8 +34,8 @@ pub struct AgentRow {
 /// Which agent a per-agent read is about.
 #[derive(Debug, Clone, Copy)]
 pub struct AgentKey<'a> {
-    pub seat: &'a str,
-    pub session_id: &'a str,
+    pub seat: &'a SeatId,
+    pub session_id: &'a SessionId,
     pub agent_id: &'a str,
 }
 
@@ -120,12 +123,13 @@ impl Index {
         &self,
         recent: DateTime<Utc>,
         unfinished_since: DateTime<Utc>,
-        live: &HashSet<(String, String)>,
+        live: &HashSet<(SeatId, SessionId)>,
     ) -> anyhow::Result<Vec<AgentRow>> {
         macro_rules! columns {
             () => {
                 "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
-                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts
+                    a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts,
+                    COALESCE((SELECT st.label FROM seats st WHERE st.seat = a.seat), a.seat)
              FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id"
             };
         }
@@ -146,6 +150,7 @@ impl Index {
                 title: r.get(12)?,
                 cwd: r.get(13)?,
                 first_ts: r.get(14)?,
+                seat_label: r.get(15)?,
             })
         };
         let mut out: Vec<AgentRow> = self
@@ -160,7 +165,7 @@ impl Index {
             columns!(),
             " WHERE a.seat = ?1 AND a.session_id = ?2 AND a.agent_id = ''"
         ))?;
-        let mut sessions: Vec<&(String, String)> = live.iter().collect();
+        let mut sessions: Vec<&(SeatId, SessionId)> = live.iter().collect();
         sessions.sort();
         for (seat, session_id) in sessions {
             let listed = out
@@ -296,8 +301,8 @@ impl Index {
     /// recent time (rolled-up spend is older than the raw window).
     pub fn session_spend(
         &self,
-        seat: &str,
-        session_id: &str,
+        seat: &SeatId,
+        session_id: &SessionId,
         since: DateTime<Utc>,
     ) -> anyhow::Result<(f64, f64)> {
         let mut st = self.conn.prepare_cached(

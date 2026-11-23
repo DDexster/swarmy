@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use super::archive::KEYS;
 use super::{Index, from_ms, ms, schema};
+use crate::core::ids::SeatId;
 use crate::core::period::{BUCKET_MS, local_midnight};
 use crate::core::pricing::{CostParts, PriceBook, PriceEntry, PriceSource, Rates};
 use crate::core::usage::Usage;
@@ -28,9 +29,9 @@ impl Index {
         }
         let today = now.with_timezone(&Local).date_naive();
         // Claude Code's entries per model, in seat order.
-        let mut current: Vec<(&str, Vec<(&PriceEntry, &str)>)> = Vec::new();
+        let mut current: Vec<(&str, Vec<(&PriceEntry, &SeatId)>)> = Vec::new();
         for (e, seat) in book.entries().iter().filter_map(|e| match &e.source {
-            PriceSource::ClaudeCode(seat) => Some((e, seat.as_str())),
+            PriceSource::ClaudeCode(seat) => Some((e, seat)),
             PriceSource::Builtin | PriceSource::User => None,
         }) {
             match current.iter_mut().find(|(m, _)| *m == e.model) {
@@ -74,7 +75,7 @@ impl Index {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
+                    r.get::<_, SeatId>(2)?,
                     r.get::<_, String>(3)?,
                     r.get::<_, bool>(4)?,
                 ))
@@ -160,7 +161,7 @@ impl Index {
                 let p = book.cost_parts(&model, day, &usage, fast);
                 let part = cost_parts(p);
                 upd.execute(params![
-                    p.map(|p| p.total()),
+                    p.map(|p| p.total().get()),
                     p.is_some() as i64,
                     id,
                     part[0],
@@ -307,8 +308,10 @@ fn reprice_rollups(tx: &Connection, book: &PriceBook) -> anyhow::Result<()> {
                 anyhow::bail!("a rollup row without a model");
             };
             let p = book.cost_parts_in_band(model, day, &usage, int(i_fast), int(i_long));
-            let mut values: Vec<rusqlite::types::Value> =
-                vec![p.map(|p| p.total()).into(), i64::from(p.is_some()).into()];
+            let mut values: Vec<rusqlite::types::Value> = vec![
+                p.map(|p| p.total().get()).into(),
+                i64::from(p.is_some()).into(),
+            ];
             values.extend(cost_parts(p).iter().map(|v| (*v).into()));
             values.extend(key);
             upd.execute(params_from_iter(values))?;
@@ -337,6 +340,7 @@ fn cost_parts(p: Option<CostParts>) -> [Option<f64>; 6] {
             p.web,
             p.cache_saved,
         ]
+        .map(f64::from)
     });
     std::array::from_fn(|i| v.map(|v| v[i]))
 }

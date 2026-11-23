@@ -14,10 +14,10 @@ use crate::app::context::Ctx;
 
 pub fn run(ctx: &Ctx, a: &PeriodFilterArgs) -> anyhow::Result<()> {
     let (idx, _) = ctx.index()?;
-    let filter = a.filter.to_filter();
+    let filter = a.filter.to_filter(ctx, &idx)?;
     let span = a
         .period
-        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_deref())?);
+        .span(ctx.now, ctx.limit_week(&idx, filter.account.as_ref())?);
     let rows = idx.spend_by(Dim::Model, span, &filter)?;
     let total = idx.total(span, &filter)?;
     let subs = idx.model_substitutions(span, &filter)?;
@@ -44,7 +44,7 @@ pub fn run(ctx: &Ctx, a: &PeriodFilterArgs) -> anyhow::Result<()> {
             ),
             Tone::Dim
         ),
-        p.paint(&filter_label(&filter), Tone::Dim)
+        p.paint(&filter_label(ctx, &filter), Tone::Dim)
     );
     println!();
     if rows.is_empty() {
