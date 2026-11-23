@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use rusqlite::params_from_iter;
+use rusqlite::{Connection, params_from_iter};
 use serde::Serialize;
 
 use super::archive::{self, Plan};
-use super::{Index, from_ms, ms};
+use super::{Index, from_ms, ms, settled};
 use crate::core::ids::{AccountId, SeatId};
 use crate::core::limits::{Reading, WindowKind};
 use crate::core::period::{BUCKET_MS, Span, bucket_start};
@@ -102,6 +102,13 @@ impl Dim {
             Dim::Hour => "HOUR",
             Dim::Weekday => "WEEKDAY",
         }
+    }
+
+    /// Whether a row's key and label come only from the request and from tables that do not
+    /// change for old requests, so a settled part can be kept (`settled`). Agent types, session
+    /// titles and agent descriptions may arrive after the requests they label.
+    fn settles(self) -> bool {
+        !matches!(self, Dim::AgentType | Dim::Session | Dim::Agent)
     }
 
     /// Chronological dimensions sort by key, the others by cost.
@@ -220,55 +227,30 @@ fn row_usage(r: &rusqlite::Row, at: usize) -> rusqlite::Result<Sums> {
 
 /// One UTC quarter hour (`period::BUCKET_MS`): (bucket number, requests, usage, cost, unpriced,
 /// pending).
-type BucketRow = (i64, u64, Usage, f64, u64, u64);
+pub(super) type BucketRow = (i64, u64, Usage, f64, u64, u64);
+
+/// One cell of a two-dimension matrix: (key of the first, its label, key of the second, cost).
+pub(super) type Cell = (String, String, String, f64);
 
 impl Index {
     pub fn spend_by(&self, dim: Dim, span: Span, f: &Filter) -> anyhow::Result<Vec<Row>> {
         if dim.is_time() {
             return self.spend_by_time(dim, span, f);
         }
-        let (key, label) = dim.exprs();
-        archive::read(&self.conn, span, false, |c, p| {
-            let mut args = Vec::new();
-            let wh = where_clause(p, f, &mut args);
-            let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
-            let from = from_for(p, &[key, label, &wh]);
-            let sums = p.sums();
-            let sql =
-                format!("SELECT {key}, {label}, {sums} {from} {wh} GROUP BY 1 ORDER BY {order}");
-            let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params_from_iter(args), |r| {
-                let (requests, usage, cost, unpriced, pending) = row_usage(r, 2)?;
-                Ok(Row {
-                    key: r.get(0)?,
-                    label: r.get(1)?,
-                    requests,
-                    usage,
-                    cost,
-                    unpriced,
-                    pending,
-                })
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
+        let read = |c: &Connection, s: Span| spend_by_on(c, dim, s, f);
+        if !dim.settles() {
+            return read(&self.conn, span);
+        }
+        let parts = self.settled_read(&format!("spend_by|{dim:?}|{f:?}"), span, read)?;
+        Ok(settled::merge_rows(parts))
     }
 
     /// Sums per UTC quarter hour; local-time grouping happens in Rust (`time_key`), which is far
     /// cheaper than SQLite's `localtime` on every row and exact in every zone.
-    fn buckets(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
-        archive::read(&self.conn, span, false, |c, p| {
-            let mut args = Vec::new();
-            let wh = where_clause(p, f, &mut args);
-            let from = from_for(p, &[&wh]);
-            let sums = p.sums();
-            let sql = format!("SELECT r.ts / {BUCKET_MS}, {sums} {from} {wh} GROUP BY 1");
-            let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params_from_iter(args), |r| {
-                let (n, u, c, up, pe) = row_usage(r, 1)?;
-                Ok((r.get::<_, i64>(0)?, n, u, c, up, pe))
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
+    pub(super) fn buckets(&self, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
+        let parts =
+            self.settled_read(&format!("buckets|{f:?}"), span, |c, s| buckets_on(c, s, f))?;
+        Ok(settled::merge_buckets(parts))
     }
 
     fn time_key(dim: Dim, bucket: i64) -> String {
@@ -312,32 +294,33 @@ impl Index {
             }
             return Ok(acc.into_iter().map(|((x, y), c)| (x, y, c)).collect());
         }
-        let (ka, la) = a.exprs();
-        let (kb, _) = b.exprs();
-        let la = if la.starts_with("MAX(") {
-            la.to_string()
+        let read = |c: &Connection, s: Span| matrix_on(c, a, b, s, f);
+        let cells = if a.settles() && b.settles() {
+            settled::merge_cells(self.settled_read(
+                &format!("matrix|{a:?}|{b:?}|{f:?}"),
+                span,
+                read,
+            )?)
         } else {
-            format!("MAX({la})")
+            read(&self.conn, span)?
         };
-        archive::read(&self.conn, span, false, |c, p| {
-            let mut args = Vec::new();
-            let wh = where_clause(p, f, &mut args);
-            let from = from_for(p, &[&la, kb, ka, &wh]);
-            let sql = format!("SELECT {la}, {kb}, TOTAL(r.cost) {from} {wh} GROUP BY {ka}, {kb}");
-            let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params_from_iter(args), |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get::<_, Option<f64>>(2)?.unwrap_or(0.0),
-                ))
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
+        Ok(cells
+            .into_iter()
+            .map(|(_, la, kb, c)| (la, kb, c))
+            .collect())
     }
 
     pub fn total(&self, span: Span, f: &Filter) -> anyhow::Result<Row> {
-        archive::read(&self.conn, span, false, |c, p| total_on(c, p, f))
+        let parts = self.settled_read(&format!("total|{f:?}"), span, |c, s| {
+            archive::read(c, s, false, |c, p| total_on(c, p, f))
+        })?;
+        Ok(match parts {
+            (Some(mut a), b) => {
+                settled::add_row(&mut a, &b);
+                a
+            }
+            (None, b) => b,
+        })
     }
 
     /// `total` together with the price fingerprint its costs were computed with, read in one
@@ -409,21 +392,10 @@ impl Index {
         span: Span,
         f: &Filter,
     ) -> anyhow::Result<Vec<(String, String, u64)>> {
-        archive::read(&self.conn, span, false, |c, p| {
-            let mut args = Vec::new();
-            let wh = where_clause(p, f, &mut args);
-            let sql = format!(
-                "SELECT r.requested_model, r.model, {} {} {wh} AND r.requested_model IS NOT NULL AND r.requested_model != ''
-                 AND r.requested_model != r.model GROUP BY 1, 2 ORDER BY 3 DESC",
-                p.count(),
-                from_for(p, &[&wh])
-            );
-            let mut st = c.prepare(&sql)?;
-            let rows = st.query_map(params_from_iter(args), |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
-            })?;
-            Ok(rows.collect::<Result<_, _>>()?)
-        })
+        let parts = self.settled_read(&format!("subs|{f:?}"), span, |c, s| {
+            substitutions_on(c, s, f)
+        })?;
+        Ok(settled::merge_counts(parts))
     }
 
     /// The accounts the index knows under `key`: an account uuid it has seen anywhere (requests,
@@ -564,32 +536,21 @@ impl Index {
         f: &Filter,
     ) -> anyhow::Result<Vec<f64>> {
         let bucket = bucket_minutes.max(1) * 60_000;
-        let start = ms(span.start);
-        let n = (((ms(span.end) - start) as f64) / bucket as f64)
+        let origin = ms(span.start);
+        let n = (((ms(span.end) - origin) as f64) / bucket as f64)
             .ceil()
             .max(1.0) as usize;
-        archive::read(&self.conn, span, false, |c, p| {
-            let mut args = Vec::new();
-            let wh = where_clause(p, f, &mut args);
-            let sql = format!(
-                "SELECT (r.ts - {start}) / {bucket}, TOTAL(r.cost) {} {wh} GROUP BY 1",
-                from_for(p, &[&wh])
-            );
-            let mut st = c.prepare(&sql)?;
-            let mut out = vec![0.0; n];
-            let rows = st.query_map(params_from_iter(args), |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
-                ))
-            })?;
-            for row in rows {
-                let (i, c) = row?;
-                if (i as usize) < n && i >= 0 {
-                    out[i as usize] = c;
+        let parts = self.settled_read(&format!("series|{bucket}|{f:?}"), span, |c, s| {
+            series_on(c, s, origin, bucket, n, f)
+        })?;
+        Ok(match parts {
+            (Some(mut a), b) => {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
                 }
+                a
             }
-            Ok(out)
+            (None, b) => b,
         })
     }
 }
@@ -607,7 +568,145 @@ where
     }
 }
 
-fn total_on(conn: &rusqlite::Connection, plan: Plan, f: &Filter) -> anyhow::Result<Row> {
+pub(super) fn spend_by_on(
+    c: &Connection,
+    dim: Dim,
+    span: Span,
+    f: &Filter,
+) -> anyhow::Result<Vec<Row>> {
+    let (key, label) = dim.exprs();
+    archive::read(c, span, false, |c, p| {
+        let mut args = Vec::new();
+        let wh = where_clause(p, f, &mut args);
+        let order = if dim.is_time() { "1 ASC" } else { "11 DESC" }; // 11: the cost
+        let from = from_for(p, &[key, label, &wh]);
+        let sums = p.sums();
+        let sql = format!("SELECT {key}, {label}, {sums} {from} {wh} GROUP BY 1 ORDER BY {order}");
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(args), |r| {
+            let (requests, usage, cost, unpriced, pending) = row_usage(r, 2)?;
+            Ok(Row {
+                key: r.get(0)?,
+                label: r.get(1)?,
+                requests,
+                usage,
+                cost,
+                unpriced,
+                pending,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+}
+
+pub(super) fn buckets_on(c: &Connection, span: Span, f: &Filter) -> anyhow::Result<Vec<BucketRow>> {
+    archive::read(c, span, false, |c, p| {
+        let mut args = Vec::new();
+        let wh = where_clause(p, f, &mut args);
+        let from = from_for(p, &[&wh]);
+        let sums = p.sums();
+        let sql = format!("SELECT r.ts / {BUCKET_MS}, {sums} {from} {wh} GROUP BY 1");
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(args), |r| {
+            let (n, u, c, up, pe) = row_usage(r, 1)?;
+            Ok((r.get::<_, i64>(0)?, n, u, c, up, pe))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+}
+
+/// (key of `a`, label of `a`, key of `b`, cost), in key order.
+pub(super) fn matrix_on(
+    c: &Connection,
+    a: Dim,
+    b: Dim,
+    span: Span,
+    f: &Filter,
+) -> anyhow::Result<Vec<Cell>> {
+    let (ka, la) = a.exprs();
+    let (kb, _) = b.exprs();
+    let la = if la.starts_with("MAX(") {
+        la.to_string()
+    } else {
+        format!("MAX({la})")
+    };
+    archive::read(c, span, false, |c, p| {
+        let mut args = Vec::new();
+        let wh = where_clause(p, f, &mut args);
+        let from = from_for(p, &[&la, kb, ka, &wh]);
+        let sql = format!(
+            "SELECT {ka}, {la}, {kb}, TOTAL(r.cost) {from} {wh} GROUP BY {ka}, {kb} ORDER BY 1, 3"
+        );
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, Option<f64>>(3)?.unwrap_or(0.0),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+}
+
+pub(super) fn substitutions_on(
+    c: &Connection,
+    span: Span,
+    f: &Filter,
+) -> anyhow::Result<Vec<(String, String, u64)>> {
+    archive::read(c, span, false, |c, p| {
+        let mut args = Vec::new();
+        let wh = where_clause(p, f, &mut args);
+        let sql = format!(
+            "SELECT r.requested_model, r.model, {} {} {wh} AND r.requested_model IS NOT NULL AND r.requested_model != ''
+             AND r.requested_model != r.model GROUP BY 1, 2 ORDER BY 3 DESC",
+            p.count(),
+            from_for(p, &[&wh])
+        );
+        let mut st = c.prepare(&sql)?;
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    })
+}
+
+/// Spend per bucket of `bucket` ms counted from `origin`, `n` buckets.
+pub(super) fn series_on(
+    c: &Connection,
+    span: Span,
+    origin: i64,
+    bucket: i64,
+    n: usize,
+    f: &Filter,
+) -> anyhow::Result<Vec<f64>> {
+    archive::read(c, span, false, |c, p| {
+        let mut args = Vec::new();
+        let wh = where_clause(p, f, &mut args);
+        let sql = format!(
+            "SELECT (r.ts - {origin}) / {bucket}, TOTAL(r.cost) {} {wh} GROUP BY 1",
+            from_for(p, &[&wh])
+        );
+        let mut st = c.prepare(&sql)?;
+        let mut out = vec![0.0; n];
+        let rows = st.query_map(params_from_iter(args), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<f64>>(1)?.unwrap_or(0.0),
+            ))
+        })?;
+        for row in rows {
+            let (i, c) = row?;
+            if (i as usize) < n && i >= 0 {
+                out[i as usize] = c;
+            }
+        }
+        Ok(out)
+    })
+}
+
+pub(super) fn total_on(conn: &rusqlite::Connection, plan: Plan, f: &Filter) -> anyhow::Result<Row> {
     let mut args = Vec::new();
     let wh = where_clause(plan, f, &mut args);
     let from = from_for(plan, &[&wh]);

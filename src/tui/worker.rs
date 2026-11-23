@@ -85,6 +85,9 @@ pub(super) fn worker(
     let mut sl_stamp = statusline_stamp(&ctx);
     let mut past_sent = false;
     let mut prev_snap: Option<live::Snapshot> = None;
+    let mut reads = live::Reads::default();
+    // The selected agent's timeline as last sent, by (agent key, `Index::agent_seq`).
+    let mut timeline_sent: Option<(String, u64)> = None;
     let mut prev_analytics: Option<super::Analytics> = None;
     let mut fleet_last: Option<crate::fleet::Fleet> = None;
     let mut slow: Option<SlowParts> = None;
@@ -202,7 +205,7 @@ pub(super) fn worker(
             &opts,
             ctx.now,
             if heavy { None } else { prev_snap.as_ref() },
-            prev_snap.as_ref(),
+            &mut reads,
         );
         if heavy {
             jobs.done(Job::HeavyParts);
@@ -269,16 +272,24 @@ pub(super) fn worker(
         marks.push(("build+send", Instant::now()));
         let w = lock(&wants).clone();
         let tt = Instant::now();
+        // Read again only when the agent changed or the selection moved: the UI keeps the last.
+        let sent = w
+            .agent
+            .as_ref()
+            .map(|a| (a.key(), idx.agent_seq(live::key_of(a))));
         if let Some(a) = &w.agent
+            && sent != timeline_sent
             && let Ok(t) = live::tool_timeline(&idx, a, 200)
-            && !send(Msg::Timeline(
+        {
+            if !send(Msg::Timeline(
                 a.key(),
                 t,
                 live::last_message(&idx, a),
                 live::life(&idx, a).unwrap_or_default(),
-            ))
-        {
-            return;
+            )) {
+                return;
+            }
+            timeline_sent = sent;
         }
         marks.push(("timeline", Instant::now()));
         if dbg {

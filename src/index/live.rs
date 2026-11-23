@@ -2,12 +2,14 @@
 //! schema has one owner. Times are epoch milliseconds, as stored.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 
-use super::{Index, ms};
+use super::{Index, ms, settled};
 use crate::core::ids::{SeatId, SessionId};
+use crate::core::period::Span;
 
 /// One agent (or main thread, `agent_id` empty) with its session's title and directory.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -30,6 +32,9 @@ pub struct AgentRow {
     pub title: Option<String>,
     pub cwd: Option<String>,
 }
+
+/// A request's time, model and cost (0 while unpriced, as `TOTAL` counts it).
+type CostAt = (i64, String, f64);
 
 /// Which agent a per-agent read is about.
 #[derive(Debug, Clone, Copy)]
@@ -315,26 +320,80 @@ impl Index {
         })?)
     }
 
-    /// Spend per minute and model since `start`: (minute index from `start`, model, cost).
-    pub fn spend_per_minute_by_model(
-        &self,
-        start: DateTime<Utc>,
-    ) -> anyhow::Result<Vec<(i64, String, f64)>> {
+    /// A whole session's spend, its rolled-up part included.
+    pub fn session_total(&self, seat: &SeatId, session_id: &SessionId) -> anyhow::Result<f64> {
         let mut st = self.conn.prepare_cached(
-            "SELECT (ts - ?1) / 60000, model, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1, 2",
+            "SELECT TOTAL(cost) + (SELECT TOTAL(cost) FROM agent_rollup WHERE seat = ?1 AND session_id = ?2)
+             FROM requests WHERE seat = ?1 AND session_id = ?2",
         )?;
-        let rows = st.query_map(params![ms(start)], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        Ok(st.query_row(params![seat, session_id], |r| r.get(0))?)
+    }
+
+    /// Spend per session since `since`, a recent time (rolled-up spend is older than the raw
+    /// window): one read of the requests since then for every session.
+    pub fn spend_by_session_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> anyhow::Result<HashMap<(SeatId, SessionId), f64>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT seat, session_id, TOTAL(cost) FROM requests WHERE ts >= ?1 GROUP BY 1, 2",
+        )?;
+        let rows = st.query_map(params![ms(since)], |r| {
+            Ok(((r.get(0)?, r.get(1)?), r.get(2)?))
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Everything spent since `since`.
+    /// Spend per minute and model since `start`: (minute index from `start`, model, cost).
+    /// Runs every second over the last hour: the settled rows of that hour are kept between
+    /// calls (`settled`), only the last quarter hours are read again.
+    pub fn spend_per_minute_by_model(
+        &self,
+        start: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<(i64, String, f64)>> {
+        // The kept rows start an hour before the horizon, so they cover `start` until the
+        // horizon moves.
+        let from = settled::horizon(Utc::now()) - chrono::Duration::hours(1);
+        let span = Span {
+            start: from.min(start),
+            end: DateTime::<Utc>::MAX_UTC,
+        };
+        let read = |c: &rusqlite::Connection, s: Span| -> anyhow::Result<Rc<Vec<CostAt>>> {
+            let mut st = c.prepare_cached(
+                "SELECT ts, model, COALESCE(cost, 0.0) FROM requests WHERE ts >= ?1 AND ts < ?2",
+            )?;
+            let rows = st.query_map(params![ms(s.start), ms(s.end)], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+            Ok(Rc::new(rows.collect::<Result<_, _>>()?))
+        };
+        let (old, new) = self.settled_read(&format!("burn_rows|{}", ms(span.start)), span, read)?;
+        let t0 = ms(start);
+        let mut by: HashMap<(i64, &str), f64> = HashMap::new();
+        for (ts, model, cost) in old.iter().flat_map(|o| o.iter()).chain(new.iter()) {
+            if *ts >= t0 {
+                *by.entry(((ts - t0) / 60_000, model.as_str())).or_default() += cost;
+            }
+        }
+        Ok(by
+            .into_iter()
+            .map(|((i, m), c)| (i, m.to_string(), c))
+            .collect())
+    }
+
+    /// Everything spent since `since` (its settled part kept between calls, `settled`).
     pub fn spend_since(&self, since: DateTime<Utc>) -> anyhow::Result<f64> {
-        let mut st = self
-            .conn
-            .prepare_cached("SELECT TOTAL(cost) FROM requests WHERE ts >= ?1")?;
-        Ok(st.query_row(params![ms(since)], |r| r.get(0))?)
+        let span = Span {
+            start: since,
+            end: DateTime::<Utc>::MAX_UTC,
+        };
+        let (old, new) = self.settled_read("spend_since", span, |c, s| {
+            Ok(
+                c.prepare_cached("SELECT TOTAL(cost) FROM requests WHERE ts >= ?1 AND ts < ?2")?
+                    .query_row(params![ms(s.start), ms(s.end)], |r| r.get::<_, f64>(0))?,
+            )
+        })?;
+        Ok(old.map_or(new, |o| o + new))
     }
 
     /// Agents that finished since `since`, newest first (at most 60).

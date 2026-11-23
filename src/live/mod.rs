@@ -2,7 +2,7 @@
 //! waiting for its children, stalled or done. Built from the index (freshly refreshed), the
 //! session registry and the process table.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
@@ -86,6 +86,31 @@ pub struct ToolLine {
     pub is_error: bool,
 }
 
+/// An agent by (seat, session id, agent id).
+type AgentOf = (SeatId, SessionId, String);
+
+/// Per-agent reads kept from one snapshot to the next: read again only when the index wrote
+/// something of the agent's since (`Index::agent_seq`), and on every heavy tick (`build`'s
+/// `prev` is `None` then), which also picks up a reprice or a re-attribution.
+#[derive(Default)]
+pub struct Reads {
+    agents: HashMap<AgentOf, AgentReads>,
+    /// A session's whole spend, with the session's write sequence and the price fingerprint
+    /// it was read under.
+    sessions: HashMap<(SeatId, SessionId), (u64, Option<String>, f64)>,
+}
+
+#[derive(Clone)]
+struct AgentReads {
+    seq: u64,
+    last_req: crate::index::live::LastRequest,
+    totals: (u64, f64),
+    tool: Option<crate::index::live::OpenTool>,
+    done_ts: Option<i64>,
+    /// USD per minute over the last 15 minutes, as of the read.
+    spark: Vec<f64>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Snapshot {
     pub taken_at: Option<DateTime<Utc>>,
@@ -127,8 +152,8 @@ pub fn build(
     // Session totals and the recently-done list change slowly: when `prev` is given they are
     // carried over instead of recomputed.
     prev: Option<&Snapshot>,
-    // The previous snapshot, always: per-agent totals are reused when nothing new arrived.
-    prev_all: Option<&Snapshot>,
+    // Per-agent reads of earlier snapshots, reused while the agent has nothing new.
+    reads: &mut Reads,
 ) -> anyhow::Result<Snapshot> {
     let recent = now - Duration::minutes(opts.stall_minutes.max(30));
     let live_keys: HashSet<(SeatId, SessionId)> = live
@@ -184,46 +209,54 @@ pub fn build(
     let spark_start = now - Duration::minutes(15);
 
     let mut agents = Vec::new();
+    let mut next: HashMap<AgentOf, AgentReads> = HashMap::new();
     for r in &rows {
         let key = AgentKey {
             seat: &r.seat,
             session_id: &r.session_id,
             agent_id: &r.agent_id,
         };
-        let last_req = idx.last_request(key)?.unwrap_or_default();
-        let req_ts = last_req.ts;
-        // Nothing new since the previous snapshot: reuse its totals and sparkline.
-        let unchanged = prev_all
-            .and_then(|p| {
-                p.agents.iter().find(|o| {
-                    o.seat == r.seat && o.session_id == r.session_id && o.agent_id == r.agent_id
-                })
-            })
-            .filter(|o| o.last_request_ts == req_ts);
-        let (requests, cost) = match unchanged {
-            Some(o) => (o.requests, o.cost),
-            None => idx.agent_totals(key)?,
-        };
-        let tool = match req_ts {
-            Some(t) => idx.open_tool(key, t)?,
-            None => None,
-        };
-        let done_ts = idx.last_tool_done(key)?;
-        let reuse_spark = unchanged
-            .filter(|_| prev.is_some())
-            .map(|o| o.spark.clone());
-        let spark = match reuse_spark {
-            Some(sp) => sp,
+        // Nothing new since the previous snapshot: its reads stand (heavy ticks read again).
+        let seq = idx.agent_seq(key);
+        let k = (r.seat.clone(), r.session_id.clone(), r.agent_id.clone());
+        let kept = reads
+            .agents
+            .remove(&k)
+            .filter(|o| prev.is_some() && o.seq == seq);
+        let got = match kept {
+            Some(o) => o,
             None => {
-                let mut sp = vec![0.0; 15];
+                let last_req = idx.last_request(key)?.unwrap_or_default();
+                let tool = match last_req.ts {
+                    Some(t) => idx.open_tool(key, t)?,
+                    None => None,
+                };
+                let mut spark = vec![0.0; 15];
                 for (i, c) in idx.agent_spend_per_minute(key, spark_start)? {
                     if (0..15).contains(&i) {
-                        sp[i as usize] = c;
+                        spark[i as usize] = c;
                     }
                 }
-                sp
+                AgentReads {
+                    seq,
+                    totals: idx.agent_totals(key)?,
+                    tool,
+                    done_ts: idx.last_tool_done(key)?,
+                    last_req,
+                    spark,
+                }
             }
         };
+        next.insert(k, got.clone());
+        let AgentReads {
+            last_req,
+            totals: (requests, cost),
+            tool,
+            done_ts,
+            spark,
+            ..
+        } = got;
+        let req_ts = last_req.ts;
         let last = [r.last_ts, req_ts, done_ts]
             .into_iter()
             .flatten()
@@ -306,6 +339,8 @@ pub fn build(
         });
     }
 
+    reads.agents = next;
+
     // Main threads waiting on their background agents.
     for i in 0..agents.len() {
         if agents[i].is_main() && agents[i].state == State::Idle {
@@ -358,10 +393,21 @@ pub fn build(
             }
         }
     } else {
-        let hour_ago = now - Duration::hours(1);
+        // The last hour of every session in one read; a session's whole spend only when the
+        // session was written or the prices changed since it was last read.
+        let hour = idx.spend_by_session_since(now - Duration::hours(1))?;
+        let fp = idx.meta("price_fp")?;
+        let mut kept = std::mem::take(&mut reads.sessions);
         for a in agents.iter_mut().filter(|a| a.is_main()) {
-            (a.session_cost, a.session_burn) =
-                idx.session_spend(&a.seat, &a.session_id, hour_ago)?;
+            let k = (a.seat.clone(), a.session_id.clone());
+            let seq = idx.session_seq(&a.seat, &a.session_id);
+            let total = match kept.remove(&k).filter(|(s, f, _)| *s == seq && *f == fp) {
+                Some((_, _, t)) => t,
+                None => idx.session_total(&a.seat, &a.session_id)?,
+            };
+            reads.sessions.insert(k.clone(), (seq, fp.clone(), total));
+            a.session_cost = total;
+            a.session_burn = hour.get(&k).copied().unwrap_or(0.0);
             if let Some(n) = a.pid.and_then(|p| procs.nodes.get(&p)) {
                 a.cpu = n.cpu;
                 a.memory = n.memory;
@@ -674,7 +720,7 @@ pub fn tool_timeline(idx: &Index, a: &Agent, limit: usize) -> anyhow::Result<Vec
         .collect())
 }
 
-fn key_of(a: &Agent) -> AgentKey<'_> {
+pub fn key_of(a: &Agent) -> AgentKey<'_> {
     AgentKey {
         seat: &a.seat,
         session_id: &a.session_id,

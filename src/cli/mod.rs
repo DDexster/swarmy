@@ -91,6 +91,10 @@ pub enum Command {
         /// Keys to press while recording: `frame:key,frame:key` (key `enter`, `esc` or a character).
         #[arg(long, hide = true, default_value = "")]
         keys: String,
+        /// The load of a busy 4K wall (three seats, ten days of history, about 18 agents at
+        /// work), for measuring the battery budget (`tools/perf.sh`).
+        #[arg(long, hide = true)]
+        wall: bool,
     },
     /// Print shell completions.
     Completions {
@@ -206,10 +210,17 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             frames,
             size,
             keys,
+            wall,
         }) => {
             let dirs = crate::config::Dirs::resolve()?;
-            let demo = crate::demo::start(&dirs.data.join("demo"))?;
+            let load = if wall {
+                crate::demo::Load::Wall
+            } else {
+                crate::demo::Load::Demo
+            };
+            let demo = crate::demo::start(&dirs.data.join("demo"), load)?;
             let mut ctx = crate::app::context::Ctx::demo(painter, demo.seats.clone(), &demo.root)?;
+            ctx.mask = cli.mask;
             // Saved logins, so the VAULT screen has something to show.
             {
                 let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;

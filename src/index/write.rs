@@ -55,31 +55,24 @@ pub(super) fn write_file(
         // prompts, errors, compactions) would not count twice anyway. Prompts and compactions
         // belong to the main transcript: a subagent's file never touches them.
         if main {
-            tx.execute(
+            tx.prepare_cached(
                 "DELETE FROM prompts WHERE seat = ?1 AND session_id = ?2 AND ts >= ?3",
-                params![f.seat, f.session_id, kept_before],
-            )?;
-            tx.execute(
-                "DELETE FROM compact_events WHERE seat = ?1 AND session_id = ?2",
-                params![f.seat, f.session_id],
-            )?;
+            )?
+            .execute(params![f.seat, f.session_id, kept_before])?;
+            tx.prepare_cached("DELETE FROM compact_events WHERE seat = ?1 AND session_id = ?2")?
+                .execute(params![f.seat, f.session_id])?;
         }
-        tx.execute(
-            "DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4",
-            params![f.seat, f.session_id, f.agent_id, kept_before],
-        )?;
-        tx.execute(
-            "DELETE FROM record_types WHERE path = ?1",
-            [f.path.to_string_lossy()],
-        )?;
+        tx.prepare_cached("DELETE FROM api_errors WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND ts >= ?4")?.execute(params![f.seat, f.session_id, f.agent_id, kept_before])?;
+        tx.prepare_cached("DELETE FROM record_types WHERE path = ?1")?
+            .execute([f.path.to_string_lossy()])?;
     }
     // Exactly once per byte range: the offset is checked and advanced in this transaction.
     for (t, n) in &chunk.stats.by_type {
-        tx.execute(
+        tx.prepare_cached(
             "INSERT INTO record_types(path, type, count) VALUES (?1, ?2, ?3)
              ON CONFLICT(path, type) DO UPDATE SET count = count + excluded.count",
-            params![f.path.to_string_lossy(), t, *n as i64],
-        )?;
+        )?
+        .execute(params![f.path.to_string_lossy(), t, *n as i64])?;
     }
     let mut account = w.account.clone();
     let mut last_ts = w.last_ts;
@@ -107,7 +100,7 @@ pub(super) fn write_file(
     for ev in chunk.events {
         match ev {
             Event::Owner { account_uuid } => {
-                tx.execute("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![f.seat, f.session_id, last_ts, account_uuid])?;
+                tx.prepare_cached("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, last_ts, account_uuid])?;
                 account = Some(account_uuid);
             }
             Event::Request(r) => {
@@ -190,7 +183,7 @@ pub(super) fn write_file(
                     if main && rolled(ms(t)) {
                         skipped += 1;
                     } else if main {
-                        tx.execute("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
+                        tx.prepare_cached("INSERT INTO prompts(seat, session_id, ts, chars) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, ms(t), text.chars().count() as i64])?;
                     }
                 }
             }
@@ -209,21 +202,15 @@ pub(super) fn write_file(
             Event::Compact { ts } => {
                 if main {
                     let t = ts.map(ms).unwrap_or(last_ts);
-                    tx.execute(
-                        "INSERT INTO compact_events(seat, session_id, ts) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-                        params![f.seat, f.session_id, t],
-                    )?;
+                    tx.prepare_cached("INSERT INTO compact_events(seat, session_id, ts) VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, t])?;
                 }
             }
             Event::AgentLaunch { .. } => {}
             Event::CostState { total_usd, models } => {
                 // Cumulative per process; a resumed session starts a new count, so keep the largest.
-                tx.execute(
-                    "INSERT INTO cost_states(seat, session_id, total_usd, models) VALUES (?1, ?2, ?3, ?4)
+                tx.prepare_cached("INSERT INTO cost_states(seat, session_id, total_usd, models) VALUES (?1, ?2, ?3, ?4)
                      ON CONFLICT(seat, session_id) DO UPDATE SET total_usd = excluded.total_usd, models = excluded.models
-                     WHERE excluded.total_usd >= cost_states.total_usd",
-                    params![f.seat, f.session_id, total_usd, serde_json::to_string(&models).unwrap_or_default()],
-                )?;
+                     WHERE excluded.total_usd >= cost_states.total_usd")?.execute(params![f.seat, f.session_id, total_usd, serde_json::to_string(&models).unwrap_or_default()])?;
             }
             Event::ApiError { ts, kind, text } => {
                 let t = ts.map(ms).unwrap_or(last_ts);
@@ -231,11 +218,8 @@ pub(super) fn write_file(
                     skipped += 1;
                     continue;
                 }
-                tx.execute(
-                    "INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT DO NOTHING",
-                    params![f.seat, f.session_id, f.agent_id, t, kind, text],
-                )?;
+                tx.prepare_cached("INSERT INTO api_errors(seat, session_id, agent_id, ts, kind, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, f.agent_id, t, kind, text])?;
             }
         }
     }
@@ -246,16 +230,13 @@ pub(super) fn write_file(
         {
             agg.title = Some(t);
         }
-        tx.execute(
-            "INSERT INTO sessions(seat, session_id, title, ai_title, cwd, first_ts, last_ts, compactions)
+        tx.prepare_cached("INSERT INTO sessions(seat, session_id, title, ai_title, cwd, first_ts, last_ts, compactions)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COUNT(*) FROM compact_events WHERE seat = ?1 AND session_id = ?2))
              ON CONFLICT(seat, session_id) DO UPDATE SET
                title = COALESCE(excluded.title, title), ai_title = COALESCE(excluded.ai_title, ai_title), cwd = COALESCE(excluded.cwd, cwd),
                first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
                last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
-               compactions = excluded.compactions",
-            params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts],
-        )?;
+               compactions = excluded.compactions")?.execute(params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts])?;
     }
     let meta = f
         .meta_path()
@@ -265,8 +246,7 @@ pub(super) fn write_file(
         FileKind::Workflow(r) => Some(r.clone()),
         _ => None,
     };
-    tx.execute(
-        "INSERT INTO agents(seat, session_id, agent_id, kind, workflow_run, agent_type, description, tool_use_id, parent_agent_id, depth,
+    tx.prepare_cached("INSERT INTO agents(seat, session_id, agent_id, kind, workflow_run, agent_type, description, tool_use_id, parent_agent_id, depth,
                             requested_model, effort, finished, first_ts, last_ts)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(seat, session_id, agent_id) DO UPDATE SET
@@ -275,8 +255,7 @@ pub(super) fn write_file(
            depth = COALESCE(excluded.depth, depth), requested_model = COALESCE(excluded.requested_model, requested_model),
            effort = COALESCE(excluded.effort, effort), finished = excluded.finished,
            first_ts = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
-           last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts))",
-        params![
+           last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts))")?.execute(params![
             f.seat,
             f.session_id,
             f.agent_id,
@@ -292,14 +271,11 @@ pub(super) fn write_file(
             (meta.finished || main) as i64,
             agg.first_ts,
             agg.last_ts,
-        ],
-    )?;
-    tx.execute(
-        "INSERT INTO files(path, seat, session_id, agent_id, kind, ino, size, mtime, offset, last_ts, account_uuid)
+        ])?;
+    tx.prepare_cached("INSERT INTO files(path, seat, session_id, agent_id, kind, ino, size, mtime, offset, last_ts, account_uuid)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(path) DO UPDATE SET ino = excluded.ino, size = excluded.size, mtime = excluded.mtime, offset = excluded.offset,
-           last_ts = excluded.last_ts, account_uuid = excluded.account_uuid",
-        params![
+           last_ts = excluded.last_ts, account_uuid = excluded.account_uuid")?.execute(params![
             f.path.to_string_lossy(),
             f.seat,
             f.session_id,
@@ -311,7 +287,6 @@ pub(super) fn write_file(
             chunk.end as i64,
             last_ts,
             account,
-        ],
-    )?;
+        ])?;
     Ok(Written { late, skipped })
 }

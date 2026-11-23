@@ -10,11 +10,11 @@ mod panels;
 use chrono::Utc;
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use super::app::{App, Panel, Shape, TABS};
+use super::app::{App, Mark, Moves, Panel, Shape, Shot, ShotKey, TABS};
 use super::boot;
 use crate::core::limits::Level;
 use crate::live::State;
@@ -73,9 +73,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let mut words =
             crate::ui::mask::words(app.vault.logins.iter().filter_map(|l| l.email.as_deref()));
         words.extend(user_word().map(str::to_string));
-        for w in &words {
-            mask_word(f, area, w);
-        }
+        mask_words(f, area, &words);
     }
 }
 
@@ -91,26 +89,47 @@ fn user_word() -> Option<&'static str> {
     .as_deref()
 }
 
-fn mask_word(f: &mut Frame, area: Rect, word: &str) {
-    let chars: Vec<char> = word.chars().collect();
-    let n = chars.len() as u16;
+/// Blanks every whole occurrence of each word, one cell per character, wherever it was drawn.
+/// One pass per row: the row's single-character cells are read once, and a word is compared only
+/// where its first character is.
+fn mask_words(f: &mut Frame, area: Rect, words: &[String]) {
+    let words: Vec<Vec<char>> = words
+        .iter()
+        .map(|w| w.chars().collect::<Vec<char>>())
+        .filter(|w| !w.is_empty())
+        .collect();
+    if words.is_empty() {
+        return;
+    }
     let buf = f.buffer_mut();
-    for y in area.y..area.y + area.height {
-        let mut x = area.x;
-        while x + n <= area.x + area.width {
-            let hit = chars.iter().enumerate().all(|(i, c)| {
-                buf[(x + i as u16, y)]
-                    .symbol()
-                    .chars()
-                    .eq(std::iter::once(*c))
-            });
-            if hit {
-                for i in 0..n {
-                    buf[(x + i, y)].set_symbol("•");
+    let mut row: Vec<Option<char>> = Vec::with_capacity(area.width as usize);
+    for y in area.top()..area.bottom() {
+        row.clear();
+        row.extend((area.left()..area.right()).map(|x| {
+            buf.cell((x, y)).and_then(|c| {
+                let mut cs = c.symbol().chars();
+                match (cs.next(), cs.next()) {
+                    (Some(ch), None) => Some(ch),
+                    (Some(_), Some(_)) | (None, Some(_)) | (None, None) => None,
                 }
-                x += n;
-            } else {
-                x += 1;
+            })
+        }));
+        for w in &words {
+            let n = w.len();
+            let mut i = 0;
+            while i + n <= row.len() {
+                if row[i] == Some(w[0]) && w.iter().zip(&row[i..i + n]).all(|(c, r)| Some(*c) == *r)
+                {
+                    for (j, r) in row.iter_mut().enumerate().skip(i).take(n) {
+                        if let Some(c) = buf.cell_mut((area.left() + j as u16, y)) {
+                            c.set_symbol("•");
+                        }
+                        *r = Some('•');
+                    }
+                    i += n;
+                } else {
+                    i += 1;
+                }
             }
         }
     }
@@ -120,6 +139,137 @@ fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
     if area.width < 10 || area.height < 3 {
         return;
     }
+    // A panel that did not animate is drawn again only when the app's state, its place or the
+    // clock's second changed: frames come five times a second for the animated ones.
+    let key = ShotKey {
+        area,
+        big,
+        rev: app.rev,
+        second: Utc::now().timestamp(),
+        eco: app.eco,
+    };
+    let phase = blink_at(app.clock_now());
+    if let Some(shot) = app
+        .shots
+        .get(&p)
+        .filter(|s| s.key == key && s.blink.is_none_or(|b| b == phase))
+    {
+        let buf = f.buffer_mut();
+        let mut cells = shot.cells.iter();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let (Some(c), Some(dst)) = (cells.next(), buf.cell_mut((x, y))) {
+                    dst.clone_from(c);
+                }
+            }
+        }
+        patch_marks(buf, &shot.marks, app);
+        app.rects.extend(shot.rects.iter().copied());
+        return;
+    }
+    let rects_before = app.rects.len();
+    app.anim_used.set(false);
+    app.marking.set(app.cache_panels);
+    app.blink_used.set(false);
+    app.pulses.borrow_mut().clear();
+    draw_panel_now(f, app, p, area, big);
+    if !app.cache_panels {
+        return;
+    }
+    app.marking.set(false);
+    let buf = f.buffer_mut();
+    let marks = find_marks(buf, area, &app.pulses.borrow());
+    if !app.anim_used.get() {
+        let mut cells = Vec::with_capacity(area.area() as usize);
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(c) = buf.cell((x, y)) {
+                    cells.push(c.clone());
+                }
+            }
+        }
+        let rects = app.rects[rects_before..].to_vec();
+        patch_marks(buf, &marks, app);
+        app.shots.insert(
+            p,
+            Shot {
+                key,
+                cells,
+                marks,
+                blink: app.blink_used.get().then_some(phase),
+                rects,
+            },
+        );
+    } else {
+        patch_marks(buf, &marks, app);
+        app.shots.remove(&p);
+    }
+}
+
+/// The cells of `area` that pulse or spin, from the marks drawing left in them.
+fn find_marks(buf: &ratatui::buffer::Buffer, area: Rect, pulses: &[(Color, f64)]) -> Vec<Mark> {
+    let pulse = |c: Color| {
+        let Color::Indexed(i) = c else { return None };
+        i.checked_sub(PULSE_MARK)
+            .and_then(|k| pulses.get(k as usize).copied())
+    };
+    let mut out = Vec::new();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(c) = buf.cell((x, y)) else { continue };
+            if let Some((col, hz)) = pulse(c.fg) {
+                out.push(Mark {
+                    x,
+                    y,
+                    what: Moves::Fg(col, hz),
+                });
+            }
+            if let Some((col, hz)) = pulse(c.bg) {
+                out.push(Mark {
+                    x,
+                    y,
+                    what: Moves::Bg(col, hz),
+                });
+            }
+            if c.symbol() == SPINNER_MARK {
+                out.push(Mark {
+                    x,
+                    y,
+                    what: Moves::Spinner,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Draws this frame's colour or spinner into each marked cell.
+fn patch_marks(buf: &mut ratatui::buffer::Buffer, marks: &[Mark], app: &App) {
+    if marks.is_empty() {
+        return;
+    }
+    let t = app.clock_now();
+    let mut spin = [0u8; 4];
+    let spin: &str = spinner_at(t).encode_utf8(&mut spin);
+    for m in marks {
+        let Some(c) = buf.cell_mut((m.x, m.y)) else {
+            continue;
+        };
+        match m.what {
+            Moves::Fg(col, hz) => {
+                c.fg = pulse_at(app, col, hz, t);
+            }
+            Moves::Bg(col, hz) => {
+                c.bg = pulse_at(app, col, hz, t);
+            }
+            Moves::Spinner => {
+                c.set_symbol(spin);
+            }
+        }
+    }
+}
+
+fn draw_panel_now(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool) {
     match p {
         Panel::Swarm => panels::swarm(f, app, area),
         Panel::Limits => panels::limits_seats(f, app, area, big),
@@ -558,5 +708,98 @@ mod tests {
         let masked = screen(true);
         assert!(!masked.contains("zelda"), "{masked}");
         assert!(masked.contains("•••••-2"));
+    }
+
+    /// Panels kept between frames (`draw_panel`) paste exactly what drawing them again gives,
+    /// mouse rects included, and are drawn again when the app's state changes.
+    #[test]
+    fn kept_panels_are_what_drawing_again_gives() {
+        let t = tempfile::tempdir().unwrap();
+        let frame = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(326, 81)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            // The header's clock may tick between two frames: compare from the second row.
+            let cells = term.backend().buffer().content()[326..].to_vec();
+            (cells, app.rects.clone())
+        };
+        let agent = |id: &str, state: State| crate::live::Agent {
+            seat: crate::core::ids::SeatId::from_stored("0123456789abcdef"),
+            seat_label: "work".into(),
+            session_id: crate::core::ids::SessionId::new("s1"),
+            agent_id: id.into(),
+            parent: (!id.is_empty()).then(String::new),
+            depth: u32::from(!id.is_empty()),
+            name: format!("agent {id}"),
+            agent_type: None,
+            project: "shop".into(),
+            model: Some("claude-opus-5-5".into()),
+            effort: None,
+            state,
+            since: Utc::now(),
+            last_activity: Utc::now(),
+            cost: 1.5,
+            requests: 3,
+            context_tokens: 1000,
+            spark: vec![0.1; 15],
+            lane: Vec::new(),
+            tmux: None,
+            pid: None,
+            account: None,
+            first_seen: Utc::now(),
+            session_cost: 2.0,
+            session_burn: 0.5,
+            cpu: 0.0,
+            memory: 0,
+            last_request_ts: None,
+        };
+        let new_app = |cache: bool| {
+            let mut app = App::new(Theme::named(None), false, true, Vec::new(), t.path().into());
+            app.boot = None;
+            app.cache_panels = cache;
+            // Two apps animate in step on a stopped clock.
+            app.t_fixed = Some(1.3);
+            app.snapshot.agents = vec![
+                agent("", State::Idle),
+                agent("a1", State::Thinking),
+                agent(
+                    "a2",
+                    State::Tool {
+                        name: "Bash".into(),
+                        summary: "ls".into(),
+                    },
+                ),
+                agent("a3", State::NeedsYou("permission: Bash".into())),
+            ];
+            app
+        };
+        let (mut kept, mut fresh) = (new_app(true), new_app(false));
+        let first = frame(&mut kept);
+        assert!(
+            kept.shots.contains_key(&Panel::Swarm),
+            "spinning and pulsing rows are kept"
+        );
+        assert!(kept.shots[&Panel::Swarm].marks.len() >= 2);
+        assert_eq!(first, frame(&mut fresh));
+        // Nothing changed: pasted, and the spinner and the pulse move on.
+        for app in [&mut kept, &mut fresh] {
+            // The blink flips too (2.6 → 3.6 half seconds).
+            app.t_fixed = Some(1.8);
+        }
+        let later = frame(&mut kept);
+        assert_ne!(later.0, first.0);
+        assert_eq!(later, frame(&mut fresh));
+        assert!(
+            kept.shots[&Panel::Swarm].blink.is_some(),
+            "a blinking swarm is kept"
+        );
+        // The focus moved (a key): drawn again, the plates follow.
+        for app in [&mut kept, &mut fresh] {
+            app.focus = Panel::Projects;
+            app.rev += 1;
+        }
+        let moved = frame(&mut kept);
+        assert_ne!(moved.0, first.0);
+        assert_eq!(moved, frame(&mut fresh));
     }
 }

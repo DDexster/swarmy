@@ -126,16 +126,60 @@ pub fn spark(values: &[f64], color: Color) -> Span<'static> {
     Span::styled(s, Style::new().fg(color))
 }
 
+/// `c` glowing at `hz`. The result is a colour to draw with, never to compute with: while a
+/// kept panel is drawn it is a mark (`PULSE_MARK`) that each frame replaces (`view::draw_panel`).
 pub fn pulse(app: &App, c: Color, hz: f64) -> Color {
-    if !app.animating() {
+    if !app.anim_on() {
         return c;
     }
-    let k = ((app.t() * hz * std::f64::consts::TAU).sin() * 0.5 + 0.5) as f32;
+    if app.marking.get() {
+        let mut ps = app.pulses.borrow_mut();
+        let i = ps.iter().position(|p| *p == (c, hz)).unwrap_or(ps.len());
+        if i < PULSE_MARKS {
+            if i == ps.len() {
+                ps.push((c, hz));
+            }
+            return Color::Indexed(PULSE_MARK + i as u8);
+        }
+    }
+    pulse_at(app, c, hz, app.t())
+}
+
+/// The colour of a pulse at time `t` of the animation clock.
+pub fn pulse_at(app: &App, c: Color, hz: f64, t: f64) -> Color {
+    let k = ((t * hz * std::f64::consts::TAU).sin() * 0.5 + 0.5) as f32;
     app.theme.glow(c, k * 0.45)
 }
 
+/// Colours `Indexed(PULSE_MARK..PULSE_MARK + PULSE_MARKS)` stand for the pulses of a kept panel
+/// (themes use RGB colours only).
+pub const PULSE_MARK: u8 = 232;
+pub const PULSE_MARKS: usize = 24;
+/// The symbol that stands for the thinking spinner in a kept panel (a private-use character,
+/// one cell wide).
+pub const SPINNER_MARK: &str = "\u{E000}";
+
+/// The spinner's frame at time `t`.
+pub fn spinner_at(t: f64) -> char {
+    SPINNER[(t * 12.0) as usize % SPINNER.len()]
+}
+
+/// On or off, twice a second. A kept panel that blinks is drawn again when the phase flips
+/// (`view::draw_panel`), not on every frame.
 pub fn blink(app: &App) -> bool {
-    !app.animating() || ((app.t() * 2.0) as u64).is_multiple_of(2)
+    if !app.anim_on() {
+        return true;
+    }
+    if app.marking.get() {
+        app.blink_used.set(true);
+        return blink_at(app.clock_now());
+    }
+    blink_at(app.t())
+}
+
+/// The blink's phase at time `t` of the animation clock.
+pub fn blink_at(t: f64) -> bool {
+    ((t * 2.0) as u64).is_multiple_of(2)
 }
 
 pub fn effort_abbr(e: Option<&str>) -> &'static str {
@@ -161,13 +205,14 @@ pub fn model_chip(a: &Agent) -> String {
 
 pub fn glyph(app: &App, s: &State) -> (String, Color) {
     let th = &app.theme;
-    let spin = SPINNER[(app.t() * 12.0) as usize % SPINNER.len()];
     match s {
         State::NeedsYou(_) => (if blink(app) { "▲" } else { "△" }.into(), th.warn),
         State::Tool { .. } => ("●".into(), pulse(app, th.good, 1.0)),
         State::Thinking => (
-            if app.animating() {
-                spin.to_string()
+            if app.anim_on() && app.marking.get() {
+                SPINNER_MARK.to_string()
+            } else if app.animating() {
+                spinner_at(app.t()).to_string()
             } else {
                 "◌".into()
             },

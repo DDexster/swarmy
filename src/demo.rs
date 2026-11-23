@@ -75,6 +75,17 @@ const AGENT_NAMES: &[&str] = &[
     "Triage lint warnings",
 ];
 
+/// How much the made-up world does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Load {
+    /// The README's world: two seats, two weeks of light history, 5–7 agents at work.
+    Demo,
+    /// A busy 4K wall, the load of the battery budget (`tools/perf.sh`): three seats, ten days of
+    /// about 12,600 requests a day in long sessions full of subagents, and three live sessions,
+    /// each with a long history of its own, keeping about 18 agents at work.
+    Wall,
+}
+
 pub struct Demo {
     pub root: PathBuf,
     pub seats: Vec<Seat>,
@@ -95,6 +106,7 @@ struct SeatDef {
     resets_in_h: i64,
 }
 
+/// The first two seats make the README's world; the wall adds the third.
 const SEATS: &[SeatDef] = &[
     SeatDef {
         label: "personal",
@@ -109,6 +121,13 @@ const SEATS: &[SeatDef] = &[
         email: "alex@acme.example",
         utilization: 38.0,
         resets_in_h: 130,
+    },
+    SeatDef {
+        label: "lab",
+        account: "acc-demo-lab",
+        email: "alex@lab.example",
+        utilization: 54.0,
+        resets_in_h: 40,
     },
 ];
 
@@ -184,12 +203,16 @@ fn cwd(project: &str) -> String {
 }
 
 /// Builds the demo world under `root` (wiped first) and starts the agents.
-pub fn start(root: &Path) -> anyhow::Result<Demo> {
+pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root)?;
     let now = Utc::now();
     let mut seats = Vec::new();
-    for (si, s) in SEATS.iter().enumerate() {
+    let defs = match load {
+        Load::Demo => &SEATS[..2],
+        Load::Wall => SEATS,
+    };
+    for (si, s) in defs.iter().enumerate() {
         let dir = root.join(format!(".claude-{}", s.label));
         std::fs::create_dir_all(dir.join("projects"))?;
         std::fs::create_dir_all(dir.join("sessions"))?;
@@ -207,7 +230,10 @@ pub fn start(root: &Path) -> anyhow::Result<Demo> {
                    "expiresAt": (now + Duration::hours(6)).timestamp_millis(), "refreshTokenExpiresAt": (now + Duration::days(25)).timestamp_millis()}})
             .to_string(),
         )?;
-        history(&dir, s, si as u64, now);
+        match load {
+            Load::Demo => history(&dir, s, si as u64, now),
+            Load::Wall => wall_history(&dir, s, si as u64, now),
+        }
         seats.push(Seat {
             found_by: vec!["demo"],
             ..Seat::new(s.label, dir.clone(), dir.join(".claude.json"), false)
@@ -216,7 +242,10 @@ pub fn start(root: &Path) -> anyhow::Result<Demo> {
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
     let seat_dirs: Vec<PathBuf> = seats.iter().map(|s| s.dir.clone()).collect();
-    std::thread::spawn(move || live(seat_dirs, st));
+    // Named, so `tools/perf.sh` can leave the writer out of the dashboard's CPU time.
+    std::thread::Builder::new()
+        .name("demo-writer".into())
+        .spawn(move || live(seat_dirs, st, load))?;
     Ok(Demo {
         root: root.to_path_buf(),
         seats,
@@ -304,6 +333,14 @@ fn history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
     }
 }
 
+/// Dates a transcript written now to its last record, as Claude Code would have left it: the
+/// dashboard's hot refresh looks at the files written in the last half hour.
+fn written_at(path: &Path, t: DateTime<Utc>) {
+    if let Ok(f) = std::fs::OpenOptions::new().append(true).open(path) {
+        let _ = f.set_modified(t.into());
+    }
+}
+
 struct LiveAgent {
     path: PathBuf,
     meta: PathBuf,
@@ -316,8 +353,79 @@ struct LiveAgent {
     seed: u64,
 }
 
+/// Ten days of a busy wall: per seat and day two long sessions, each a main thread of 300
+/// requests and 20 subagents of 90.
+fn wall_history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
+    for day in 0..10i64 {
+        for k in 0..2u64 {
+            let pi = ((si + k) % PROJECTS.len() as u64) as usize;
+            let project = PROJECTS[pi];
+            let seed0 = 1_000_000_000_000
+                + si * 100_000_000_000
+                + day as u64 * 1_000_000_000
+                + k * 100_000_000;
+            let sid = format!("{:08x}-wall-{}-{day}-{k}", rnd(seed0, 7) as u32, s.label);
+            let pdir = project_dir(dir, project);
+            let start =
+                now - Duration::days(day) - Duration::hours(11) + Duration::minutes(k as i64 * 20);
+            let mut main = vec![
+                json!({"type": "session-owner", "accountUuid": s.account, "sessionId": sid}),
+                json!({"type": "custom-title", "customTitle": format!("{project} wall {day}"), "sessionId": sid}),
+            ];
+            for i in 0..300u64 {
+                let t = start + Duration::minutes(i as i64 * 2);
+                let (a, tid) = assistant(
+                    seed0 + i,
+                    t,
+                    "claude-opus-5-5",
+                    "high",
+                    &cwd(project),
+                    None,
+                    i as usize,
+                );
+                main.push(a);
+                main.push(tool_result(t + Duration::seconds(30), &tid));
+            }
+            let main_path = pdir.join(format!("{sid}.jsonl"));
+            append(&main_path, &main);
+            written_at(&main_path, start + Duration::minutes(600));
+            for g in 0..20u64 {
+                let aid = format!("aw{:015x}", rnd(seed0, 50 + g) >> 4);
+                let (model, effort) = MODELS[(rnd(seed0, 60 + g) % 3) as usize];
+                let sub = pdir.join(&sid).join("subagents");
+                let _ = std::fs::create_dir_all(&sub);
+                let meta = json!({"agentType": if g % 3 == 0 { "Explore" } else { "general-purpose" },
+                                  "description": AGENT_NAMES[((seed0 + g) % AGENT_NAMES.len() as u64) as usize],
+                                  "model": model, "effort": effort, "spawnDepth": 1, "finished": true});
+                let _ =
+                    std::fs::write(sub.join(format!("agent-{aid}.meta.json")), meta.to_string());
+                let mut lines = Vec::new();
+                for i in 0..90u64 {
+                    let t =
+                        start + Duration::minutes(g as i64 * 25) + Duration::seconds(i as i64 * 20);
+                    let (a, tid) = assistant(
+                        seed0 + 1_000_000 + g * 1000 + i,
+                        t,
+                        model,
+                        effort,
+                        &cwd(project),
+                        Some(&aid),
+                        (g + i) as usize,
+                    );
+                    lines.push(a);
+                    lines.push(tool_result(t + Duration::seconds(12), &tid));
+                }
+                let path = sub.join(format!("agent-{aid}.jsonl"));
+                append(&path, &lines);
+                written_at(&path, start + Duration::minutes(g as i64 * 25 + 30));
+            }
+        }
+    }
+}
+
 /// Keeps the demo agents working until stopped.
-fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
+fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>, load: Load) {
+    let wall = load == Load::Wall;
     let pid = std::process::id();
     let start = proc_start_ticks(pid);
     let now = Utc::now();
@@ -329,19 +437,27 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
             "checkout-revamp",
         ),
         (1, "payments-api", "e5f6a7b8-demo-live-payments", "refunds"),
+        (2, "ml-pipeline", "c9d0e1f2-demo-live-ml", "feature-store"),
     ];
+    let sessions = &sessions[..seat_dirs.len().min(sessions.len())];
     // Main threads with a little recent history, and the registry entries.
-    for (si, project, sid, name) in sessions {
+    for &(si, project, sid, name) in sessions {
         let dir = &seat_dirs[si];
         let p = project_dir(dir, project).join(format!("{sid}.jsonl"));
         let mut lines = vec![
             json!({"type": "session-owner", "accountUuid": SEATS[si].account, "sessionId": sid}),
             json!({"type": "custom-title", "customTitle": name, "sessionId": sid}),
         ];
-        for i in 0..12u64 {
-            let t = now - Duration::minutes(40 - i as i64 * 3);
+        // The wall's live sessions have run for a day already, like long-lived orchestrators.
+        let (n, step) = if wall { (1500u64, 1) } else { (12, 3) };
+        for i in 0..n {
+            let t = now - Duration::minutes(4 + (n - i) as i64 * step);
             let (a, tid) = assistant(
-                9_000 + i + si as u64 * 50,
+                if wall {
+                    500_000_000 + si as u64 * 10_000 + i
+                } else {
+                    9_000 + i + si as u64 * 50
+                },
                 t,
                 "claude-opus-5-5",
                 "high",
@@ -382,11 +498,11 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
     let mut spawned: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         let now = Utc::now();
-        // Keep 5–7 agents running.
-        let want = 5 + (tick / 7 % 3);
+        // Keep 5–7 agents running (17–19 on the wall).
+        let want = if wall { 17 } else { 5 } + (tick / 7 % 3);
         while (agents.len() as u64) < want {
             spawned += 1;
-            let (si, project, sid, _) = sessions[(spawned % 2) as usize];
+            let (si, project, sid, _) = sessions[(spawned % sessions.len() as u64) as usize];
             let (model, effort) = MODELS[(spawned * 7 % 3) as usize];
             let id = format!("adlive{spawned:011x}");
             let sub = project_dir(&seat_dirs[si], project)
@@ -404,14 +520,21 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
                 effort,
                 project,
                 open_tool: None,
-                steps_left: 6 + spawned % 9,
+                steps_left: if wall {
+                    20 + spawned % 30
+                } else {
+                    6 + spawned % 9
+                },
                 seed: 1_000_000 + spawned * 1000,
             });
         }
         for a in agents.iter_mut() {
             a.seed += 1;
             match &a.open_tool {
-                Some((tid, since)) if (now - *since).num_seconds() as u64 >= 2 + a.seed % 5 => {
+                Some((tid, since))
+                    if (now - *since).num_seconds() as u64
+                        >= if wall { 4 + a.seed % 9 } else { 2 + a.seed % 5 } =>
+                {
                     append(&a.path, &[tool_result(now, tid)]);
                     a.open_tool = None;
                     a.steps_left = a.steps_left.saturating_sub(1);
@@ -430,6 +553,22 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>) {
                     a.open_tool = Some((tid, now));
                 }
                 _ => {}
+            }
+        }
+        // The wall's main threads answer now and then too.
+        if wall && tick.is_multiple_of(14) {
+            for (k, &(si, project, sid, _)) in sessions.iter().enumerate() {
+                let (v, tid) = assistant(
+                    2_000_000_000 + tick * 10 + k as u64,
+                    now,
+                    "claude-opus-5-5",
+                    "high",
+                    &cwd(project),
+                    None,
+                    tick as usize,
+                );
+                let p = project_dir(&seat_dirs[si], project).join(format!("{sid}.jsonl"));
+                append(&p, &[v, tool_result(now, &tid)]);
             }
         }
         // Finished agents.

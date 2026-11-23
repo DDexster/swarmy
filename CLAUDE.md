@@ -35,6 +35,32 @@ logins. Users run it in a spare terminal, mostly on laptops.
   session totals (10 s), history charts (5 min), the full process table and disks
   (SYSTEM open) run rarely or on demand. `.claude.json` is rewritten by Claude Code every few
   seconds — never trigger heavy work on its mtime.
+  What keeps it there (each was a regression once; keep them when changing the code around):
+  - Long spans are not summed again on every pass: `index/settled.rs` cuts a span at the settled
+    horizon (a quarter hour ≥ 15 min old) and keeps the part before it per (settled generation,
+    price fingerprint); only the last quarter hours are read again. `spend_by`, `total`,
+    `matrix`, `model_substitutions`, the quarter-hour buckets, `spend_series`, `spend_since` and
+    the per-minute burn go through it (dims whose labels can change later — agent type,
+    session, agent — do not). A new recurring sum over a long span goes through it too.
+  - Per-agent reads in `live::build` are kept in `live::Reads` and read again only when
+    `Index::agent_seq` moved (the index read that agent's transcript further, or another
+    process committed) and on heavy ticks; the selected agent's timeline likewise.
+  - The hot refresh looks up its few files by path (`plan`), never the whole `files` table,
+    runs no `COUNT(*)` over `requests`, and its writes use cached statements
+    (`prepare_cached`); a live session's spend is read again only when `Index::session_seq`
+    moved.
+  - The UI keeps each panel's cells (`App::shots`, `view::draw_panel`) and pastes them until a
+    message or an input arrives (`App::rev`) or the second changes; pulses and the spinner draw
+    marks that are patched each frame (`kit::pulse`, `SPINNER_MARK`), so animated panels are
+    kept too; a blinking panel is drawn again when the blink flips; anything else reading
+    `App::t`/`animating` makes its panel drawn every frame. `--mask` blanks words in one pass
+    per row (`mask_words`).
+  - The guard: `tools/perf.sh` (and `tools/perf.sh --mask`) runs a release build on
+    `swarmy demo --wall` (three seats, ten days of ~12,600 requests a day, ~18 agents at work)
+    in a 326×81 tmux window and fails above 2.0 (2.3 with `--mask`) CPU-seconds per minute.
+    Run it before merging anything that touches the worker, the index reads or the view. CPU
+    time still moves by 10–15% with the machine's load (SMT siblings): near the budget, run it
+    again on a quieter machine before concluding.
 - Prices are versioned data (`src/core/pricing.rs`, overridable by Claude Code's cache and
   `config.toml`), never ad-hoc constants. Built-in prices carry their model's date; each version
   of Claude Code's cached prices applies from the day the index first saw it; an override derives
@@ -91,6 +117,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/demo.rs` | made-up world for `swarmy demo` and README media |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
+| `tools/perf.sh` | the battery budget measured on `swarmy demo --wall`, fails above it |
 
 ## Claude Code format notes (verified on 2.1.329)
 
@@ -135,6 +162,7 @@ cargo zigbuild --release --target x86_64-unknown-linux-musl
 readelf -l target/x86_64-unknown-linux-musl/release/swarmy | grep -c INTERP   # must print 0
 
 tools/record-readme.sh                     # refresh docs/img (screenshots + demo.gif)
+tools/perf.sh && tools/perf.sh --mask      # battery budget on the wall load (needs tmux, ~5 min)
 ```
 
 Visual changes to the dashboard: record at the sizes that matter (326×81 wall, 160×81 column,

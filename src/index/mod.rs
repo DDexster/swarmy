@@ -24,6 +24,7 @@ pub mod schema;
 #[cfg(test)]
 mod seat_scenarios;
 pub(crate) mod seats;
+mod settled;
 pub mod storage;
 mod write;
 
@@ -60,6 +61,40 @@ pub struct Index {
     settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
     /// The seats (id, label) last named in the `seats` table (`seats::adopt_seats`).
     adopted: Option<Vec<(SeatId, String)>>,
+    /// Which agents this connection wrote, for readers that keep per-agent figures between
+    /// refreshes (`agent_seq`).
+    changes: Changes,
+    /// Settled parts of recurring sums (`settled`).
+    parts: settled::Parts,
+}
+
+/// An agent by (seat, session id, agent id), as its transcript file names it.
+type AgentOf = (SeatId, String, String);
+
+/// A sequence number bumped by every write batch: per agent, the batch that last wrote one of
+/// its files; `all`, the last change that may touch any agent (another process committed).
+#[derive(Default)]
+struct Changes {
+    seq: u64,
+    by_agent: HashMap<AgentOf, u64>,
+    /// The same per session (seat, session id): the batch that last wrote any of its agents.
+    by_session: HashMap<(SeatId, String), u64>,
+    all: u64,
+    /// SQLite's `data_version` when last looked at: it moves when another connection commits.
+    data_version: Option<i64>,
+}
+
+impl Changes {
+    fn wrote(&mut self, agents: Vec<AgentOf>) {
+        if agents.is_empty() {
+            return;
+        }
+        self.seq += 1;
+        for a in agents {
+            self.by_session.insert((a.0.clone(), a.1.clone()), self.seq);
+            self.by_agent.insert(a, self.seq);
+        }
+    }
 }
 
 /// A settled total: (settled generation, price fingerprint, account, span start, span end).
@@ -100,13 +135,20 @@ const READING_REPEAT_MS: i64 = 5 * 60 * 1000;
 
 /// Marks a change to settled spend (see [`SETTLED_AFTER_MS`]), inside the writing transaction.
 fn bump_settled(tx: &Connection) -> rusqlite::Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO meta(key, value) VALUES ('settled_gen', '1')
          ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
-        [],
-    )?;
+    )?
+    .execute([])?;
     Ok(())
 }
+
+/// A file as the index has it: inode, size, offset, account, last record time.
+type Known = (u64, u64, u64, Option<String>, i64);
+
+/// Up to this many files (the hot refresh), `plan` looks each one up by its path instead of
+/// loading the whole `files` table.
+const KNOWN_BY_PATH: usize = 512;
 
 /// The dirs a session's files were listed from (with their mtimes), and the files.
 type ListedDirs = (
@@ -225,8 +267,8 @@ impl Index {
     fn init(conn: Connection) -> anyhow::Result<Index> {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // The live view runs a couple of dozen distinct statements every second (`live.rs`);
-        // keep them all prepared instead of the default 16.
-        conn.set_prepared_statement_cache_capacity(64);
+        // keep them all prepared, with the writer's statements, instead of the default 16.
+        conn.set_prepared_statement_cache_capacity(128);
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         // The WAL shrinks back to this after a checkpoint (a compaction or a VACUUM grows it).
@@ -240,6 +282,8 @@ impl Index {
             dated: None,
             settled: Default::default(),
             adopted: None,
+            changes: Changes::default(),
+            parts: settled::Parts::default(),
         })
     }
 
@@ -249,6 +293,47 @@ impl Index {
 
     pub fn set_meta(&self, key: &str, value: &str) -> anyhow::Result<()> {
         Ok(schema::set_meta(&self.conn, key, value)?)
+    }
+
+    /// Changes whenever a refresh of this index wrote something of the agent's (its transcript
+    /// was read further) or another process committed to the index since. Equal numbers mean
+    /// the agent's rows read the same as before, except for what a reprice, a re-attribution or
+    /// a compaction rewrote, which readers pick up on their slower cadence.
+    pub fn agent_seq(&self, a: live::AgentKey) -> u64 {
+        let key = (
+            a.seat.clone(),
+            a.session_id.as_str().to_string(),
+            a.agent_id.to_string(),
+        );
+        let all = self.changes.all;
+        self.changes
+            .by_agent
+            .get(&key)
+            .map_or(all, |s| (*s).max(all))
+    }
+
+    /// `agent_seq` for a whole session: moves when any of its agents was written.
+    pub fn session_seq(&self, seat: &SeatId, session_id: &crate::core::ids::SessionId) -> u64 {
+        let key = (seat.clone(), session_id.as_str().to_string());
+        let all = self.changes.all;
+        self.changes
+            .by_session
+            .get(&key)
+            .map_or(all, |s| (*s).max(all))
+    }
+
+    /// Notes a commit by another connection (a second dashboard, a command's refresh): every
+    /// agent counts as changed then.
+    fn note_other_writers(&mut self) -> anyhow::Result<()> {
+        let v: i64 = self
+            .conn
+            .query_row("PRAGMA data_version", [], |r| r.get(0))?;
+        if self.changes.data_version.is_some_and(|old| old != v) {
+            self.changes.seq += 1;
+            self.changes.all = self.changes.seq;
+        }
+        self.changes.data_version = Some(v);
+        Ok(())
     }
 
     /// Brings the index up to date with every seat's transcripts.
@@ -358,6 +443,7 @@ impl Index {
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
         let started = Instant::now();
+        self.note_other_writers()?;
         let files_total = all.len();
         // Rows an older swarmy keyed by label move to their seat's id before anything is written.
         self.adopt_seats(seats)?;
@@ -377,23 +463,33 @@ impl Index {
     /// when it was replaced or shrank (`reset`), nothing when it is unchanged. A file read from
     /// its start gets its read marks here, before anything of this refresh is written.
     fn plan(&self, all: &[TranscriptFile], seats: &[Seat]) -> anyhow::Result<Vec<Work>> {
-        let mut known: HashMap<String, (u64, u64, u64, Option<String>, i64)> = HashMap::new();
-        {
+        let mut known: HashMap<String, Known> = HashMap::new();
+        let known_row = |r: &rusqlite::Row| -> rusqlite::Result<Known> {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        };
+        if all.len() <= KNOWN_BY_PATH {
+            // The hot refresh, every second: a few dozen files, each found by its key, instead
+            // of loading every file the index has ever seen.
+            let mut st = self.conn.prepare_cached(
+                "SELECT ino, size, offset, account_uuid, last_ts FROM files WHERE path = ?1",
+            )?;
+            for f in all {
+                let key = f.path.to_string_lossy().into_owned();
+                if let Some(k) = st.query_row([&key], known_row).optional()? {
+                    known.insert(key, k);
+                }
+            }
+        } else {
             let mut st = self
                 .conn
-                .prepare("SELECT path, ino, size, offset, account_uuid, last_ts FROM files")?;
-            let rows = st.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    (
-                        r.get::<_, i64>(1)? as u64,
-                        r.get::<_, i64>(2)? as u64,
-                        r.get::<_, i64>(3)? as u64,
-                        r.get(4)?,
-                        r.get(5)?,
-                    ),
-                ))
-            })?;
+                .prepare("SELECT ino, size, offset, account_uuid, last_ts, path FROM files")?;
+            let rows = st.query_map([], |r| Ok((r.get::<_, String>(5)?, known_row(r)?)))?;
             for row in rows {
                 let (k, v) = row?;
                 known.insert(k, v);
@@ -473,9 +569,6 @@ impl Index {
 
         // Big files first so the parallel batches stay balanced.
         work.sort_by_key(|w| std::cmp::Reverse(w.size - w.start));
-        let before: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
         // Rows added by this refresh have a larger rowid: rowids are never given out twice, even
         // after the compactor deleted rows (`compact::requests_rowid_high`).
         let last_rowid = compact::requests_rowid_high(&self.conn)?;
@@ -502,14 +595,14 @@ impl Index {
             let mut rowid = compact::requests_rowid_high(&tx)?;
             // Read in the write transaction: a compaction committed since the plan counts.
             let rolled_until = archive::rolled_until(&tx)?;
+            let mut written: Vec<AgentOf> = Vec::new();
             for (w, chunk) in parsed {
                 let Ok(chunk) = chunk else { continue };
                 let now: Option<(u64, u64)> = tx
-                    .query_row(
-                        "SELECT ino, offset FROM files WHERE path = ?1",
-                        [w.file.path.to_string_lossy()],
-                        |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
-                    )
+                    .prepare_cached("SELECT ino, offset FROM files WHERE path = ?1")?
+                    .query_row([w.file.path.to_string_lossy()], |r| {
+                        Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64))
+                    })
                     .optional()?;
                 if now != w.expected {
                     // Another process read this file meanwhile; what it wrote stands.
@@ -521,6 +614,11 @@ impl Index {
                     rolled_until,
                 };
                 let wrote = write::write_file(&tx, w, chunk, &mut cwds, at, &mut rowid)?;
+                written.push((
+                    w.file.seat.clone(),
+                    w.file.session_id.clone(),
+                    w.file.agent_id.clone(),
+                ));
                 late |= wrote.late;
                 skipped += wrote.skipped;
             }
@@ -529,14 +627,12 @@ impl Index {
             }
             if skipped > 0 {
                 // A running count for `doctor`: records found again after they were rolled up.
-                tx.execute(
-                    "INSERT INTO meta(key, value) VALUES ('skipped_records', ?1)
-                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + excluded.value",
-                    [skipped as i64],
-                )?;
+                tx.prepare_cached("INSERT INTO meta(key, value) VALUES ('skipped_records', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + excluded.value")?.execute([skipped as i64])?;
                 stats.records_skipped += skipped;
             }
             tx.commit()?;
+            self.changes.wrote(written);
             done.files_done += batch.len();
             progress(done);
         }
@@ -549,10 +645,13 @@ impl Index {
             &cwds,
             (files_total > 0).then_some(last_rowid),
         )?;
-        let after: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))?;
-        stats.requests_new = (after - before).max(0) as u64;
+        // Counted by rowid, not by two `COUNT(*)` of the whole table on every hot refresh.
+        let added: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM requests WHERE rowid > ?1",
+            [last_rowid],
+            |r| r.get(0),
+        )?;
+        stats.requests_new = added.max(0) as u64;
         self.set_meta("refreshed_at", &Utc::now().timestamp_millis().to_string())?;
         Ok(stats)
     }
@@ -571,34 +670,28 @@ impl Index {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for si in seat_info {
             if let Some(a) = &si.account {
-                tx.execute(
-                    "INSERT INTO accounts(account_uuid, email, display_name, org_name, plan, tier, seat, seen_at)
+                tx.prepare_cached("INSERT INTO accounts(account_uuid, email, display_name, org_name, plan, tier, seat, seen_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                      ON CONFLICT(account_uuid) DO UPDATE SET email = excluded.email, display_name = excluded.display_name,
-                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at",
-                    params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now],
-                )?;
+                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at")?.execute(params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now])?;
             }
             if let Some(u) = &si.utilization {
                 for r in &u.readings {
                     // A reading that says what one a few minutes away already said (same account,
                     // window and value) adds nothing: sources report every few seconds.
-                    tx.execute(
-                        "INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at)
+                    tx.prepare_cached("INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at)
                          SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (
                            SELECT 1 FROM readings WHERE account_uuid = ?1 AND kind = ?2
                              AND fetched_at BETWEEN ?3 - ?6 AND ?3 + ?6
                              AND utilization = ?4 AND ABS(resets_at - ?5) < 60000)
-                         ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING",
-                        params![
+                         ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING")?.execute(params![
                             u.account_uuid,
                             r.kind.key(),
                             ms(r.fetched_at),
                             r.utilization,
                             ms(r.resets_at),
                             READING_REPEAT_MS
-                        ],
-                    )?;
+                        ])?;
                 }
             }
         }
@@ -630,11 +723,12 @@ impl Index {
                 if before.as_deref() == Some(acc) {
                     continue;
                 }
-                let added = tx.execute(
-                    "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)
+                let added = tx
+                    .prepare_cached(
+                        "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)
                      ON CONFLICT(seat, ts) DO NOTHING",
-                    params![si.seat, ts, acc],
-                )?;
+                    )?
+                    .execute(params![si.seat, ts, acc])?;
                 if added > 0 {
                     reattribute.push((si.seat.clone(), ts));
                 }
@@ -683,7 +777,7 @@ impl Index {
         // Transcripts written before Claude Code recorded owners: the seat's current account.
         for si in seat_info {
             if let Some(a) = &si.account {
-                tx.execute("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2", params![a.account_uuid, si.seat])?;
+                tx.prepare_cached("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2")?.execute(params![a.account_uuid, si.seat])?;
             }
         }
         // Projects of new working directories; a new rule revision recomputes every cwd, raw or
@@ -720,5 +814,64 @@ mod tests {
         assert_eq!(i.count("requests").unwrap(), 0);
         drop(i);
         assert!(Index::open(&p).is_ok());
+    }
+
+    /// `agent_seq` moves for the agent whose transcript was read further, not for the others,
+    /// and for every agent when another connection wrote to the index.
+    #[test]
+    fn agent_seq_follows_writes() {
+        use crate::core::ids::SessionId;
+        use crate::index::scenarios::{World, assistant, owner};
+        let w = World::new(&["work"]);
+        let line =
+            |id: &str, ts: &str| assistant(id, ts, "claude-sonnet-5-5", "/w/shop", (10, 5), &[]);
+        w.append(
+            "work",
+            "s1",
+            &[owner("acc-a"), line("m1", "2026-11-01T10:00:00Z")],
+        );
+        w.write_subagent("work", "s1", "a1", &[line("m2", "2026-11-01T10:01:00Z")]);
+        let book = PriceBook::builtin();
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &book);
+        let seat = w.id("work");
+        let sid = SessionId::new("s1");
+        let seq = |idx: &Index, agent: &str| {
+            idx.agent_seq(live::AgentKey {
+                seat: &seat,
+                session_id: &sid,
+                agent_id: agent,
+            })
+        };
+        let (main0, sub0) = (seq(&idx, ""), seq(&idx, "a1"));
+        w.append("work", "s1", &[line("m3", "2026-11-01T10:02:00Z")]);
+        w.refresh(&mut idx, &[], &book);
+        assert_ne!(seq(&idx, ""), main0, "the main thread was read further");
+        assert_eq!(seq(&idx, "a1"), sub0, "the subagent was not");
+        let session0 = idx.session_seq(&seat, &sid);
+        w.write_subagent(
+            "work",
+            "s1",
+            "a1",
+            &[
+                line("m2", "2026-11-01T10:01:00Z"),
+                line("m4", "2026-11-01T10:03:00Z"),
+            ],
+        );
+        w.refresh(&mut idx, &[], &book);
+        assert_ne!(
+            idx.session_seq(&seat, &sid),
+            session0,
+            "a subagent moves its session"
+        );
+        // Nothing new: nothing moves.
+        let (main1, sub1) = (seq(&idx, ""), seq(&idx, "a1"));
+        w.refresh(&mut idx, &[], &book);
+        assert_eq!((seq(&idx, ""), seq(&idx, "a1")), (main1, sub1));
+        // Another process commits: everything counts as changed.
+        let other = w.index("i.sqlite");
+        other.set_meta("refreshed_at", "1").unwrap();
+        w.refresh(&mut idx, &[], &book);
+        assert_ne!(seq(&idx, "a1"), sub1);
     }
 }

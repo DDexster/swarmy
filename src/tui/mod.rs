@@ -164,6 +164,7 @@ pub fn run(ctx: Ctx, no_boot: bool, force_eco: bool) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let mut app = App::new(theme, mask, no_boot, seats, vault_dir);
+    app.cache_panels = true;
     let res = ui_loop(&mut terminal, &mut app, &rx, &wants, &eco);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
@@ -189,6 +190,7 @@ fn ui_loop(
         };
         while let Ok(m) = rx.try_recv() {
             app.on_msg(m);
+            app.rev += 1;
         }
         let td = Instant::now();
         terminal.draw(|f| view::draw(f, app))?;
@@ -200,6 +202,7 @@ fn ui_loop(
             .max(jobs::MIN_POLL);
 
         if event::poll(timeout)? {
+            app.rev += 1;
             match event::read()? {
                 Event::Key(k) if k.kind == KeyEventKind::Press => {
                     if app.on_key(k) {

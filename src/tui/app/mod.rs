@@ -164,6 +164,46 @@ pub struct Boot {
     pub skip: bool,
 }
 
+/// A panel's cells as last drawn, with what decides whether they are still right.
+pub struct Shot {
+    pub key: ShotKey,
+    pub cells: Vec<ratatui::buffer::Cell>,
+    /// Cells that pulse or spin, patched on every frame.
+    pub marks: Vec<Mark>,
+    /// The blink's phase the panel was drawn in, when it blinks: drawn again when it flips.
+    pub blink: Option<bool>,
+    /// The mouse rects the panel registered.
+    pub rects: Vec<(Panel, Rect)>,
+}
+
+/// A cell of a kept panel that moves: its place and what moves in it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Mark {
+    pub x: u16,
+    pub y: u16,
+    pub what: Moves,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Moves {
+    /// The cell's foreground or background pulses around this colour at this rate.
+    Fg(ratatui::style::Color, f64),
+    Bg(ratatui::style::Color, f64),
+    /// The cell shows the thinking spinner.
+    Spinner,
+}
+
+/// A drawn panel stays right while its place, the app's state (`App::rev`) and the clock's
+/// second are the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShotKey {
+    pub area: Rect,
+    pub big: bool,
+    pub rev: u64,
+    pub second: i64,
+    pub eco: bool,
+}
+
 /// One row of the LIMITS · SEATS panel.
 #[derive(Debug, Clone)]
 pub enum LimitsRow {
@@ -212,6 +252,24 @@ pub struct App {
     pub alerts: HashMap<String, Instant>,
     /// Where each panel was drawn last frame, for the mouse.
     pub rects: Vec<(Panel, Rect)>,
+    /// Bumped by every message and input event: a panel drawn at the same `rev` (and second)
+    /// draws the same cells, unless it animates (`view::draw_panel`).
+    pub rev: u64,
+    /// Panels drawn without animation, kept and pasted until something changes (the live
+    /// terminal only: `cache_panels`).
+    pub shots: HashMap<Panel, Shot>,
+    pub cache_panels: bool,
+    /// Set when drawing asked for the animation clock (`t`, `animating`).
+    pub anim_used: std::cell::Cell<bool>,
+    /// While a panel that may be kept is drawn, pulses and spinners leave marks instead of a
+    /// colour or a frame of the clock (`view::kit::pulse`), patched in on every frame.
+    pub marking: std::cell::Cell<bool>,
+    /// Set when a panel drawn while marking blinked (`view::kit::blink`).
+    pub blink_used: std::cell::Cell<bool>,
+    /// The pulses (colour, Hz) marked while drawing the current panel.
+    pub pulses: std::cell::RefCell<Vec<(ratatui::style::Color, f64)>>,
+    /// The animation clock stopped at this time (tests).
+    pub t_fixed: Option<f64>,
     analytics_request: bool,
     pub(super) seats: Vec<Seat>,
     pub(super) vault_dir: PathBuf,
@@ -268,6 +326,14 @@ impl App {
             error: None,
             alerts: HashMap::new(),
             rects: Vec::new(),
+            rev: 0,
+            shots: HashMap::new(),
+            cache_panels: false,
+            anim_used: std::cell::Cell::new(false),
+            marking: std::cell::Cell::new(false),
+            blink_used: std::cell::Cell::new(false),
+            pulses: Default::default(),
+            t_fixed: None,
             analytics_request: false,
             seats,
             vault_dir,
@@ -276,11 +342,27 @@ impl App {
     }
 
     pub fn animating(&self) -> bool {
+        let on = self.anim_on();
+        if on {
+            self.anim_used.set(true);
+        }
+        on
+    }
+
+    /// Whether things move, without counting as a use of the clock (`animating` does).
+    pub fn anim_on(&self) -> bool {
         !self.paused && self.theme.animate
     }
 
     pub fn t(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
+        self.anim_used.set(true);
+        self.clock_now()
+    }
+
+    /// The animation clock, without counting as a use of it.
+    pub fn clock_now(&self) -> f64 {
+        self.t_fixed
+            .unwrap_or_else(|| self.started.elapsed().as_secs_f64())
     }
 
     pub fn request_analytics(&mut self) {
