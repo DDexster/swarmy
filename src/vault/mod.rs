@@ -60,10 +60,13 @@ pub struct Login {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SeatState {
     pub fingerprint: Option<String>,
-    /// The account from Claude Code's profile, when it is known to belong to the current login.
+    /// The account from Claude Code's profile (`<accountUuid>/<organizationUuid>` when known),
+    /// when it is known to belong to the current login.
     pub account_uuid: Option<String>,
     /// The login changed after the profile was read: the account behind it is not known yet.
     pub unverified_since: Option<DateTime<Utc>>,
+    /// When the vault last switched this seat's login.
+    pub switched_at: Option<DateTime<Utc>>,
     /// The saved login that holds exactly these tokens.
     pub saved_as: Option<String>,
 }
@@ -106,6 +109,10 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
     // A damaged `.claude.json` fails the read: saving a login without its account would label
     // it wrongly later.
     let cj = config_json::read_seat_file(&seat.claude_json)?;
+    let mut account = cj.account;
+    if let (Some(a), Some(sec)) = (account.as_mut(), secret.as_ref()) {
+        a.apply_credentials(&sec.meta());
+    }
     let written_at = std::fs::metadata(seat.credentials_file())
         .ok()
         .and_then(|m| m.modified().ok())
@@ -114,7 +121,7 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
         secret,
         written_at,
         oauth_account: cj.oauth_account_raw,
-        account: cj.account,
+        account,
     })
 }
 
@@ -419,13 +426,18 @@ impl<'a> VaultTx<'a> {
     ) -> anyhow::Result<String> {
         let meta = secret.meta();
         let now = Utc::now();
+        let account_with_meta: Option<config_json::Account> = account.map(|a| {
+            let mut a = a.clone();
+            a.apply_credentials(&meta);
+            a
+        });
+        let account = account_with_meta.as_ref();
+        let account_id = account.map(|a| a.id().to_string());
         let logins = &self.index.logins;
         let existing = mounted_in
             .and_then(|seat| logins.iter().find(|l| l.mounted.as_ref() == Some(seat)))
             .filter(|l| {
-                account.is_none()
-                    || l.account_uuid.is_none()
-                    || l.account_uuid.as_deref() == account.map(|a| a.account_uuid.as_str())
+                account_id.is_none() || l.account_uuid.is_none() || l.account_uuid == account_id
             })
             .or_else(|| {
                 logins
@@ -454,9 +466,9 @@ impl<'a> VaultTx<'a> {
                     l.oauth_account = oauth_account;
                 }
                 if let Some(a) = account {
-                    l.account_uuid = Some(a.account_uuid.clone());
+                    l.account_uuid = Some(a.id().to_string());
                     l.email = a.email.clone().or(l.email.take());
-                    l.plan = a.rate_limit_tier.clone().or(l.plan.take());
+                    l.plan = a.effective_tier().or(l.plan.take());
                 }
                 if let Some(lb) = new_label {
                     l.label = lb;
@@ -472,9 +484,9 @@ impl<'a> VaultTx<'a> {
                 self.index.logins.push(Login {
                     id: id.clone(),
                     label: new_label.context("a new login without a label")?,
-                    account_uuid: account.map(|a| a.account_uuid.clone()),
+                    account_uuid: account_id,
                     email: account.and_then(|a| a.email.clone()),
-                    plan: account.and_then(|a| a.rate_limit_tier.clone()),
+                    plan: account.and_then(|a| a.effective_tier()),
                     meta,
                     oauth_account,
                     captured_at: now,

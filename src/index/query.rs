@@ -422,14 +422,26 @@ impl Index {
         Ok(settled::merge_counts(parts))
     }
 
-    /// The accounts the index knows under `key`: an account uuid it has seen anywhere (requests,
-    /// readings, logins of a seat), or the email of an account it has seen (any case).
+    /// The accounts the index knows under `key`: an account id (`<acc>/<org>` or bare `<acc>`), a
+    /// bare user uuid matching `<acc>/<org>`, an organization uuid, an organization name, or an
+    /// email (any case).
     pub fn accounts_matching(&self, key: &str) -> anyhow::Result<Vec<AccountId>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT account_uuid FROM accounts WHERE account_uuid = ?1 OR lower(email) = lower(?1)
-             UNION SELECT account_uuid FROM readings WHERE account_uuid = ?1
-             UNION SELECT account_uuid FROM seat_accounts WHERE account_uuid = ?1
-             UNION SELECT account_uuid FROM (SELECT account_uuid FROM requests WHERE account_uuid = ?1 LIMIT 1)",
+            "SELECT account_uuid FROM accounts
+               WHERE account_uuid = ?1
+                  OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
+                  OR org_uuid = ?1
+                  OR lower(email) = lower(?1)
+                  OR lower(org_name) = lower(?1)
+             UNION SELECT account_uuid FROM readings
+               WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
+             UNION SELECT account_uuid FROM seat_accounts
+               WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
+             UNION SELECT account_uuid FROM (
+               SELECT account_uuid FROM requests
+               WHERE account_uuid = ?1 OR substr(account_uuid, 1, length(?1) + 1) = (?1 || '/')
+               LIMIT 1
+             )",
         )?;
         let rows = st.query_map([key], |r| r.get::<_, String>(0))?;
         Ok(rows

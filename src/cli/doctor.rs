@@ -47,18 +47,18 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         let acct = si
             .account
             .as_ref()
-            .map(|a| ctx.account_name(&a.account_uuid))
+            .map(|a| ctx.account_name(a.id().as_str()))
             .unwrap_or_else(|| "(not logged in)".into());
         let plan = si
             .account
             .as_ref()
-            .and_then(|a| a.rate_limit_tier.clone().or(a.plan.clone()))
+            .and_then(|a| a.plan_label())
             .unwrap_or_default();
         t.row(vec![
             Cell::tone(&s.label, Tone::Bold),
             Cell::new(ctx.show_path(&s.dir.to_string_lossy())),
             Cell::new(acct),
-            Cell::tone(plan.replace("default_claude_", ""), Tone::Dim),
+            Cell::tone(plan, Tone::Dim),
             Cell::new(live.len().to_string()),
             Cell::tone(s.found_by.join(", "), Tone::Dim),
         ]);
@@ -101,7 +101,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     for si in &ctx.seat_info {
         if let Some(a) = &si.account {
             by_acct
-                .entry(a.account_uuid.clone())
+                .entry(a.id().to_string())
                 .or_default()
                 .push(&si.label);
         }

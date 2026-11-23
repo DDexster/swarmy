@@ -24,7 +24,7 @@ impl VaultTx<'_> {
         let meta = sec.meta();
         let fp = meta.fingerprint.clone();
         let profile_at = s.account.as_ref().and_then(|a| a.profile_fetched_at);
-        let account = s.account.as_ref().map(|a| a.account_uuid.clone());
+        let account = s.account.as_ref().map(|a| a.id().to_string());
         let prev = self.index.seats.get(&seat.id).cloned();
         let unverified_since = match &prev {
             // First sight: a refresh token issued after the profile was read is a newer login;
@@ -64,6 +64,10 @@ impl VaultTx<'_> {
             }
             Some(p) => p.unverified_since.filter(|_| profile_at <= p.profile_at),
         };
+        let switched_at = prev
+            .as_ref()
+            .filter(|p| p.fingerprint == fp)
+            .and_then(|p| p.switched_at);
         let seen = SeatSeen {
             label: seat.label.clone(),
             fingerprint: fp.clone(),
@@ -74,6 +78,7 @@ impl VaultTx<'_> {
                 profile_at
             },
             unverified_since,
+            switched_at,
         };
         if prev.as_ref() != Some(&seen) {
             self.index.seats.insert(seat.id.clone(), seen);
@@ -92,6 +97,7 @@ impl VaultTx<'_> {
                 account
             },
             unverified_since,
+            switched_at,
             saved_as,
         }
     }
@@ -227,7 +233,7 @@ const FRESH_ACCESS_MINUTES: i64 = 30;
 /// - the grant does not expire before the saved one (a rotation never shortens it).
 fn is_rotation(mounted: &Login, new: &LoginMeta, s: &SeatLogin) -> bool {
     let same_account = mounted.account_uuid.is_some()
-        && s.account.as_ref().map(|a| &a.account_uuid) == mounted.account_uuid.as_ref();
+        && s.account.as_ref().map(|a| a.id().to_string()) == mounted.account_uuid;
     let same = |a: &Option<String>, b: &Option<String>| a.is_none() || b.is_none() || a == b;
     let same_plan = same(&mounted.meta.subscription_type, &new.subscription_type)
         && same(&mounted.meta.rate_limit_tier, &new.rate_limit_tier);

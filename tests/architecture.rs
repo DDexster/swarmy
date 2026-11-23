@@ -110,6 +110,7 @@ fn test_modules_are_not_production_code() {
         "index/archive_scenarios.rs",
         "index/compact_scenarios.rs",
         "index/seat_scenarios.rs",
+        "index/account_scenarios.rs",
     ] {
         assert!(empty(f), "{f} is a test module");
     }

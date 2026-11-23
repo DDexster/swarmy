@@ -51,19 +51,32 @@ fn record(input: &input::Input, data: &Path, home: &Path, dir: &Path, now: chron
         .as_deref()
         .and_then(|p| crate::claude::transcript::tail(Path::new(p), TAIL_MAX_BYTES).ok())
         .unwrap_or_default();
-    // The session's owner is who the response was for; the seat's login only fills in.
-    let account = tail.owner.or_else(|| {
+    // The session's owner is who the response was for; the seat's login only fills in (or supplies
+    // the organization uuid when an older transcript's `session-owner` had none).
+    let seat_account = || {
         crate::claude::config_json::read_seat_file(&crate::claude::seats::claude_json_of(dir, home))
             .ok()
             .and_then(|cj| cj.account)
-            .map(|a| a.account_uuid)
-    });
+    };
+    let account = match tail.owner {
+        Some(owner) if owner.has_org() => Some(owner),
+        Some(owner) => {
+            if let Some(a) = seat_account()
+                && a.account_uuid == owner.user_uuid()
+            {
+                Some(a.id())
+            } else {
+                Some(owner)
+            }
+        }
+        None => seat_account().map(|a| a.id()),
+    };
     let Some(account) = account else {
         // Nobody to book the numbers to: better no reading than one under a guessed account.
         return;
     };
     let at = tail.last_response.filter(|t| *t <= now).unwrap_or(now);
-    let Some(live) = live_from(input, dir, crate::core::ids::AccountId::new(account), at) else {
+    let Some(live) = live_from(input, dir, account, at) else {
         return;
     };
     if let Some(new) = reading::next(old.as_ref(), live)
@@ -293,5 +306,60 @@ mod tests {
             (r.account.as_str(), r.at),
             ("acc-b", now + chrono::Duration::hours(1))
         );
+    }
+
+    #[test]
+    fn same_account_uuid_in_two_organizations_records_distinct_accounts() {
+        let t = tempfile::tempdir().unwrap();
+        let (data, home) = (t.path().join("data"), t.path().join("home"));
+        let dir_team = home.join(".claude");
+        let dir_max = home.join(".claude-work");
+        std::fs::create_dir_all(&dir_team).unwrap();
+        std::fs::create_dir_all(&dir_max).unwrap();
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount": {"accountUuid": "acc-1", "organizationUuid": "org-team"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_max.join(".claude.json"),
+            r#"{"oauthAccount": {"accountUuid": "acc-1", "organizationUuid": "org-max"}}"#,
+        )
+        .unwrap();
+        let tr_team = dir_team.join("s1.jsonl");
+        std::fs::write(
+            &tr_team,
+            concat!(
+                r#"{"type":"session-owner","accountUuid":"acc-1","organizationUuid":"org-team","sessionId":"s1"}"#, "\n",
+                r#"{"type":"assistant","timestamp":"2026-11-22T09:00:00Z","message":{"id":"m1","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let tr_max = dir_max.join("s2.jsonl");
+        std::fs::write(
+            &tr_max,
+            concat!(
+                r#"{"type":"session-owner","accountUuid":"acc-1","organizationUuid":"org-max","sessionId":"s2"}"#, "\n",
+                r#"{"type":"assistant","timestamp":"2026-11-22T09:05:00Z","message":{"id":"m2","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let mk = |tr: &Path, pct: f64| {
+            parse_input(&format!(
+                r#"{{"session_id":"s","transcript_path":{},"rate_limits":{{"seven_day":{{"used_percentage":{pct},"resets_at":1795960000}}}}}}"#,
+                serde_json::Value::String(tr.display().to_string())
+            ))
+        };
+        let now = "2026-11-22T10:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        record(&mk(&tr_team, 12.0), &data, &home, &dir_team, now);
+        record(&mk(&tr_max, 67.0), &data, &home, &dir_max, now);
+        let r_team = read(&file_for(&data, &dir_team)).unwrap();
+        let r_max = read(&file_for(&data, &dir_max)).unwrap();
+        assert_eq!(r_team.account.as_str(), "acc-1/org-team");
+        assert_eq!(r_team.seven_day.unwrap().0, 12.0);
+        assert_eq!(r_max.account.as_str(), "acc-1/org-max");
+        assert_eq!(r_max.seven_day.unwrap().0, 67.0);
     }
 }

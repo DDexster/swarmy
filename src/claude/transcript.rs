@@ -71,9 +71,9 @@ pub enum Event {
         ts: Option<DateTime<Utc>>,
         text: String,
     },
-    /// `session-owner`: the account this session runs under from here on.
+    /// `session-owner`: the account (and organization) this session runs under from here on.
     Owner {
-        account_uuid: String,
+        account: crate::core::ids::AccountId,
     },
     Title {
         kind: TitleKind,
@@ -163,6 +163,8 @@ struct RawRecord<'a> {
     tool_use_result: Option<&'a RawValue>,
     #[serde(rename = "accountUuid")]
     account_uuid: Option<String>,
+    #[serde(rename = "organizationUuid")]
+    organization_uuid: Option<String>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
     #[serde(rename = "aiTitle")]
@@ -390,7 +392,10 @@ pub fn parse_line(line: &str, out: &mut Vec<Event>, stats: &mut ParseStats) {
         },
         "session-owner" => {
             if let Some(a) = r.account_uuid.filter(|a| !a.is_empty()) {
-                out.push(Event::Owner { account_uuid: a });
+                let org = r.organization_uuid.filter(|o| !o.is_empty());
+                out.push(Event::Owner {
+                    account: crate::core::ids::AccountId::of(&a, org.as_deref()),
+                });
             }
         }
         "custom-title" => {
@@ -641,7 +646,7 @@ pub fn read_from(path: &Path, offset: u64) -> std::io::Result<Chunk> {
 /// in the file).
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Tail {
-    pub owner: Option<String>,
+    pub owner: Option<crate::core::ids::AccountId>,
     pub last_response: Option<DateTime<Utc>>,
 }
 
@@ -669,8 +674,8 @@ pub fn tail(path: &Path, max: u64) -> std::io::Result<Tail> {
         for line in lines {
             parse_line(line, &mut events, &mut stats);
             for e in events.drain(..) {
-                if let Event::Owner { account_uuid } = e {
-                    owner = Some(account_uuid);
+                if let Event::Owner { account } = e {
+                    owner = Some(account);
                 } else if let Event::Request(r) = e {
                     last = Some(last.map_or(r.ts, |t: DateTime<Utc>| t.max(r.ts)));
                     last_owner.clone_from(&owner);
@@ -720,7 +725,11 @@ mod tests {
         lines.push(at("2026-11-22T11:00:00Z"));
         std::fs::write(&p, lines.join("\n") + "\n").unwrap();
         let got = tail(&p, 1 << 20).unwrap();
-        assert_eq!(got.owner.as_deref(), Some("acc-a"), "found 200 KiB back");
+        assert_eq!(
+            got.owner.as_ref().map(|a| a.as_str()),
+            Some("acc-a"),
+            "found 200 KiB back"
+        );
         assert_eq!(
             got.last_response,
             Some(parse_ts(Some("2026-11-22T11:00:00Z")).unwrap())
@@ -729,13 +738,27 @@ mod tests {
         // the response still ran under the old one.
         lines.push(owner("acc-b"));
         std::fs::write(&p, lines.join("\n") + "\n").unwrap();
-        assert_eq!(tail(&p, 1 << 20).unwrap().owner.as_deref(), Some("acc-a"));
+        assert_eq!(
+            tail(&p, 1 << 20)
+                .unwrap()
+                .owner
+                .as_ref()
+                .map(|a| a.as_str()),
+            Some("acc-a")
+        );
         lines.push(at("2026-11-22T12:00:00Z"));
         std::fs::write(&p, lines.join("\n") + "\n").unwrap();
-        assert_eq!(tail(&p, 1 << 20).unwrap().owner.as_deref(), Some("acc-b"));
+        assert_eq!(
+            tail(&p, 1 << 20)
+                .unwrap()
+                .owner
+                .as_ref()
+                .map(|a| a.as_str()),
+            Some("acc-b")
+        );
         // Too far back for the window: no owner, rather than reading the whole file.
         let got = tail(&p, 64 * 1024).unwrap();
-        assert_eq!(got.owner.as_deref(), Some("acc-b"));
+        assert_eq!(got.owner.as_ref().map(|a| a.as_str()), Some("acc-b"));
         std::fs::write(
             &p,
             [
@@ -824,7 +847,7 @@ mod tests {
         assert_eq!(
             ev[0],
             Event::Owner {
-                account_uuid: "acc-1".into()
+                account: crate::core::ids::AccountId::of("acc-1", Some("org")),
             }
         );
         assert_eq!(

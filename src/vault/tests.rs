@@ -701,7 +701,7 @@ fn an_old_vault_keyed_by_labels_moves_to_seat_ids() -> anyhow::Result<()> {
         "waits for its seat"
     );
     let disk = read_json(&vdir.join("logins.json"))?;
-    assert_eq!(disk["v"], 2);
+    assert_eq!(disk["v"], 3);
     assert!(disk["seats"].get(work.id.as_str()).is_some(), "{disk}");
     assert!(disk["seats"].get("work").is_none());
     assert!(
@@ -1099,5 +1099,116 @@ fn reading_seat_states_takes_no_lock_and_writes_nothing() -> anyhow::Result<()> 
     );
     let alice = login(&v, "alice")?.clone();
     assert_eq!(secret_of(&v, &alice.id)?["accessToken"], "acc-new");
+    Ok(())
+}
+
+#[test]
+fn multi_org_logins_stay_distinct_and_do_not_trigger_rotation() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let vdir = t.path().join("vault");
+    let def = seat(t.path(), "default")?;
+    let work = seat(t.path(), "work")?;
+    let write_org_seat = |s: &Seat,
+                          refresh: &str,
+                          org: &str,
+                          sub: &str,
+                          org_tier: Option<&str>|
+     -> anyhow::Result<()> {
+        let now = Utc::now();
+        let creds = json!({
+            "claudeAiOauth": {
+                "accessToken": format!("acc-{refresh}"),
+                "refreshToken": refresh,
+                "expiresAt": (now + chrono::Duration::hours(6)).timestamp_millis(),
+                "refreshTokenExpiresAt": (now + chrono::Duration::days(25)).timestamp_millis(),
+                "subscriptionType": sub,
+                "rateLimitTier": "default_claude_max_5x"
+            }
+        });
+        std::fs::write(s.credentials_file(), creds.to_string())?;
+        let mut oauth = json!({
+            "accountUuid": "acc-same",
+            "organizationUuid": org,
+            "emailAddress": "dev@example.com",
+            "userRateLimitTier": "default_claude_max_5x",
+            "profileFetchedAt": now.timestamp_millis()
+        });
+        if let Some(ot) = org_tier {
+            oauth["organizationRateLimitTier"] = json!(ot);
+        }
+        std::fs::write(&s.claude_json, json!({"oauthAccount": oauth}).to_string())?;
+        Ok(())
+    };
+    write_org_seat(&def, "r-team", "org-team", "team", Some("default_raven"))?;
+    write_org_seat(&work, "r-max", "org-max", "max", None)?;
+
+    let mut v = Vault::open(&vdir)?;
+    v.edit(|tx| tx.capture(&def, Some("dev-team")))?;
+    v.edit(|tx| tx.capture(&work, Some("dev-max")))?;
+    let l_team = login(&v, "dev-team")?.clone();
+    let l_max = login(&v, "dev-max")?.clone();
+    assert_eq!(l_team.account_uuid.as_deref(), Some("acc-same/org-team"));
+    assert_eq!(l_max.account_uuid.as_deref(), Some("acc-same/org-max"));
+    assert_eq!(l_team.plan.as_deref(), Some("default_raven"));
+    assert_eq!(l_max.plan.as_deref(), Some("default_claude_max_5x"));
+
+    // Logging into org-max inside the `default` seat (same accountUuid, different org, fresh token)
+    // must NOT be treated as a token rotation of `dev-team`.
+    write_org_seat(
+        &def,
+        "r-other-org",
+        "org-other",
+        "team",
+        Some("default_raven"),
+    )?;
+    v.edit(|tx| tx.sync(std::slice::from_ref(&def)))?;
+    let l_team_after = login(&v, "dev-team")?;
+    assert_eq!(
+        l_team_after.meta.fingerprint, l_team.meta.fingerprint,
+        "dev-team was not overwritten by another organization's grant"
+    );
+    assert_eq!(l_team_after.mounted, None, "dev-team unmounted cleanly");
+    Ok(())
+}
+
+#[test]
+fn v2_logins_upgrade_bare_account_uuid_and_plan_from_oauth_account() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let vdir = t.path().join("vault");
+    std::fs::create_dir_all(&vdir)?;
+    let now = Utc::now().to_rfc3339();
+    let v2 = json!({
+        "v": 2,
+        "logins": [{
+            "id": "l0123456789",
+            "label": "team-login",
+            "account_uuid": "acc-1",
+            "email": "dev@example.com",
+            "plan": "default_claude_max_5x",
+            "meta": {
+                "fingerprint": "0123456789abcdef",
+                "subscription_type": "team",
+                "rate_limit_tier": "default_claude_max_5x",
+                "access_expires_at": null,
+                "refresh_expires_at": null,
+                "scopes": []
+            },
+            "oauth_account": {
+                "accountUuid": "acc-1",
+                "organizationUuid": "org-team",
+                "organizationRateLimitTier": "default_raven",
+                "userRateLimitTier": "default_claude_max_5x"
+            },
+            "captured_at": now,
+            "updated_at": now,
+            "mounted": null
+        }],
+        "seats": {}
+    });
+    std::fs::write(vdir.join("logins.json"), v2.to_string())?;
+    let v = Vault::open(&vdir)?;
+    let l = login(&v, "team-login")?;
+    assert_eq!(l.account_uuid.as_deref(), Some("acc-1/org-team"));
+    assert_eq!(l.plan.as_deref(), Some("default_raven"));
     Ok(())
 }

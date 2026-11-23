@@ -470,7 +470,7 @@ impl App {
             .iter()
             .find(|r| r.account_uuid == uuid)
             .map(|r| r.name.clone())
-            .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short(uuid)))
+            .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short_account(uuid)))
     }
 
     /// Rows of the LIMITS · SEATS panel: every seat, then every saved login that is in no seat.

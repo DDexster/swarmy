@@ -210,14 +210,16 @@ fn report_window(
 }
 
 fn tier_of(ctx: &Ctx, account: &str) -> Option<String> {
-    if let Some(t) = ctx.login_tiers.get(account) {
-        return Some(t.clone());
-    }
-    ctx.seat_info
+    if let Some(t) = ctx
+        .seat_info
         .iter()
         .filter_map(|s| s.account.as_ref())
-        .find(|a| a.account_uuid == account)
-        .and_then(|a| a.rate_limit_tier.clone())
+        .find(|a| a.id().as_str() == account)
+        .and_then(|a| a.effective_tier())
+    {
+        return Some(t);
+    }
+    ctx.login_tiers.get(account).cloned()
 }
 
 /// Analyses every account with a reading ([`Ctx::latest_readings`]), using cross-account

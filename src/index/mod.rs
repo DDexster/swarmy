@@ -5,6 +5,9 @@
 //! (tracked by inode, size and offset). A file that shrank or was replaced is read again from the
 //! start. The first run reads everything in parallel.
 
+#[cfg(test)]
+mod account_scenarios;
+mod accounts;
 pub mod archive;
 #[cfg(test)]
 pub(crate) mod archive_scenarios;
@@ -69,6 +72,8 @@ pub struct Index {
     settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
     /// The seats (id, label) last named in the `seats` table (`seats::adopt_seats`).
     adopted: Option<Vec<(SeatId, String)>>,
+    /// The (seat, account) pairs last checked for legacy bare-uuid migration (`accounts::adopt_accounts`).
+    adopted_accounts: Option<Vec<(SeatId, crate::core::ids::AccountId)>>,
     /// Which agents this connection wrote, for readers that keep per-agent figures between
     /// refreshes (`agent_seq`).
     changes: Changes,
@@ -344,6 +349,7 @@ impl Index {
             dated: None,
             settled: Default::default(),
             adopted: None,
+            adopted_accounts: None,
             changes: Changes::default(),
             parts: settled::Parts::default(),
         })
@@ -520,11 +526,21 @@ impl Index {
         let started = Instant::now();
         self.note_other_writers()?;
         let files_total = all.len();
-        // Rows an older swarmy keyed by label move to their seat's id before anything is written.
+        // Rows an older swarmy keyed by label move to their seat's id before anything is written;
+        // legacy bare account uuids move to `<account>/<org>` before planning so multi-org files
+        // re-read their `session-owner` records in the same pass.
         self.adopt_seats(seats)?;
+        let reattribute_owners = self.adopt_accounts(seat_info)?;
         let work = self.plan(&all, seats)?;
         let from_start = work.iter().any(|w| w.start == 0);
-        let mut stats = self.ingest(work, seat_info, resolver, prices, progress)?;
+        let mut stats = self.ingest(
+            work,
+            seat_info,
+            resolver,
+            prices,
+            reattribute_owners,
+            progress,
+        )?;
         if from_start {
             // A seat found after a compaction: its old records go straight into the archive.
             self.roll_late(prices, seats)?;
@@ -626,6 +642,7 @@ impl Index {
         seat_info: &[SeatInfo],
         resolver: &mut Resolver,
         prices: &PriceBook,
+        reattribute_owners: bool,
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
         let bytes_total: u64 = work.iter().map(|w| w.size - w.start).sum();
@@ -731,6 +748,7 @@ impl Index {
             prices,
             &cwds,
             (files_total > 0).then_some(last_rowid),
+            reattribute_owners,
         )?;
         // Counted by rowid, not by two `COUNT(*)` of the whole table on every hot refresh.
         let added: i64 = self.conn.query_row(
@@ -754,67 +772,13 @@ impl Index {
         prices: &PriceBook,
         new_cwds: &std::collections::HashSet<String>,
         new_after_rowid: Option<i64>,
+        reattribute_owners: bool,
     ) -> anyhow::Result<()> {
         let now = ms(Utc::now());
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for si in seat_info {
-            if let Some(a) = &si.account {
-                tx.prepare_cached("INSERT INTO accounts(account_uuid, email, display_name, org_name, plan, tier, seat, seen_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-                     ON CONFLICT(account_uuid) DO UPDATE SET email = excluded.email, display_name = excluded.display_name,
-                       org_name = excluded.org_name, plan = excluded.plan, tier = excluded.tier, seat = excluded.seat, seen_at = excluded.seen_at
-                     WHERE (email, display_name, org_name, plan, tier, seat) IS NOT
-                             (excluded.email, excluded.display_name, excluded.org_name, excluded.plan, excluded.tier, excluded.seat)
-                       OR seen_at < excluded.seen_at - 3600000")?.execute(params![a.account_uuid, a.email, a.display_name, a.organization_name, a.plan, a.rate_limit_tier, si.seat, now])?;
-            }
-            if let Some(u) = &si.utilization {
-                for r in &u.readings {
-                    // A reading that says what one a few minutes away already said (same account,
-                    // window and value) adds nothing: sources report every few seconds.
-                    tx.prepare_cached("INSERT INTO readings(account_uuid, kind, fetched_at, utilization, resets_at)
-                         SELECT ?1, ?2, ?3, ?4, ?5 WHERE NOT EXISTS (
-                           SELECT 1 FROM readings WHERE account_uuid = ?1 AND kind = ?2
-                             AND fetched_at BETWEEN ?3 - ?6 AND ?3 + ?6
-                             AND utilization = ?4 AND ABS(resets_at - ?5) < 60000)
-                         ON CONFLICT(account_uuid, kind, fetched_at) DO NOTHING")?.execute(params![
-                            u.account_uuid,
-                            r.kind.key(),
-                            ms(r.fetched_at),
-                            r.utilization,
-                            ms(r.resets_at),
-                            READING_REPEAT_MS
-                        ])?;
-                }
-            }
-        }
-        // What each seat has logged in now. A change of login is dated when swarmy sees it
-        // (review H1): never at the profile's `profileFetchedAt` (after a vault switch that is when
-        // the login was saved, maybe days ago and in another seat) nor at a reading's time, and
-        // never before the seat's newest recorded change, so the history only moves forward.
-        let mut reattribute: Vec<(SeatId, i64)> = Vec::new();
-        for si in seat_info {
-            let Some(a) = &si.account else { continue };
-            let newest: Option<(i64, String)> = tx
-                .prepare_cached(
-                    "SELECT ts, account_uuid FROM seat_accounts WHERE seat = ?1 ORDER BY ts DESC LIMIT 1",
-                )?
-                .query_row(params![si.seat], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            if newest
-                .as_ref()
-                .is_some_and(|(_, acc)| *acc == a.account_uuid)
-            {
-                continue;
-            }
-            let ts = newest.map_or(now, |(t, _)| now.max(t + 1));
-            tx.prepare_cached(
-                "INSERT INTO seat_accounts(seat, ts, account_uuid) VALUES (?1, ?2, ?3)",
-            )?
-            .execute(params![si.seat, ts, a.account_uuid])?;
-            reattribute.push((si.seat.clone(), ts));
-        }
+        let reattribute = accounts::record_seat_facts(&tx, seat_info, now)?;
         // Requests of the seat from the change on follow it, unless their transcript names the
         // owner (`SEAT_ACCOUNT_AT`). Rollups are never re-keyed: they were attributed while their
         // raw rows, owners included, were still there, and the archive cannot tell an owner's
@@ -825,6 +789,15 @@ impl Index {
             moved += tx.execute(
                 &format!("UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT} WHERE seat = ?1 AND ts >= ?2"),
                 params![seat, ts],
+            )?;
+        }
+        if reattribute_owners {
+            moved += tx.execute(
+                &format!(
+                    "UPDATE requests SET account_uuid = {SEAT_ACCOUNT_AT}
+                     WHERE EXISTS (SELECT 1 FROM owners o WHERE o.seat = requests.seat AND o.session_id = requests.session_id)"
+                ),
+                [],
             )?;
         }
         if moved > 0 {
@@ -864,7 +837,7 @@ impl Index {
         // Transcripts written before Claude Code recorded owners: the seat's current account.
         for si in seat_info {
             if let Some(a) = &si.account {
-                tx.prepare_cached("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2")?.execute(params![a.account_uuid, si.seat])?;
+                tx.prepare_cached("UPDATE requests SET account_uuid = ?1 WHERE account_uuid IS NULL AND seat = ?2")?.execute(params![a.id().as_str(), si.seat])?;
             }
         }
         if unattributed(&tx)? != unattributed_before {

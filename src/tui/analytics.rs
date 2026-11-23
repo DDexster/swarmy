@@ -113,7 +113,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
             account: if state.unverified_since.is_some() {
                 None
             } else {
-                si.account.as_ref().map(|a| a.account_uuid.clone())
+                si.account.as_ref().map(|a| a.id().to_string())
             },
             login: state.saved_as.clone().or_else(|| {
                 vault_logins

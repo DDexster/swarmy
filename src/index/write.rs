@@ -115,9 +115,9 @@ pub(super) fn write_file(
     )?;
     for ev in chunk.events {
         match ev {
-            Event::Owner { account_uuid } => {
-                tx.prepare_cached("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, last_ts, account_uuid])?;
-                account = Some(account_uuid);
+            Event::Owner { account: owner_id } => {
+                tx.prepare_cached("INSERT INTO owners(seat, session_id, ts, account_uuid) VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING")?.execute(params![f.seat, f.session_id, last_ts, owner_id.as_str()])?;
+                account = Some(owner_id.to_string());
             }
             Event::Request(r) => {
                 let t = ms(r.ts);

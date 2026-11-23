@@ -126,15 +126,25 @@ impl PartialEq<&str> for SessionId {
     }
 }
 
-/// An Anthropic account: the `accountUuid` of an OAuth profile. Made by the readers of Claude
-/// Code's files and by resolving what a user typed (`--account` takes a uuid, an email or a
-/// saved login's label, resolved once at the edge: `app::Ctx::resolve_account`).
+/// An Anthropic account in an organization: `<accountUuid>/<organizationUuid>` when the
+/// organization is known, else `<accountUuid>` (legacy transcripts/rows without an org). One
+/// user (`accountUuid`) can belong to several organizations (e.g. personal Max and a company
+/// Team) with separate plans and rate limits, so the pair is the true identity.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 #[repr(transparent)]
 pub struct AccountId(String);
 
 impl AccountId {
+    /// Canonical identity of an account in an organization: `<account>/<org>` when the
+    /// organization is known, else `<account>`.
+    pub fn of(account_uuid: &str, org_uuid: Option<&str>) -> AccountId {
+        match org_uuid.filter(|o| !o.is_empty()) {
+            Some(org) => AccountId(format!("{account_uuid}/{org}")),
+            None => AccountId(account_uuid.to_string()),
+        }
+    }
+
     pub fn new(s: impl Into<String>) -> AccountId {
         AccountId(s.into())
     }
@@ -143,9 +153,39 @@ impl AccountId {
         &self.0
     }
 
+    /// The user part (`accountUuid`), before any `/`.
+    pub fn user_uuid(&self) -> &str {
+        self.0.split_once('/').map_or(self.0.as_str(), |(u, _)| u)
+    }
+
+    /// The organization part (`organizationUuid`), when present.
+    pub fn org_uuid(&self) -> Option<&str> {
+        self.0
+            .split_once('/')
+            .map(|(_, o)| o)
+            .filter(|o| !o.is_empty())
+    }
+
+    /// Whether this id carries an organization uuid (as opposed to a legacy bare `accountUuid`).
+    pub fn has_org(&self) -> bool {
+        self.org_uuid().is_some()
+    }
+
     /// The first 8 characters, for a name of last resort (`acct-1a2b3c4d`).
     pub fn short(&self) -> &str {
         short(&self.0)
+    }
+}
+
+/// Short display fallback for an account id: `1a2b3c4d/9e8f7a6b` when an organization uuid is
+/// present, else `1a2b3c4d`.
+pub fn short_account(id: &str) -> String {
+    if let Some((u, o)) = id.split_once('/')
+        && !o.is_empty()
+    {
+        format!("{}/{}", short(u), short(o))
+    } else {
+        short(id).to_string()
     }
 }
 
@@ -201,5 +241,30 @@ mod tests {
         // The same digest the status line has always named its files with.
         let full = hex::encode(Sha256::digest(b"/h/.claude-work"));
         assert_eq!(a.as_str(), &full[..16]);
+    }
+
+    #[test]
+    fn account_ids_carry_user_and_organization() {
+        let bare = AccountId::of("acc-123456789", None);
+        assert_eq!(bare.as_str(), "acc-123456789");
+        assert_eq!(bare.user_uuid(), "acc-123456789");
+        assert_eq!(bare.org_uuid(), None);
+        assert!(!bare.has_org());
+        assert_eq!(short_account(bare.as_str()), "acc-1234");
+
+        let empty_org = AccountId::of("acc-123456789", Some(""));
+        assert_eq!(empty_org, bare);
+
+        let scoped = AccountId::of("acc-123456789", Some("org-abcdef0123"));
+        assert_eq!(scoped.as_str(), "acc-123456789/org-abcdef0123");
+        assert_eq!(scoped.user_uuid(), "acc-123456789");
+        assert_eq!(scoped.org_uuid(), Some("org-abcdef0123"));
+        assert!(scoped.has_org());
+        assert_eq!(short_account(scoped.as_str()), "acc-1234/org-abcd");
+        assert_ne!(
+            scoped,
+            AccountId::of("acc-123456789", Some("org-other")),
+            "two organizations of the same user are distinct accounts"
+        );
     }
 }

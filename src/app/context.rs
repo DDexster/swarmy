@@ -201,12 +201,19 @@ impl Ctx {
         }
         let states = v.seat_states(&self.seats)?;
         for si in &mut self.seat_info {
-            if states
-                .get(&si.seat)
-                .is_some_and(|st| st.unverified_since.is_some())
-            {
-                si.account = None;
-                si.utilization = None;
+            if let Some(st) = states.get(&si.seat) {
+                if st.unverified_since.is_some() {
+                    si.account = None;
+                    si.utilization = None;
+                } else if let (Some(switched), Some(u)) = (st.switched_at, si.utilization.as_ref())
+                    && u.org_from_profile
+                    && u.fetched_at < switched
+                {
+                    // `cachedUsageUtilization` had no `organizationUuid` of its own and predates
+                    // the vault switch: it may belong to the seat's previous organization under
+                    // the same `accountUuid`.
+                    si.utilization = None;
+                }
             }
         }
         Ok(())
@@ -303,11 +310,27 @@ impl Ctx {
         Ok((idx, stats))
     }
 
-    /// Display name of an account: the config label, else the email (masked on request), else
-    /// the seats it is logged into, else a short uuid.
+    /// Display name of an account: the config label, else a saved login's label, else the seats it
+    /// is logged into, else the email / org name (masked on request), else a short id.
     pub fn account_name(&self, uuid: &str) -> String {
+        let user = AccountId::new(uuid);
         if let Some(l) = self.config.accounts.get(uuid) {
             return l.clone();
+        }
+        // Backwards compatibility: a `[accounts]` entry keyed by bare `accountUuid` still applies
+        // when only one known account belongs to that user.
+        if user.has_org()
+            && let Some(l) = self.config.accounts.get(user.user_uuid())
+        {
+            let matching_orgs: std::collections::BTreeSet<AccountId> = self
+                .seat_info
+                .iter()
+                .filter_map(|s| s.account.as_ref().map(config_json::Account::id))
+                .filter(|id| id.user_uuid() == user.user_uuid())
+                .collect();
+            if matching_orgs.len() <= 1 {
+                return l.clone();
+            }
         }
         // A saved login's label names its account best: seat names would mix the two ideas.
         if let Some(l) = self.login_labels.get(uuid) {
@@ -316,23 +339,27 @@ impl Ctx {
         let seats: Vec<&str> = self
             .seat_info
             .iter()
-            .filter(|s| s.account.as_ref().is_some_and(|a| a.account_uuid == uuid))
+            .filter(|s| s.account.as_ref().is_some_and(|a| a.id().as_str() == uuid))
             .map(|s| s.label.as_str())
             .collect();
         if !seats.is_empty() {
             return format!("account in {}", seats.join("+"));
         }
         if !self.mask
-            && let Some(e) = self
+            && let Some(a) = self
                 .seat_info
                 .iter()
                 .filter_map(|s| s.account.as_ref())
-                .find(|a| a.account_uuid == uuid)
-                .and_then(|a| a.email.clone())
+                .find(|a| a.id().as_str() == uuid)
         {
-            return e;
+            if let Some(e) = &a.email {
+                return e.clone();
+            }
+            if let Some(org) = &a.organization_name {
+                return org.clone();
+            }
         }
-        format!("acct-{}", crate::core::ids::short(uuid))
+        format!("acct-{}", crate::core::ids::short_account(uuid))
     }
 
     pub fn email(&self, uuid: &str) -> Option<String> {
@@ -342,8 +369,19 @@ impl Ctx {
         self.seat_info
             .iter()
             .filter_map(|s| s.account.as_ref())
-            .find(|a| a.account_uuid == uuid)
+            .find(|a| a.id().as_str() == uuid)
             .and_then(|a| a.email.clone())
+    }
+
+    pub fn org_name(&self, uuid: &str) -> Option<String> {
+        if self.mask {
+            return None;
+        }
+        self.seat_info
+            .iter()
+            .filter_map(|s| s.account.as_ref())
+            .find(|a| a.id().as_str() == uuid)
+            .and_then(|a| a.organization_name.clone())
     }
 
     /// The freshest utilization reading of every account Claude Code has cached in a seat now
@@ -353,7 +391,7 @@ impl Ctx {
             std::collections::BTreeMap::new();
         for si in &self.seat_info {
             if let Some(u) = &si.utilization {
-                let e = best.entry(u.account_uuid.clone()).or_insert(u);
+                let e = best.entry(u.account_id.to_string()).or_insert(u);
                 if u.fetched_at > e.fetched_at {
                     *e = u;
                 }
@@ -424,17 +462,44 @@ impl Ctx {
         let mut found: std::collections::BTreeSet<AccountId> =
             idx.accounts_matching(key)?.into_iter().collect();
         for a in self.seat_info.iter().filter_map(|s| s.account.as_ref()) {
+            let id = a.id();
             let email = a
                 .email
                 .as_deref()
                 .is_some_and(|e| e.eq_ignore_ascii_case(key));
-            if a.account_uuid == key || email {
-                found.insert(AccountId::new(a.account_uuid.clone()));
+            let org_name = a
+                .organization_name
+                .as_deref()
+                .is_some_and(|o| o.eq_ignore_ascii_case(key));
+            if id.as_str() == key
+                || a.account_uuid == key
+                || a.organization_uuid.as_deref() == Some(key)
+                || email
+                || org_name
+            {
+                found.insert(id);
             }
         }
         for (uuid, name) in &self.config.accounts {
             if name == key || uuid == key {
-                found.insert(AccountId::new(uuid.clone()));
+                let cfg_id = AccountId::new(uuid.clone());
+                if cfg_id.has_org() {
+                    found.insert(cfg_id);
+                } else {
+                    // A config entry keyed by bare `accountUuid`: map to any matching org-scoped
+                    // account when present, else keep the bare id.
+                    let scoped: Vec<AccountId> = self
+                        .seat_info
+                        .iter()
+                        .filter_map(|s| s.account.as_ref().map(config_json::Account::id))
+                        .filter(|id| id.user_uuid() == uuid)
+                        .collect();
+                    if scoped.is_empty() {
+                        found.insert(cfg_id);
+                    } else {
+                        found.extend(scoped);
+                    }
+                }
             }
         }
         // Saved logins: their labels name accounts too.
@@ -445,10 +510,16 @@ impl Ctx {
                         .email
                         .as_deref()
                         .is_some_and(|e| e.eq_ignore_ascii_case(key));
-                    if let Some(a) = &l.account_uuid
-                        && (l.label == key || email || a == key)
-                    {
-                        found.insert(AccountId::new(a.clone()));
+                    if let Some(a) = &l.account_uuid {
+                        let id = AccountId::new(a.clone());
+                        if l.label == key
+                            || email
+                            || id.as_str() == key
+                            || id.user_uuid() == key
+                            || id.org_uuid() == Some(key)
+                        {
+                            found.insert(id);
+                        }
                     }
                 }
             }
@@ -536,7 +607,7 @@ pub fn seat_info_of(
     data_dir: &std::path::Path,
     problems: &mut Vec<String>,
 ) -> (SeatInfo, Option<serde_json::Value>) {
-    let cj = match config_json::read_seat_file(&s.claude_json) {
+    let mut cj = match config_json::read_seat_file(&s.claude_json) {
         Ok(cj) => cj,
         Err(e) => {
             let msg = format!("seat {}: {e:#}", s.label);
@@ -545,15 +616,19 @@ pub fn seat_info_of(
             config_json::ClaudeJson::default()
         }
     };
+    // Best-effort non-secret metadata from `.credentials.json` (subscriptionType / rateLimitTier
+    // scoped to this seat's OAuth grant). Never touches macOS Keychain; missing files are ignored.
+    if let Some(a) = cj.account.as_mut()
+        && let Ok(text) = std::fs::read_to_string(s.credentials_file())
+        && let Ok(Some(secret)) = crate::claude::credentials::parse_login(&text)
+    {
+        a.apply_credentials(&secret.meta());
+    }
     let live =
         crate::statusline::reading::read(&crate::statusline::reading::file_of(data_dir, &s.id));
     // A status-line reading counts only for the account it names (review H2).
     let utilization = match cj.account.as_ref() {
-        Some(a) => crate::statusline::reading::merge(
-            cj.utilization,
-            &AccountId::new(a.account_uuid.clone()),
-            live,
-        ),
+        Some(a) => crate::statusline::reading::merge(cj.utilization, &a.id(), live),
         None => cj.utilization,
     };
     (
@@ -623,12 +698,55 @@ mod tests {
         let mut problems = Vec::new();
         let (info, _) = seat_info_of(&seat, t.path(), &mut problems);
         let u = info.utilization.unwrap();
-        assert_eq!(u.account_uuid, "acc-b");
+        assert_eq!(u.account_id.as_str(), "acc-b");
         assert_eq!(u.readings[0].utilization, 10.0, "acc-b's own reading");
         // The same reading under acc-b's name is acc-b's, and newer: it wins.
         write(&file_of(t.path(), &seat.id), &reading("acc-b")).unwrap();
         let (info, _) = seat_info_of(&seat, t.path(), &mut problems);
         assert_eq!(info.utilization.unwrap().readings[0].utilization, 80.0);
         assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn credentials_enrich_plan_when_present_without_requiring_file() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join(".claude-team");
+        std::fs::create_dir_all(&dir).unwrap();
+        let seat = Seat::new("team", dir.clone(), dir.join(".claude.json"), false);
+        std::fs::write(
+            &seat.claude_json,
+            serde_json::json!({
+                "oauthAccount": {
+                    "accountUuid": "acc-1",
+                    "organizationUuid": "org-team",
+                    "userRateLimitTier": "default_claude_max_5x"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            seat.credentials_file(),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "a",
+                    "refreshToken": "r",
+                    "subscriptionType": "team",
+                    "rateLimitTier": "default_claude_max_5x"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut problems = Vec::new();
+        let (info, _) = seat_info_of(&seat, t.path(), &mut problems);
+        assert!(problems.is_empty(), "{problems:?}");
+        let acct = info.account.unwrap();
+        assert_eq!(acct.id().as_str(), "acc-1/org-team");
+        assert_eq!(
+            acct.effective_tier().as_deref(),
+            Some("team:default_claude_max_5x")
+        );
+        assert_eq!(acct.plan_label().as_deref(), Some("team (max_5x)"));
     }
 }

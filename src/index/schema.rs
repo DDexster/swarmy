@@ -39,7 +39,7 @@ pub const CACHE_VERSION: &str = "6";
 const DIMENSIONS_SINCE: u32 = 6;
 
 /// Version of the fact tables; each step up has a migration in `migrate_facts`.
-pub const FACTS_VERSION: u32 = 2;
+pub const FACTS_VERSION: u32 = 3;
 
 /// Read from the transcripts row by row: dropped and read again when `CACHE_VERSION` changes.
 pub const RAW_TABLES: &[&str] = &[
@@ -339,6 +339,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   email TEXT,
   display_name TEXT,
   org_name TEXT,
+  org_uuid TEXT,
   plan TEXT,
   tier TEXT,
   seat TEXT,
@@ -740,6 +741,10 @@ fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
     // 1 → 2: seats are keyed by id; the labels stored so far wait in `seats` for their seat.
     if version < 2 {
         super::seats::list_legacy_labels(conn)?;
+    }
+    // 2 → 3: accounts carry `org_uuid` alongside the canonical `<account>/<org>` primary key.
+    if version < 3 && !columns(conn, "accounts")?.iter().any(|c| c == "org_uuid") {
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN org_uuid TEXT;")?;
     }
     set_meta(conn, "facts_version", &FACTS_VERSION.to_string())?;
     Ok(())

@@ -105,7 +105,8 @@ mod tests {
 
     pub(crate) fn weekly(account: &str, fetched: &str, used: f64, resets: &str) -> Utilization {
         Utilization {
-            account_uuid: account.into(),
+            account_id: crate::core::ids::AccountId::new(account),
+            org_from_profile: false,
             fetched_at: at(fetched),
             readings: vec![Reading {
                 kind: WindowKind::SevenDay,
@@ -980,7 +981,7 @@ mod tests {
         assert_eq!(work.len(), 2);
         w.refresh(&mut b, &[], &prices);
         let mut resolver = Resolver::new(Vec::new());
-        a.ingest(work, &[], &mut resolver, &prices, &mut |_| {})
+        a.ingest(work, &[], &mut resolver, &prices, false, &mut |_| {})
             .unwrap();
         assert_eq!(counted(&a), want);
         assert_eq!(dump(&a, REQUESTS), dump(&reference, REQUESTS));
@@ -990,7 +991,7 @@ mod tests {
         w.append("work", "s1", &[compact("2026-11-10T10:06:00Z")]);
         let work = a.plan(&w.files(), &w.seats).unwrap();
         w.refresh(&mut b, &[], &prices);
-        a.ingest(work, &[], &mut resolver, &prices, &mut |_| {})
+        a.ingest(work, &[], &mut resolver, &prices, false, &mut |_| {})
             .unwrap();
         w.refresh(&mut a, &[], &prices);
         w.refresh(&mut reference, &[], &prices);

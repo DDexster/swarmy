@@ -299,7 +299,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
     ]);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
         let st = states.get(&s.id).cloned().unwrap_or_default();
-        let acct = si.account.as_ref().map(|a| a.account_uuid.clone());
+        let acct = si.account.as_ref().map(|a| a.id().to_string());
         let w = weekly(&reports, acct.as_deref());
         let (week, tone, resets) = match w {
             Some((u, end, reset)) => (

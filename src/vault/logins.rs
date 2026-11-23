@@ -10,8 +10,10 @@ use super::{Login, store};
 use crate::claude::seats::{Seat, SeatId};
 use crate::errors::VaultError;
 
-/// The format of `logins.json`: 2 names seats by id (`core::ids::SeatId`); 1 (no `v`) by label.
-const INDEX_VERSION: u32 = 2;
+/// The format of `logins.json`: 3 keys `account_uuid` by canonical `AccountId`
+/// (`<accountUuid>/<organizationUuid>` when an org is known); 2 named seats by `SeatId`; 1 (no
+/// `v`) by seat label.
+const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Index {
@@ -51,6 +53,10 @@ pub(super) struct SeatSeen {
     pub(super) profile_at: Option<DateTime<Utc>>,
     /// The refresh token changed and Claude Code has not re-read the profile since.
     pub(super) unverified_since: Option<DateTime<Utc>>,
+    /// When the vault last switched this seat to another login: a cached utilization reading
+    /// older than this without its own `organizationUuid` may belong to the previous org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) switched_at: Option<DateTime<Utc>>,
 }
 
 pub(super) fn read_index(dir: &Path) -> anyhow::Result<(Index, Option<String>)> {
@@ -85,8 +91,26 @@ impl Index {
                 seen.label = label.as_str().to_string();
                 self.legacy_seats.insert(label.as_str().to_string(), seen);
             }
-            self.v = INDEX_VERSION;
         }
+        if self.v < 3 {
+            // Upgrade bare `accountUuid` to `<accountUuid>/<organizationUuid>` from the saved
+            // `oauthAccount` profile, and refresh the derived plan tier with org precedence.
+            for l in &mut self.logins {
+                if let Some(raw) = &l.oauth_account
+                    && let Some(mut acct) = crate::claude::config_json::Account::from_value(raw)
+                {
+                    acct.apply_credentials(&l.meta);
+                    let id = acct.id();
+                    if id.has_org() || l.account_uuid.is_none() {
+                        l.account_uuid = Some(id.to_string());
+                    }
+                    if let Some(tier) = acct.effective_tier() {
+                        l.plan = Some(tier);
+                    }
+                }
+            }
+        }
+        self.v = INDEX_VERSION;
         Ok(())
     }
 

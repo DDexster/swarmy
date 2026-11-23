@@ -53,7 +53,7 @@ pub(super) fn worker(
             let accounts = ctx
                 .seat_info
                 .iter()
-                .filter_map(|s| s.account.as_ref().map(|a| a.account_uuid.clone()))
+                .filter_map(|s| s.account.as_ref().map(|a| a.id().to_string()))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len();
             if !send(Msg::Ready {
@@ -536,7 +536,7 @@ fn fleet_of(
     }
     f.needs_you.sort_by_key(|n| n.since);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let Some(acct) = si.account.as_ref().map(|a| a.account_uuid.clone()) else {
+        let Some(acct) = si.account.as_ref().map(|a| a.id().to_string()) else {
             continue;
         };
         let week = limits

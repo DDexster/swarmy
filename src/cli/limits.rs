@@ -33,16 +33,20 @@ pub fn run(ctx: &Ctx, format: Format, top: usize) -> anyhow::Result<()> {
             .email(&rep.account_uuid)
             .map(|e| format!(" · {e}"))
             .unwrap_or_default();
+        let org = match ctx.org_name(&rep.account_uuid).filter(|o| o != &rep.name) {
+            Some(o) => format!(" · {o}"),
+            None => String::new(),
+        };
         let tier = rep
             .tier
             .as_deref()
-            .map(|t| format!(" · {}", t.replace("default_claude_", "")))
+            .map(|t| format!(" · {}", crate::claude::config_json::format_tier_label(t)))
             .unwrap_or_default();
         println!(
             "{} {}{}",
             p.paint("ACCOUNT", Tone::Header),
             p.paint(&rep.name, Tone::Bold),
-            p.paint(&format!("{email}{tier}"), Tone::Dim)
+            p.paint(&format!("{email}{org}{tier}"), Tone::Dim)
         );
         for w in &rep.windows {
             print_window(ctx, w, top);

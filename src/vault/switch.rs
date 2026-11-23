@@ -123,6 +123,22 @@ impl VaultTx<'_> {
             // 5. Bookkeeping.
             let from_label = previous.as_ref().and_then(|id| self.index.label_of(id));
             self.mount(&target.id, seat);
+            let target_profile_at = target
+                .oauth_account
+                .as_ref()
+                .and_then(config_json::Account::from_value)
+                .and_then(|a| a.profile_fetched_at);
+            self.index.seats.insert(
+                seat.id.clone(),
+                super::logins::SeatSeen {
+                    label: seat.label.clone(),
+                    fingerprint: target.meta.fingerprint.clone(),
+                    account_uuid: target.account_uuid.clone(),
+                    profile_at: target_profile_at,
+                    unverified_since: None,
+                    switched_at: Some(chrono::Utc::now()),
+                },
+            );
             self.journal(&format!(
                 "switch seat={} from={} to={}",
                 seat.label,

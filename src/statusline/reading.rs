@@ -13,9 +13,10 @@ use crate::claude::config_json::Utilization;
 use crate::core::ids::{AccountId, SeatId};
 use crate::core::limits::{Reading, WindowKind};
 
-/// The format of a reading file. 2: the reading names its account and keeps the time its
-/// numbers were first true (review H2, M5); a file without `v` (1) has no account and is ignored.
-pub const VERSION: u32 = 2;
+/// The format of a reading file. 3: `account` carries `<accountUuid>/<organizationUuid>` when an
+/// organization is known; older versions (1 without account, 2 with bare `accountUuid`) are
+/// ignored until the next response writes 3.
+pub const VERSION: u32 = 3;
 
 /// What `swarmy statusline` keeps of one call: a limit reading of one account.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -149,7 +150,7 @@ pub fn merge(
         }
     }
     // Windows the status line does not carry (per-model weekly limits) keep the cached values.
-    let cached = cached.filter(|c| c.account_uuid == account.as_str());
+    let cached = cached.filter(|c| &c.account_id == account);
     if let Some(c) = cached.as_ref() {
         readings.extend(
             c.readings
@@ -159,7 +160,8 @@ pub fn merge(
         );
     }
     Some(Utilization {
-        account_uuid: account.to_string(),
+        account_id: account.clone(),
+        org_from_profile: false,
         fetched_at: live.at,
         readings,
         extra_usage_enabled: cached.is_some_and(|c| c.extra_usage_enabled),
@@ -191,7 +193,8 @@ mod tests {
 
         // Older cached reading (95%) of the same account: the live one replaces it.
         let cached = Utilization {
-            account_uuid: "acc".into(),
+            account_id: acc("acc"),
+            org_from_profile: false,
             fetched_at: at - chrono::Duration::hours(1),
             readings: vec![Reading {
                 kind: WindowKind::SevenDay,
@@ -229,7 +232,8 @@ mod tests {
         let input = parse_input(INPUT);
         let a = live_from(&input, Path::new("/x"), acc("acc-a"), at).unwrap();
         let cached_b = Utilization {
-            account_uuid: "acc-b".into(),
+            account_id: acc("acc-b"),
+            org_from_profile: false,
             fetched_at: at - chrono::Duration::hours(3),
             readings: vec![],
             extra_usage_enabled: true,
