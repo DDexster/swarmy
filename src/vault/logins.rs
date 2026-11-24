@@ -10,10 +10,11 @@ use super::{Login, store};
 use crate::claude::seats::{Seat, SeatId};
 use crate::errors::VaultError;
 
-/// The format of `logins.json`: 3 keys `account_uuid` by canonical `AccountId`
+/// The format of `logins.json`: 4 gives each login its `harness` and a list of seats in
+/// `mounted` (one login in several seats); 3 keys `account_uuid` by canonical `AccountId`
 /// (`<accountUuid>/<organizationUuid>` when an org is known); 2 named seats by `SeatId`; 1 (no
-/// `v`) by seat label.
-const INDEX_VERSION: u32 = 3;
+/// `v`) by seat label. Older files read as they are (`Login::mounted` takes one seat or many).
+const INDEX_VERSION: u32 = 4;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Index {
@@ -83,7 +84,7 @@ impl Index {
         }
         if self.v < 2 {
             for l in &mut self.logins {
-                if let Some(label) = l.mounted.take() {
+                if let Some(label) = std::mem::take(&mut l.mounted).into_iter().next() {
                     l.mounted_label = Some(label.as_str().to_string());
                 }
             }
@@ -123,8 +124,10 @@ impl Index {
                 self.seats.entry(seat.id.clone()).or_insert(seen);
             }
             for l in &mut self.logins {
-                if l.mounted.is_none() && l.mounted_label.as_deref() == Some(seat.label.as_str()) {
-                    l.mounted = Some(seat.id.clone());
+                if l.mounted_label.as_deref() == Some(seat.label.as_str()) {
+                    if !l.is_in(&seat.id) {
+                        l.mounted.push(seat.id.clone());
+                    }
                     l.mounted_label = None;
                 }
             }

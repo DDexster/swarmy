@@ -87,15 +87,24 @@ pub fn run(ctx: &Ctx, a: &PeriodFilterArgs) -> anyhow::Result<()> {
             .map(|(e, c)| format!("{e} {:.0}%", c / msum * 100.0))
             .collect::<Vec<_>>()
             .join(" · ");
+        let unpriced = r.requests > 0 && r.unpriced == r.requests && r.cost == 0.0;
         t.row(vec![
             Cell::tone(short_name(&r.key), tone),
             Cell::new(fmt::count(r.requests)),
-            Cell::tone(fmt::money(r.cost), Tone::Bold),
+            if unpriced {
+                Cell::tone("unpriced", Tone::Dim)
+            } else {
+                Cell::tone(fmt::money(r.cost), Tone::Bold)
+            },
             Cell::tone(
                 format!("{:<12} {}", fmt::bar(share, 12), fmt::pct(share * 100.0)),
                 tone,
             ),
-            Cell::new(fmt::money(r.cost / reqs)),
+            if unpriced {
+                Cell::tone("—", Tone::Dim)
+            } else {
+                Cell::new(fmt::money(r.cost / reqs))
+            },
             Cell::new(fmt::tokens((u.output as f64 / reqs) as u64)),
             Cell::new(if u.output > 0 {
                 fmt::pct(u.thinking as f64 / u.output as f64 * 100.0)
@@ -115,10 +124,16 @@ pub fn run(ctx: &Ctx, a: &PeriodFilterArgs) -> anyhow::Result<()> {
             Cell::tone(mix_s, Tone::Dim),
         ]);
     }
+    let total_unpriced =
+        total.requests > 0 && total.unpriced == total.requests && total.cost == 0.0;
     t.footer(vec![
         Cell::tone("TOTAL", Tone::Bold),
         Cell::new(fmt::count(total.requests)),
-        Cell::tone(fmt::money(total.cost), Tone::Accent),
+        if total_unpriced {
+            Cell::tone("unpriced", Tone::Dim)
+        } else {
+            Cell::tone(fmt::money(total.cost), Tone::Accent)
+        },
     ]);
     println!("{}", t.render(p));
 

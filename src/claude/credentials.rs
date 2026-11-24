@@ -2,104 +2,9 @@
 //! Windows) or, on macOS, a Keychain item. Token values never leave this module except through
 //! `Secret`, which does not print them.
 
-use std::fmt;
-
-use chrono::{DateTime, TimeZone, Utc};
-use serde::Serialize;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
-/// The verbatim `claudeAiOauth` object. Debug and Display show only the fingerprint.
-#[derive(Clone, PartialEq)]
-pub struct Secret(Value);
-
-impl Secret {
-    pub fn new(v: Value) -> Self {
-        Secret(v)
-    }
-
-    pub fn expose(&self) -> &Value {
-        &self.0
-    }
-
-    pub fn meta(&self) -> LoginMeta {
-        LoginMeta::of(&self.0)
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Secret({})", self.meta().fingerprint)
-    }
-}
-
-impl Drop for Secret {
-    fn drop(&mut self) {
-        // Best effort: overwrite token strings before the memory is freed.
-        if let Value::Object(m) = &mut self.0 {
-            for v in m.values_mut() {
-                if let Value::String(s) = v {
-                    wipe(std::mem::take(s));
-                }
-            }
-        }
-    }
-}
-
-/// Zeroes the heap buffer of a string before freeing it.
-fn wipe(s: String) {
-    let mut b = s.into_bytes();
-    b.iter_mut().for_each(|x| *x = 0);
-    std::hint::black_box(&b);
-}
-
-/// Non-secret facts about a login.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, serde::Deserialize)]
-pub struct LoginMeta {
-    /// First 8 bytes of SHA-256 of the refresh token, hex: identifies the grant.
-    pub fingerprint: String,
-    pub subscription_type: Option<String>,
-    pub rate_limit_tier: Option<String>,
-    pub access_expires_at: Option<DateTime<Utc>>,
-    pub refresh_expires_at: Option<DateTime<Utc>>,
-    pub scopes: Vec<String>,
-}
-
-impl LoginMeta {
-    pub fn of(v: &Value) -> LoginMeta {
-        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
-        let t = |k: &str| {
-            v.get(k)
-                .and_then(Value::as_i64)
-                .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        };
-        let token = v
-            .get("refreshToken")
-            .and_then(Value::as_str)
-            .or_else(|| v.get("accessToken").and_then(Value::as_str));
-        LoginMeta {
-            fingerprint: token.map(fingerprint).unwrap_or_else(|| "none".into()),
-            subscription_type: s("subscriptionType"),
-            rate_limit_tier: s("rateLimitTier"),
-            access_expires_at: t("expiresAt"),
-            refresh_expires_at: t("refreshTokenExpiresAt"),
-            scopes: v
-                .get("scopes")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|x| x.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        }
-    }
-}
-
-pub fn fingerprint(token: &str) -> String {
-    let d = Sha256::digest(token.as_bytes());
-    hex::encode(&d[..8])
-}
+pub use crate::core::login::{LoginMeta, Secret, fingerprint};
 
 /// Extracts `claudeAiOauth` from the text of a credentials file or of a backup holding just
 /// `{"claudeAiOauth": {...}}`.
@@ -108,7 +13,7 @@ pub fn parse_login(text: &str) -> anyhow::Result<Option<Secret>> {
     Ok(v.get("claudeAiOauth")
         .filter(|x| x.is_object())
         .cloned()
-        .map(Secret))
+        .map(Secret::new))
 }
 
 /// Puts `login` into the credentials file text, keeping every other key (`mcpOAuth` tokens belong

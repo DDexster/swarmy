@@ -122,15 +122,26 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
         }),
         th.fg,
     ));
+    let where_seat = if a.harness == crate::core::harness::Harness::Claude {
+        a.seat_label.clone()
+    } else {
+        format!(
+            "{} ({})",
+            a.seat_label,
+            a.harness.display_name().to_lowercase()
+        )
+    };
     lines.push(Line::from(vec![
         Span::styled(fit("where", kw), faint(app)),
         Span::styled(a.project.clone(), th.bold(th.dir)),
         Span::styled(
-            format!(" · {} · {}", a.seat_label, a.session_id.short()),
+            format!(" · {where_seat} · {}", a.session_id.short()),
             Style::new().fg(th.fg),
         ),
     ]));
-    let cost = if a.is_main() {
+    let cost = if a.unpriced && (!a.is_main() || a.session_cost == 0.0) {
+        format!("unpriced · {} requests", fmt::count(a.requests))
+    } else if a.is_main() {
         format!(
             "{} · session Σ{} · {}/h",
             fmt::usd(a.cost),

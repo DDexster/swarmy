@@ -19,6 +19,19 @@ pub struct ClaudeProc {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct AgyProc {
+    pub pid: u32,
+    pub parent: Option<u32>,
+    pub cwd: Option<PathBuf>,
+    /// The data dir this agy uses: `$HOME/.gemini/antigravity-cli` of its environment (the CLI
+    /// keys its dir on `HOME`), when the environment is readable.
+    pub app_data_dir: Option<PathBuf>,
+    pub start_time: u64,
+    pub cpu: f32,
+    pub memory: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcNode {
     pub pid: u32,
     pub parent: Option<u32>,
@@ -32,26 +45,32 @@ pub struct ProcNode {
 /// One snapshot of the process table.
 pub struct ProcTable {
     pub claude: Vec<ClaudeProc>,
+    pub agy: Vec<AgyProc>,
     pub nodes: HashMap<u32, ProcNode>,
     children: HashMap<u32, Vec<u32>>,
 }
 
+fn proc_base(s: &str) -> String {
+    let b = s
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(s)
+        .to_ascii_lowercase();
+    b.trim_end_matches(".exe").to_string()
+}
+
 fn is_claude(name: &str, cmd: &[String]) -> bool {
-    let base = |s: &str| {
-        let b = s
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(s)
-            .to_ascii_lowercase();
-        b.trim_end_matches(".exe").to_string()
-    };
-    if base(name) == "claude" {
+    if proc_base(name) == "claude" {
         return true;
     }
     // `node .../@anthropic-ai/claude-code/cli.js`
     cmd.iter()
         .take(2)
         .any(|a| a.contains("@anthropic-ai/claude-code/") && !a.contains("chrome-native"))
+}
+
+fn is_agy(name: &str) -> bool {
+    proc_base(name) == "agy"
 }
 
 impl ProcTable {
@@ -106,6 +125,7 @@ impl ProcTable {
         }
         ProcTable {
             claude: Vec::new(),
+            agy: Vec::new(),
             nodes,
             children: HashMap::new(),
         }
@@ -114,6 +134,7 @@ impl ProcTable {
     pub fn empty() -> ProcTable {
         ProcTable {
             claude: Vec::new(),
+            agy: Vec::new(),
             nodes: HashMap::new(),
             children: HashMap::new(),
         }
@@ -123,6 +144,7 @@ impl ProcTable {
         let mut nodes = HashMap::new();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut claude = Vec::new();
+        let mut agy = Vec::new();
         for (pid, p) in sys.processes() {
             // Threads show up as processes on Linux; skip them.
             if p.thread_kind().is_some() {
@@ -153,6 +175,22 @@ impl ProcTable {
                     cpu: p.cpu_usage(),
                     memory: p.memory(),
                 });
+            } else if is_agy(&name) {
+                let app_data_dir = p.environ().iter().find_map(|e| {
+                    let e = e.to_string_lossy();
+                    e.strip_prefix("HOME=")
+                        .filter(|v| !v.is_empty())
+                        .map(|h| PathBuf::from(h).join(".gemini").join("antigravity-cli"))
+                });
+                agy.push(AgyProc {
+                    pid,
+                    parent,
+                    cwd: cwd.clone(),
+                    app_data_dir,
+                    start_time: p.start_time(),
+                    cpu: p.cpu_usage(),
+                    memory: p.memory(),
+                });
             }
             if let Some(pp) = parent {
                 children.entry(pp).or_default().push(pid);
@@ -171,8 +209,10 @@ impl ProcTable {
             );
         }
         claude.sort_by_key(|c| c.start_time);
+        agy.sort_by_key(|c| c.start_time);
         ProcTable {
             claude,
+            agy,
             nodes,
             children,
         }

@@ -59,6 +59,9 @@ pub struct Analytics {
     /// Spend of the period before this one, for ▲▼ trends (none for "all").
     pub prev_total: Option<f64>,
     pub prev_models: Vec<(String, f64)>,
+    /// Which harnesses ran each model in the period (model, harness key); empty when only one
+    /// harness has seats (MODELS shows the column only then).
+    pub model_harness: Vec<(String, String)>,
     /// When the slow parts were computed (efficiency, the previous period).
     pub efficiency_at: Option<Instant>,
     pub prev_at: Option<Instant>,
@@ -98,10 +101,17 @@ pub struct SeatRow {
     pub id: crate::core::ids::SeatId,
     /// For display; unique within one run.
     pub label: String,
+    pub harness: crate::core::harness::Harness,
     /// The confirmed account (None while a new login is unconfirmed).
     pub account: Option<String>,
     pub login: Option<String>,
+    /// Auth/plan hint for seats outside the Claude vault (e.g. `consumer`).
+    pub plan: Option<String>,
     pub live: usize,
+    pub today_cost: f64,
+    pub today_requests: u64,
+    /// Spend of the last 7 days (shown for seats whose harness has no local quota).
+    pub week_cost: f64,
     pub state: crate::vault::SeatState,
 }
 
@@ -208,11 +218,13 @@ fn ui_loop(
                     if app.on_key(k) {
                         return Ok(());
                     }
-                    if let Some(vault_ui::External::AddLogin(label)) = app.vault.external.take() {
-                        // Hand the terminal to Claude Code for /login, then take it back.
+                    if let Some(vault_ui::External::AddLogin(label, harness)) =
+                        app.vault.external.take()
+                    {
+                        // Hand the terminal to the harness for its sign-in, then take it back.
                         let _ = execute!(std::io::stdout(), DisableMouseCapture);
                         ratatui::restore();
-                        app.run_add_login(&label);
+                        app.run_add_login(&label, harness);
                         *terminal = ratatui::init();
                         let _ = execute!(std::io::stdout(), EnableMouseCapture);
                         terminal.clear()?;

@@ -157,6 +157,10 @@ mod tests {
             session_id: session.into(),
             agent_id: String::new(),
             kind: FileKind::Main,
+            harness: seat.harness,
+            default_cwd: None,
+            session_title: None,
+            inline_meta: None,
         }
     }
 

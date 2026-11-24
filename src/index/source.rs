@@ -1,0 +1,162 @@
+//! Per-harness transcript discovery and incremental chunk reading for the index.
+//!
+//! Keeps harness dispatch in one place so `index::Index` stays harness-agnostic and future
+//! harnesses (e.g. OpenCode) plug in here without growing `src/index/mod.rs`.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use rusqlite::Connection;
+
+use super::agy_summaries;
+use crate::claude::files::{self, FileKind, TranscriptFile};
+use crate::claude::seats::{Seat, SeatId};
+use crate::claude::transcript;
+use crate::core::harness::Harness;
+
+/// The dirs a session's files were listed from (with their mtimes), and the files.
+pub(super) type ListedDirs = (Vec<(PathBuf, Option<SystemTime>)>, Vec<TranscriptFile>);
+
+/// Lists every transcript file belonging to `seat`, dispatching by `seat.harness`.
+pub(super) fn list_seat_files(seat: &Seat) -> Vec<TranscriptFile> {
+    match seat.harness {
+        Harness::Claude => files::list(seat),
+        Harness::Agy => {
+            let metas = agy_summaries::read_all(&seat.dir);
+            crate::agy::meta::list_transcripts(&seat.id, &seat.dir, &metas)
+        }
+    }
+}
+
+/// Reads the new bytes of `f` starting at `offset` using the harness-specific transcript parser.
+pub(super) fn read_transcript_chunk(
+    f: &TranscriptFile,
+    offset: u64,
+) -> std::io::Result<transcript::Chunk> {
+    match f.harness {
+        Harness::Claude => transcript::read_from(&f.path, offset),
+        Harness::Agy => {
+            let conv_id = if f.agent_id.is_empty() {
+                f.session_id.as_str()
+            } else {
+                f.agent_id.as_str()
+            };
+            crate::agy::transcript::read_from(&f.path, offset, conv_id, f.default_cwd.as_deref())
+        }
+    }
+}
+
+/// Lists transcript files recently modified in the `files` table (`mtime >= since`), hydrating
+/// Antigravity files with targeted `conversation_summaries.db` metadata.
+pub(super) fn recent_files(
+    conn: &Connection,
+    seats: &[Seat],
+    since: i64,
+) -> anyhow::Result<Vec<TranscriptFile>> {
+    let mut out: Vec<TranscriptFile> = Vec::new();
+    let mut agy_recent: HashMap<SeatId, Vec<String>> = HashMap::new();
+    {
+        let mut st = conn.prepare(
+            "SELECT path, seat, session_id, agent_id, kind FROM files WHERE mtime >= ?1",
+        )?;
+        let rows = st.query_map([since], |r| {
+            let kind: String = r.get(4)?;
+            let seat_id: SeatId = r.get(1)?;
+            let session_id: String = r.get(2)?;
+            let agent_id: String = r.get(3)?;
+            let path = PathBuf::from(r.get::<_, String>(0)?);
+            Ok((path, seat_id, session_id, agent_id, kind))
+        })?;
+        for r in rows {
+            let (path, seat_id, session_id, agent_id, kind) = r?;
+            let harness = seats
+                .iter()
+                .find(|s| s.id == seat_id)
+                .map_or(Harness::Claude, |s| s.harness);
+            if harness == Harness::Agy {
+                let cid = if agent_id.is_empty() {
+                    session_id
+                } else {
+                    agent_id
+                };
+                agy_recent.entry(seat_id).or_default().push(cid);
+                continue;
+            }
+            out.push(TranscriptFile {
+                path,
+                seat: seat_id,
+                session_id,
+                agent_id,
+                kind: match kind.as_str() {
+                    "main" => FileKind::Main,
+                    "subagent" => FileKind::Subagent,
+                    other => FileKind::Workflow(other.to_string()),
+                },
+                harness: Harness::Claude,
+                default_cwd: None,
+                session_title: None,
+                inline_meta: None,
+            });
+        }
+    }
+    for (seat_id, cids) in agy_recent {
+        if let Some(seat) = seats.iter().find(|s| s.id == seat_id) {
+            let metas = agy_summaries::read_all(&seat.dir);
+            for cid in &cids {
+                if let Some(tf) =
+                    crate::agy::meta::transcript_file(&seat.id, &seat.dir, cid, &metas)
+                {
+                    out.push(tf);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Lists the files of a live session, caching Claude directory listings by directory mtime.
+pub(super) fn session_files(
+    cache: &mut HashMap<(SeatId, String), ListedDirs>,
+    seat: &Seat,
+    sid: &str,
+) -> Vec<TranscriptFile> {
+    if seat.harness == Harness::Agy {
+        let metas = agy_summaries::read_all(&seat.dir);
+        return crate::agy::meta::list_session_transcripts(&seat.id, &seat.dir, sid, &metas);
+    }
+    let key = (seat.id.clone(), sid.to_string());
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    if let Some((dirs, cached)) = cache.get(&key)
+        && !dirs.is_empty()
+        && dirs.iter().all(|(d, t)| mtime(d) == *t)
+    {
+        return cached.clone();
+    }
+    let list = files::list_session(seat, sid);
+    // Watch the dirs that hold these files (main dir, subagents, workflow runs).
+    let mut dirs: Vec<PathBuf> = list
+        .iter()
+        .filter_map(|f| f.path.parent().map(Path::to_path_buf))
+        .collect();
+    // Also dirs that may not exist yet: creating them is how a first subagent shows up.
+    for f in list.iter().filter(|f| f.kind == FileKind::Main) {
+        if let Some(pdir) = f.path.parent() {
+            let base = pdir.join(sid);
+            dirs.push(base.join("subagents").join("workflows"));
+            dirs.push(base.join("subagents"));
+            dirs.push(base);
+        }
+    }
+    dirs.sort();
+    dirs.dedup();
+    let stamped = dirs
+        .into_iter()
+        .map(|d| {
+            let t = mtime(&d);
+            (d, t)
+        })
+        .collect();
+    cache.insert(key, (stamped, list.clone()));
+    list
+}

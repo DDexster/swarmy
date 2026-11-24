@@ -221,12 +221,17 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
         Err(_) => path.display().to_string(),
     };
     println!("{}", p.paint("swarmy setup", Tone::Header));
-    if ctx.seats.is_empty() {
+    let claude_seats: Vec<&Seat> = ctx
+        .seats
+        .iter()
+        .filter(|s| s.harness.supports_statusline())
+        .collect();
+    if claude_seats.is_empty() {
         println!("No Claude Code config dir found. Run `claude` once, then run setup again.");
         return Ok(());
     }
     println!("\nClaude Code config dirs (seats) found:");
-    for s in &ctx.seats {
+    for s in &claude_seats {
         let state = match seat_status_line(s) {
             StatusLine::None => p.paint("no status line", Tone::Dim),
             StatusLine::Swarmy { .. } => p.paint("swarmy status line ✓", Tone::Good),
@@ -238,9 +243,9 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
     let exe = crate::fsutil::canonical(&exe).unwrap_or(exe);
 
     // 1. The status line.
-    let todo: Vec<&Seat> = ctx
-        .seats
+    let todo: Vec<&Seat> = claude_seats
         .iter()
+        .copied()
         .filter(|s| match read_settings(&settings_file(s)) {
             Ok(settings) => with_status_line(
                 settings,
@@ -321,14 +326,21 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
     // 2. Saved logins.
     if !a.remove && !a.no_vault {
         let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
-        let states = v.edit(|tx| tx.seat_states(&ctx.seats))?;
+        let vault_seats: Vec<Seat> = ctx
+            .seats
+            .iter()
+            .filter(|s| s.harness.supports_vault())
+            .cloned()
+            .collect();
+        let states = v.edit(|tx| tx.seat_states(&vault_seats))?;
         let unsaved: Vec<&Seat> = ctx
             .seats
             .iter()
             .filter(|s| {
-                states
-                    .get(&s.id)
-                    .is_some_and(|st| st.fingerprint.is_some() && st.saved_as.is_none())
+                s.harness.supports_vault()
+                    && states
+                        .get(&s.id)
+                        .is_some_and(|st| st.fingerprint.is_some() && st.saved_as.is_none())
             })
             .collect();
         if !unsaved.is_empty() {

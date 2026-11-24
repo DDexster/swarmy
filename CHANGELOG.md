@@ -3,6 +3,24 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+- **Antigravity (`agy`) as a harness next to Claude Code**: its seats (`~/.gemini/antigravity-cli`,
+  the `HOME` of running agys, `[[seat]] harness = "agy"`), live conversations and subagents,
+  spend, tools and projects in every panel and command; `--harness` and `--by harness`.
+- **Gemini prices** (Gemini 4 Neon, Carbon, Argon, Hydrogen; 3.x; 2.5) as dated built-in rows,
+  including the Carbon/Argon change on 2026-12-01; `tools/prices-from-litellm.py` compares the
+  built-in rows with LiteLLM's list.
+- **Logins in several seats**: a saved login stays listed after it goes into a seat and can go
+  into more seats; the seat's own login is still saved first. `--share` is gone (no longer
+  needed).
+- **Vault for Antigravity**: save, add (`swarmy accounts add --harness agy`) and switch Google
+  logins between agy seats; a login only goes into seats of its harness.
+- LIMITS · SEATS groups seats and logins per harness; MODELS shows which harness ran a model;
+  BURN splits today's spend per harness.
+- Accounts: the organization migration keeps parked organizations apart, finishes an
+  interrupted re-attribution, and completes `session-owner` records that have no organization.
+
 ## v0.1.0
 
 The first release: mission control for Claude Code agents in the terminal.

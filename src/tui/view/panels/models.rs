@@ -30,11 +30,31 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
     let width = inner.width as usize;
     let total: f64 = an.by_model.iter().map(|r| r.cost).sum::<f64>().max(1e-9);
     let show_mix = width >= 95;
-    let fixed = 11 + 9 + 11 + 6 + 8 + 6 + 6 + 6 + if show_mix { 24 } else { 0 } + 8;
+    // Which harness ran each model, when there is more than one (`cc`, `agy`, `cc+agy`).
+    let har_w = if an.model_harness.is_empty() { 0 } else { 7 };
+    let har_of = |model: &str| -> String {
+        let mut hs: Vec<&str> = crate::core::harness::Harness::ALL
+            .iter()
+            .filter(|h| {
+                an.model_harness
+                    .iter()
+                    .any(|(m, k)| m == model && k == h.key())
+            })
+            .map(|h| h.short())
+            .collect();
+        hs.dedup();
+        hs.join("+")
+    };
+    let fixed = 11 + har_w + 9 + 11 + 6 + 8 + 6 + 6 + 6 + if show_mix { 24 } else { 0 } + 8;
     let bar_w = width.saturating_sub(fixed).clamp(4, 40);
     let mut header = format!(
-        "{} {} {} {} {} {} {} {}",
+        "{}{} {} {} {} {} {} {} {}",
         fit("MODEL", 11),
+        if har_w > 0 {
+            format!(" {}", fit("HAR", har_w - 1))
+        } else {
+            String::new()
+        },
         fit_right("REQS", 8),
         fit_right("COST      ", 16),
         fit("SHARE", bar_w),
@@ -51,15 +71,32 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
         let c = th.family_name(&r.key);
         let share = r.cost / total;
         let u = r.usage;
-        let mut sp = vec![
-            Span::styled(fit(&short_name(&r.key), 11), th.bold(c)),
+        let unpriced = r.requests > 0 && r.unpriced == r.requests && r.cost == 0.0;
+        let cost_str = if unpriced {
+            "unpriced".to_string()
+        } else {
+            fmt::usd(r.cost)
+        };
+        let per_req = if unpriced {
+            "—".to_string()
+        } else {
+            fmt::usd(r.cost / r.requests.max(1) as f64)
+        };
+        let mut sp = vec![Span::styled(fit(&short_name(&r.key), 11), th.bold(c))];
+        if har_w > 0 {
+            sp.push(Span::styled(
+                format!(" {}", fit(&har_of(&r.key), har_w - 1)),
+                dim(app),
+            ));
+        }
+        sp.extend([
             Span::styled(
-                format!(
-                    " {} {}",
-                    fit_right(&fmt::count(r.requests), 8),
-                    fit_right(&fmt::usd(r.cost), 10)
-                ),
+                format!(" {} ", fit_right(&fmt::count(r.requests), 8)),
                 Style::new().fg(th.fg),
+            ),
+            Span::styled(
+                fit_right(&cost_str, 10),
+                Style::new().fg(if unpriced { th.dim } else { th.fg }),
             ),
             trend_w(
                 app,
@@ -72,7 +109,7 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
                 6,
             ),
             Span::raw(" "),
-        ];
+        ]);
         sp.extend(gauge(share, bar_w, c, &th));
         sp.push(Span::styled(
             fit_right(&fmt::pct(share * 100.0), 6),
@@ -81,7 +118,7 @@ pub fn models(f: &mut Frame, app: &mut App, area: Rect) {
         sp.push(Span::styled(
             format!(
                 " {} {} {}",
-                fit_right(&fmt::usd(r.cost / r.requests.max(1) as f64), 7),
+                fit_right(&per_req, 7),
                 fit_right(
                     &u.cache_hit_ratio()
                         .map(|x| fmt::pct(x * 100.0))

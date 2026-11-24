@@ -1,18 +1,23 @@
-//! Switching which saved login a seat uses: the vault's one write into a Claude Code config dir.
+//! Switching which saved login a seat uses: the vault's one write into a harness's config dir
+//! (Claude Code: `.credentials.json` plus `oauthAccount` in `.claude.json`; Antigravity: its
+//! `antigravity-oauth-token`).
 
 use std::path::PathBuf;
 
 use super::{Login, SEAT_BACKUPS, VaultError, VaultTx, read_seat, store};
 use crate::claude::config_json;
 use crate::claude::credentials;
-use crate::claude::seats::Seat;
+use crate::claude::seats::{Seat, SeatId};
+use crate::core::harness::Harness;
 
 /// How many times a switch starts again because Claude Code rewrote the seat's credentials
 /// between swarmy saving them and replacing them.
 const SWITCH_ATTEMPTS: usize = 5;
 
 impl VaultTx<'_> {
-    /// Writes `login_key` into `seat`, first saving whatever the seat holds.
+    /// Writes `login_key` into `seat`, first saving whatever the seat holds. The login may be in
+    /// other seats too and stays there: one grant can serve several seats (both refresh the
+    /// access token; Claude Code and agy keep the refresh token).
     ///
     /// All or nothing for the seat: the seat's login is saved first (on disk before anything in
     /// the seat changes), both seat files are backed up, then `.credentials.json` is replaced
@@ -22,26 +27,23 @@ impl VaultTx<'_> {
     /// (Claude Code wrote them since), the vault records the login the seat holds now, so the
     /// vault and the seat never disagree about which grant is where (and [`VaultTx::sync`]
     /// repairs the same after a crash between the two writes).
-    pub fn switch(
-        &mut self,
-        seat: &Seat,
-        login_key: &str,
-        allow_shared: bool,
-    ) -> anyhow::Result<SwitchReport> {
+    pub fn switch(&mut self, seat: &Seat, login_key: &str) -> anyhow::Result<SwitchReport> {
         let target = self.find(login_key).cloned()?;
-        if let Some(other) = target
-            .mounted
-            .as_ref()
-            .filter(|m| **m != seat.id)
-            .map(|m| self.index.seat_name(m))
-            && !allow_shared
-        {
-            return Err(VaultError::SharedGrant {
+        if target.harness != seat.harness {
+            return Err(VaultError::WrongHarness {
                 login: target.label,
-                seat: other,
+                login_harness: target.harness.display_name().into(),
+                seat: seat.label.clone(),
+                seat_harness: seat.harness.display_name().into(),
             }
             .into());
         }
+        let shared_with: Vec<String> = target
+            .mounted
+            .iter()
+            .filter(|m| **m != seat.id)
+            .map(|m| self.index.seat_name(m))
+            .collect();
         let secret = self
             .secret(&target.id)
             .ok_or_else(|| VaultError::MissingSecret(target.label.clone()))?;
@@ -50,7 +52,10 @@ impl VaultTx<'_> {
             // 1. Save what the seat holds now, on disk before the seat is overwritten.
             self.sync(std::slice::from_ref(seat))?;
             let cred_text = store::read_optional(&seat.credentials_file())?;
-            let cj_text = store::read_optional(&seat.claude_json)?;
+            let cj_text = match seat.harness {
+                Harness::Claude => store::read_optional(&seat.claude_json)?,
+                Harness::Agy => None,
+            };
             let before = read_seat(seat)?;
             if store::read_optional(&seat.credentials_file())? != cred_text {
                 // Claude Code refreshed the token while it was read: read it again.
@@ -77,26 +82,37 @@ impl VaultTx<'_> {
                     to: target.label,
                     backup: None,
                     unchanged: true,
+                    shared_with,
                 });
             }
             self.save()?;
 
             // 2. Back up both files, kept per seat.
             let bdir = self.seat_backups(seat)?;
-            store::backup(
-                &bdir,
-                &[
-                    ("credentials.json", cred_text.as_deref()),
-                    ("claude.json", cj_text.as_deref()),
-                ],
-                SEAT_BACKUPS,
-            )?;
+            match seat.harness {
+                Harness::Claude => store::backup(
+                    &bdir,
+                    &[
+                        ("credentials.json", cred_text.as_deref()),
+                        ("claude.json", cj_text.as_deref()),
+                    ],
+                    SEAT_BACKUPS,
+                )?,
+                Harness::Agy => store::backup(
+                    &bdir,
+                    &[(crate::agy::credentials::TOKEN_FILE, cred_text.as_deref())],
+                    SEAT_BACKUPS,
+                )?,
+            }
 
             #[cfg(test)]
             super::tests::hooks::before_seat_write();
             // 3. Write the new login, keeping mcpOAuth and every other key, only over the very
             //    text whose login step 1 saved.
-            let new_creds = credentials::with_login(cred_text.as_deref(), &secret)?;
+            let new_creds = match seat.harness {
+                Harness::Claude => credentials::with_login(cred_text.as_deref(), &secret)?,
+                Harness::Agy => crate::agy::credentials::with_login(&secret)?,
+            };
             if !store::replace_if_unchanged(
                 &seat.credentials_file(),
                 cred_text.as_deref(),
@@ -106,7 +122,8 @@ impl VaultTx<'_> {
             }
             // 4. The account shown by Claude Code: only `oauthAccount` changes, merged into the
             //    file as it is right now (Claude Code rewrites it every few seconds).
-            if let Some(acct) = &target.oauth_account
+            if seat.harness == Harness::Claude
+                && let Some(acct) = &target.oauth_account
                 && let Err(e) = store::rewrite_merging(&seat.claude_json, |t| {
                     config_json::with_oauth_account(t, Some(acct))
                 })
@@ -122,7 +139,7 @@ impl VaultTx<'_> {
 
             // 5. Bookkeeping.
             let from_label = previous.as_ref().and_then(|id| self.index.label_of(id));
-            self.mount(&target.id, seat);
+            self.mount(&target.id, &seat.id);
             let target_profile_at = target
                 .oauth_account
                 .as_ref()
@@ -131,7 +148,9 @@ impl VaultTx<'_> {
             // Without a saved profile, `.claude.json` still names the previous account: the
             // seat's account is unknown until Claude Code reads the new login's profile.
             let now = chrono::Utc::now();
-            let known_profile = target.oauth_account.is_some() && target.account_uuid.is_some();
+            // An agy token file names its own account.
+            let known_profile = target.account_uuid.is_some()
+                && (seat.harness == Harness::Agy || target.oauth_account.is_some());
             self.index.seats.insert(
                 seat.id.clone(),
                 super::logins::SeatSeen {
@@ -156,21 +175,24 @@ impl VaultTx<'_> {
                 to: target.label,
                 backup: Some(bdir),
                 unchanged: false,
+                shared_with,
             });
         }
         Err(VaultError::SeatBusy(seat.credentials_file()).into())
     }
 
-    /// Records `id` as the one login mounted in `seat`.
-    pub(super) fn mount(&mut self, id: &str, seat: &Seat) {
+    /// Records `id` as the login in `seat` (a seat holds one login; the login may be in other
+    /// seats as well).
+    pub(super) fn mount(&mut self, id: &str, seat: &SeatId) {
         for l in &mut self.index.logins {
-            if l.mounted.as_ref() == Some(&seat.id) {
-                l.mounted = None;
+            if l.id != id {
+                l.mounted.retain(|m| m != seat);
             }
         }
-        if let Some(l) = self.index.find_mut(id) {
-            l.mounted = Some(seat.id.clone());
-            l.mounted_label = None;
+        if let Some(l) = self.index.find_mut(id)
+            && !l.is_in(seat)
+        {
+            l.mounted.push(seat.clone());
         }
     }
 
@@ -201,7 +223,7 @@ impl VaultTx<'_> {
                 seat.label
             ));
         }
-        self.mount(&target.id, seat);
+        self.mount(&target.id, &seat.id);
         let saved = self.save();
         self.journal(&format!(
             "switch seat={} to={} half done (credentials written, .claude.json not): {err:#}",
@@ -233,4 +255,6 @@ pub struct SwitchReport {
     pub to: String,
     pub backup: Option<PathBuf>,
     pub unchanged: bool,
+    /// Other seats that hold the same login.
+    pub shared_with: Vec<String>,
 }

@@ -13,6 +13,7 @@ use rusqlite::{Connection, params};
 
 use super::{Index, ms};
 use crate::claude::seats::{Seat, SeatId};
+use crate::core::harness::Harness;
 
 /// Tables with a `seat` column that holds a seat (all but `seats` itself).
 pub(crate) fn seat_tables(conn: &Connection) -> rusqlite::Result<Vec<String>> {
@@ -64,9 +65,9 @@ impl Index {
     /// legacy label (see the module docs) to the id of the seat that carries that label now.
     /// Runs inside every refresh; does nothing when the seats are the ones it saw last.
     pub(super) fn adopt_seats(&mut self, seats: &[Seat]) -> anyhow::Result<()> {
-        let sig: Vec<(SeatId, String)> = seats
+        let sig: Vec<(SeatId, String, Harness)> = seats
             .iter()
-            .map(|s| (s.id.clone(), s.label.clone()))
+            .map(|s| (s.id.clone(), s.label.clone(), s.harness))
             .collect();
         if self.adopted.as_ref() == Some(&sig) {
             return Ok(());
@@ -107,9 +108,9 @@ impl Index {
         let now = ms(chrono::Utc::now());
         for s in seats {
             tx.execute(
-                "INSERT INTO seats(seat, label, dir, seen_at) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(seat) DO UPDATE SET label = excluded.label, dir = excluded.dir, seen_at = excluded.seen_at",
-                params![s.id, s.label, s.dir.to_string_lossy(), now],
+                "INSERT INTO seats(seat, label, dir, harness, seen_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(seat) DO UPDATE SET label = excluded.label, dir = excluded.dir, harness = excluded.harness, seen_at = excluded.seen_at",
+                params![s.id, s.label, s.dir.to_string_lossy(), s.harness.key(), now],
             )?;
         }
         if moved > 0 {

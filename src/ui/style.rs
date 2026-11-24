@@ -23,6 +23,8 @@ pub enum Tone {
     Opus,
     Sonnet,
     Haiku,
+    Gemini,
+    Gpt,
     Other,
 }
 
@@ -33,6 +35,8 @@ impl Tone {
             Family::Opus => Tone::Opus,
             Family::Sonnet => Tone::Sonnet,
             Family::Haiku => Tone::Haiku,
+            Family::Gemini => Tone::Gemini,
+            Family::Gpt => Tone::Gpt,
             Family::Other => Tone::Other,
         }
     }
@@ -58,6 +62,8 @@ impl Tone {
             Tone::Opus => (255, 140, 66),
             Tone::Sonnet => (98, 160, 234),
             Tone::Haiku => (64, 224, 208),
+            Tone::Gemini => (236, 112, 200),
+            Tone::Gpt => (245, 169, 184),
             Tone::Other => (160, 160, 160),
         }
     }
@@ -74,6 +80,8 @@ impl Tone {
             Tone::Opus => AnsiColors::BrightYellow,
             Tone::Sonnet => AnsiColors::BrightBlue,
             Tone::Haiku => AnsiColors::Cyan,
+            Tone::Gemini => AnsiColors::BrightMagenta,
+            Tone::Gpt => AnsiColors::Magenta,
         }
     }
 }

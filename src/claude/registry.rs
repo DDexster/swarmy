@@ -10,6 +10,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::procs::{ProcTable, proc_start_ticks};
+use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
 use crate::core::pane::Pane;
 
@@ -35,6 +36,8 @@ struct RawSession {
 #[derive(Debug, Clone, Serialize)]
 pub struct LiveSession {
     pub seat: SeatId,
+    #[serde(default)]
+    pub harness: Harness,
     pub pid: u32,
     pub session_id: SessionId,
     pub cwd: String,
@@ -113,6 +116,7 @@ pub fn live_sessions(seat: &SeatId, sessions_dir: &Path, procs: &ProcTable) -> V
         }
         out.push(LiveSession {
             seat: seat.clone(),
+            harness: Harness::Claude,
             pid: r.pid,
             session_id: SessionId::new(r.session_id),
             cwd: r.cwd,

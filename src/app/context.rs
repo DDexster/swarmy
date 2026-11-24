@@ -5,11 +5,13 @@ use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 
+use crate::agy::discovery::{self as agy_discovery, AgyCandidates};
 use crate::claude::config_json;
 use crate::claude::procs::ProcTable;
 use crate::claude::project::Resolver;
 use crate::claude::seats::{self, Candidates, Seat, SeatId};
 use crate::config::{Config, Dirs};
+use crate::core::harness::Harness;
 use crate::core::ids::AccountId;
 use crate::core::limits::{Reading, WindowKind};
 use crate::core::period::Span;
@@ -45,22 +47,69 @@ impl Ctx {
         crate::index::use_temp_dir(&dirs.data.join("tmp"))?;
         let procs = ProcTable::snapshot();
         // `SWARMY_ISOLATED=1` (tests, demos): only dirs under $HOME and the config count, not the
-        // config dirs of running `claude` processes, which belong to the real user.
+        // config dirs of running `claude` or `agy` processes, which belong to the real user.
         let isolated = std::env::var_os("SWARMY_ISOLATED").is_some();
-        let mut env_dirs: Vec<PathBuf> = procs
-            .claude
-            .iter()
-            .filter(|_| !isolated)
-            .filter_map(|p| p.config_dir.clone())
-            .collect();
-        if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
-            env_dirs.push(PathBuf::from(d));
+        let mut claude_cfg = Vec::new();
+        let mut agy_cfg = Vec::new();
+        for (path, label, explicit) in config.seat_entries(&dirs.home) {
+            let h = match explicit {
+                Some(h) => h,
+                None if agy_discovery::looks_like_agy_dir(&path) => Harness::Agy,
+                None => Harness::Claude,
+            };
+            match h {
+                Harness::Claude => claude_cfg.push((path, label)),
+                Harness::Agy => agy_cfg.push((path, label)),
+            }
         }
-        let seats = seats::discover(&Candidates {
-            home: &dirs.home,
-            env_dirs,
-            configured: config.seat_paths(&dirs.home),
-        });
+        let mut seats = Vec::new();
+        if config.harness_enabled(Harness::Claude) {
+            let mut env_dirs: Vec<PathBuf> = procs
+                .claude
+                .iter()
+                .filter(|_| !isolated)
+                .filter_map(|p| p.config_dir.clone())
+                .collect();
+            if let Some(d) = std::env::var_os("CLAUDE_CONFIG_DIR") {
+                env_dirs.push(PathBuf::from(d));
+            }
+            seats.extend(seats::discover(&Candidates {
+                home: &dirs.home,
+                env_dirs,
+                configured: claude_cfg,
+            }));
+        }
+        if config.harness_enabled(Harness::Agy) {
+            let env_dirs: Vec<PathBuf> = procs
+                .agy
+                .iter()
+                .filter(|_| !isolated)
+                .filter_map(|p| p.app_data_dir.clone())
+                .collect();
+            seats.extend(agy_discovery::discover(&AgyCandidates {
+                home: &dirs.home,
+                env_dirs,
+                configured: agy_cfg,
+            }));
+        }
+        // Keep labels unique across harnesses (seat ids never change): a later duplicate takes
+        // `-2`, `-3`… whichever no seat has.
+        let mut taken: std::collections::BTreeSet<String> = Default::default();
+        for i in 0..seats.len() {
+            let base = seats[i].label.clone();
+            let mut label = base.clone();
+            let mut n = 2;
+            while taken.contains(&label)
+                || seats[i + 1..]
+                    .iter()
+                    .any(|s| s.label == label && label != base)
+            {
+                label = format!("{base}-{n}");
+                n += 1;
+            }
+            taken.insert(label.clone());
+            seats[i].label = label;
+        }
         let mut seat_info = Vec::new();
         let mut caches = Vec::new();
         let mut problems = Vec::new();
@@ -99,11 +148,12 @@ impl Ctx {
         Ok(ctx)
     }
 
-    /// Days Claude Code keeps each seat's transcripts (`cleanupPeriodDays`, else its default),
-    /// and whether the seat sets it.
+    /// Days each retention-bearing seat keeps transcripts (`cleanupPeriodDays`, else Claude Code's
+    /// default), and whether the seat sets it. Harnesses without automatic deletion are skipped.
     pub fn retention(&self) -> Vec<(String, u32, bool)> {
         self.seats
             .iter()
+            .filter(|s| s.harness.has_transcript_retention())
             .map(|s| match s.cleanup_period_days() {
                 Ok(Some(d)) => (s.label.clone(), d, true),
                 // A damaged file is in `problems` (`Ctx::load`).
@@ -199,7 +249,13 @@ impl Ctx {
                 }
             }
         }
-        let states = v.seat_states(&self.seats)?;
+        let vault_seats: Vec<Seat> = self
+            .seats
+            .iter()
+            .filter(|s| s.harness.supports_vault())
+            .cloned()
+            .collect();
+        let states = v.seat_states(&vault_seats)?;
         for si in &mut self.seat_info {
             if let Some(st) = states.get(&si.seat) {
                 if st.unverified_since.is_some() {
@@ -650,6 +706,26 @@ pub fn seat_info_of(
     data_dir: &std::path::Path,
     problems: &mut Vec<String>,
 ) -> (SeatInfo, Option<serde_json::Value>) {
+    if s.harness == Harness::Agy {
+        let account = match crate::agy::account::read_account(&s.dir) {
+            Ok(a) => a,
+            Err(e) => {
+                let msg = format!("seat {}: {e}", s.label);
+                crate::diag::log("seats", &msg);
+                problems.push(msg);
+                None
+            }
+        };
+        return (
+            SeatInfo {
+                seat: s.id.clone(),
+                label: s.label.clone(),
+                account,
+                utilization: None,
+            },
+            None,
+        );
+    }
     let mut cj = match config_json::read_seat_file(&s.claude_json) {
         Ok(cj) => cj,
         Err(e) => {

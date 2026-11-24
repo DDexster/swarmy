@@ -49,7 +49,7 @@ pub(super) fn help(f: &mut Frame, app: &App, area: Rect) {
         ),
         (
             "/",
-            "filter agents: words, p:project m:model s:seat state:needs",
+            "filter agents: words, p:project m:model s:seat h:harness state:needs",
         ),
         (
             ":",
@@ -205,6 +205,16 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             "logins: unsaved, unknown, expiring (the vault)",
         ),
         row(
+            "→ work, lab",
+            th.dim,
+            "LIMITS · SEATS: the seats a saved login is in (one login may serve several); free: in none",
+        ),
+        row(
+            "CLAUDE CODE",
+            th.fg,
+            "LIMITS · SEATS sections per harness: its seats and logins (a login fits only its harness)",
+        ),
+        row(
             "+ ✓ ✎ ◆ !",
             th.dim,
             "spawned · finished · your prompt · online · API error",
@@ -255,6 +265,21 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             th.fg,
             "swarmy's own database · growth a day · size in a year (warning colour: over budget)",
         ),
+        row(
+            "—",
+            th.dim,
+            "unpriced model: no list price known yet (add [[price]] in config.toml)",
+        ),
+        row(
+            "today · 7d",
+            th.dim,
+            "a seat whose harness has no local quota (Antigravity): its spend instead of limit gauges",
+        ),
+        row(
+            "cc · agy",
+            th.dim,
+            "harness (SWARM HAR, MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity",
+        ),
         head("colours"),
         Line::from(vec![
             Span::styled(fit("limit", 16), th.bold(th.fg)),
@@ -267,7 +292,8 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled("fable ", Style::new().fg(th.fable)),
             Span::styled("opus ", Style::new().fg(th.opus)),
             Span::styled("sonnet ", Style::new().fg(th.sonnet)),
-            Span::styled("haiku", Style::new().fg(th.haiku)),
+            Span::styled("haiku ", Style::new().fg(th.haiku)),
+            Span::styled("gemini", Style::new().fg(th.gemini)),
             Span::styled(" (the same in every panel)", Style::new().fg(th.dim)),
         ]),
         row("project", th.dir, "project and directory names"),
@@ -285,17 +311,17 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         row(
             "seat",
             th.fg,
-            "a Claude Code config dir (~/.claude, ~/.claude-work…)",
+            "a harness config/data dir (~/.claude, ~/.claude-work, ~/.gemini/antigravity-cli…)",
         ),
         row(
             "login",
             th.fg,
-            "an OAuth sign-in; saved ones live in the vault",
+            "an OAuth sign-in; saved Claude Code logins live in the vault",
         ),
         row(
             "account",
             th.fg,
-            "the Anthropic account behind a login; limits are per account",
+            "the account behind a login; Claude Code limits are per account",
         ),
     ]
 }

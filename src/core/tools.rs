@@ -22,6 +22,7 @@ pub enum ToolClass {
 
 /// Every tool with a class other than [`ToolClass::Other`].
 const TOOLS: &[(&str, ToolClass)] = &[
+    // Claude Code
     ("Edit", ToolClass::Edit),
     ("Write", ToolClass::Edit),
     ("MultiEdit", ToolClass::Edit),
@@ -33,6 +34,20 @@ const TOOLS: &[(&str, ToolClass)] = &[
     ("ExitPlanMode", ToolClass::Plan),
     ("Agent", ToolClass::Agent),
     ("Task", ToolClass::Agent),
+    // Google Antigravity (`agy`)
+    ("edit_file", ToolClass::Edit),
+    ("write_file", ToolClass::Edit),
+    ("write_to_file", ToolClass::Edit),
+    ("replace_file_content", ToolClass::Edit),
+    ("multi_replace_file_content", ToolClass::Edit),
+    ("read_file", ToolClass::Read),
+    ("view_file", ToolClass::Read),
+    ("view_file_outline", ToolClass::Read),
+    ("view_code_item", ToolClass::Read),
+    ("run_command", ToolClass::Shell),
+    ("ask_question", ToolClass::AskUser),
+    ("invoke_subagent", ToolClass::Agent),
+    ("swarm", ToolClass::Agent),
 ];
 
 impl ToolClass {
@@ -73,8 +88,22 @@ mod tests {
         assert_eq!(ToolClass::of("Grep"), ToolClass::Other);
         assert_eq!(
             ToolClass::Edit.names().collect::<Vec<_>>(),
-            ["Edit", "Write", "MultiEdit", "NotebookEdit"]
+            [
+                "Edit",
+                "Write",
+                "MultiEdit",
+                "NotebookEdit",
+                "edit_file",
+                "write_file",
+                "write_to_file",
+                "replace_file_content",
+                "multi_replace_file_content",
+            ]
         );
+        assert_eq!(ToolClass::of("run_command"), ToolClass::Shell);
+        assert_eq!(ToolClass::of("read_file"), ToolClass::Read);
+        assert!(ToolClass::of("ask_question").waits_on_user());
+        assert_eq!(ToolClass::of("invoke_subagent"), ToolClass::Agent);
         assert_eq!(ToolClass::Other.names().count(), 0);
         for (n, c) in TOOLS {
             assert_eq!(ToolClass::of(n), *c, "{n} is listed twice");

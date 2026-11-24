@@ -3,6 +3,7 @@
 //! The library holds everything; the `swarmy` binary only parses the command line and calls
 //! [`cli::run`].
 
+pub mod agy;
 pub mod app;
 pub mod claude;
 pub mod cli;

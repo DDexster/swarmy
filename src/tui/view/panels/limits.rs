@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CLine};
 
 use super::{dim, faint};
+use crate::core::harness::Harness;
 use crate::core::limits::{Level, WindowKind};
 use crate::core::units::Pct;
 use crate::tui::app::{App, LimitsRow, Panel};
@@ -84,9 +85,36 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     let cur = app.cur(Panel::Limits);
     let focused = app.focus == Panel::Limits;
     let now = Utc::now();
+    let sections = app.limits_sections();
+    let mut section: Option<Harness> = None;
     let mut first_login = true;
+    // Gauges and the reset column, where a harness without a local quota shows its spend.
+    let quota_w = gauges * (g + 5) + usize::from(has_five) + 1 + reset_w;
     for (i, r) in rows.iter().enumerate() {
         let sel = focused && i == cur;
+        let h = app.row_harness(r);
+        if section != Some(h) {
+            section = Some(h);
+            first_login = true;
+            if sections {
+                lines.push(section_head(app, h, &rows));
+            }
+        }
+        if let LimitsRow::Login(_) = r
+            && first_login
+        {
+            first_login = false;
+            if !sections {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(" SAVED LOGINS ", th.heading()),
+                    Span::styled(
+                        " · in the vault · where each is · Enter puts one into a seat (one may be in several)",
+                        faint(app),
+                    ),
+                ]));
+            }
+        }
         let mut sp: Vec<Span> = vec![Span::styled(
             if sel { "▸ " } else { "  " },
             th.bold(th.accent),
@@ -112,7 +140,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                     (Some(t), _) => {
                         format!("? new login {}", t.with_timezone(&Local).format("%d %b"))
                     }
-                    (None, Some(a)) => mask_name(app, &app.account_label(a)),
+                    (None, Some(a)) => mask_name(app, &account_name(app, a)),
                     (None, None) if state.fingerprint.is_some() => "(unknown)".into(),
                     _ => "(logged out)".into(),
                 };
@@ -131,19 +159,23 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 (acct, false)
             }
             LimitsRow::Login(label) => {
-                if first_login {
-                    first_login = false;
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled(" SAVED LOGINS ", th.heading()),
-                        Span::styled(
-                            " · in the vault, not in a seat · Enter puts one into a seat",
-                            faint(app),
-                        ),
-                    ]));
-                }
                 let l = app.vault.logins.iter().find(|x| &x.label == label);
-                sp.push(Span::styled(fit("", name_w), faint(app)));
+                // Where the login is, in the SEAT column: the seats that hold it, or free.
+                let seats: Vec<String> = l
+                    .map(|x| {
+                        x.mounted
+                            .iter()
+                            .filter_map(|id| app.analytics.seats.iter().find(|s| &s.id == id))
+                            .map(|s| s.label.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let (where_, wc) = if seats.is_empty() {
+                    ("free".to_string(), th.faint)
+                } else {
+                    (format!("→ {}", seats.join(", ")), th.dim)
+                };
+                sp.push(Span::styled(fit(&where_, name_w), Style::new().fg(wc)));
                 sp.push(Span::styled(
                     format!(" {}", fit(&format!("⚿ {label}"), login_w)),
                     Style::new().fg(th.fg),
@@ -151,7 +183,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 let acct = l.and_then(|x| x.account_uuid.clone());
                 let name = acct
                     .as_deref()
-                    .map(|a| app.account_label(a))
+                    .map(|a| account_name(app, a))
                     .or_else(|| l.and_then(|x| x.email.clone()))
                     .unwrap_or_else(|| "(account unknown)".into());
                 if acct_w > 0 {
@@ -164,39 +196,70 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             }
         };
         let (five, week, reset) = app.limits_of(account.as_deref());
-        let shown: Vec<Option<f64>> = if has_five {
-            vec![five, week]
-        } else {
-            vec![week]
-        };
-        for v in shown {
-            sp.push(Span::raw(" "));
-            match v {
-                Some(p) => {
-                    let c = th.utilization(p);
-                    let c = if quiet {
-                        th.fade(c, 0.35)
-                    } else if Level::of(p) >= Level::Bad {
-                        pulse(app, c, 1.0)
-                    } else {
-                        c
-                    };
-                    sp.extend(gauge(p / 100.0, g, c, &th));
-                    sp.push(Span::styled(fit_right(&fmt::pct(p), 5), th.bold(c)));
+        if h.supports_limits() {
+            let shown: Vec<Option<f64>> = if has_five {
+                vec![five, week]
+            } else {
+                vec![week]
+            };
+            for v in shown {
+                sp.push(Span::raw(" "));
+                match v {
+                    Some(p) => {
+                        let c = th.utilization(p);
+                        let c = if quiet {
+                            th.fade(c, 0.35)
+                        } else if Level::of(p) >= Level::Bad {
+                            pulse(app, c, 1.0)
+                        } else {
+                            c
+                        };
+                        sp.extend(gauge(p / 100.0, g, c, &th));
+                        sp.push(Span::styled(fit_right(&fmt::pct(p), 5), th.bold(c)));
+                    }
+                    None => sp.push(Span::styled(fit("  unknown", g + 5), faint(app))),
                 }
-                None => sp.push(Span::styled(fit("  unknown", g + 5), faint(app))),
             }
+            sp.push(Span::styled(
+                format!(
+                    " {}",
+                    fit(
+                        &reset.map(|r| fmt::duration(r - now)).unwrap_or_default(),
+                        reset_w
+                    )
+                ),
+                dim(app),
+            ));
+        } else {
+            // No local quota: what the seat spent instead (a login: its plan).
+            let text = match r {
+                LimitsRow::Seat(label) => app
+                    .analytics
+                    .seats
+                    .iter()
+                    .find(|x| &x.label == label)
+                    .map(|x| {
+                        format!(
+                            "today {} · 7d {} · {} req today",
+                            fmt::usd(x.today_cost),
+                            fmt::usd(x.week_cost),
+                            fmt::count(x.today_requests)
+                        )
+                    })
+                    .unwrap_or_default(),
+                LimitsRow::Login(label) => app
+                    .vault
+                    .logins
+                    .iter()
+                    .find(|x| &x.label == label)
+                    .and_then(|x| x.plan.clone().or_else(|| x.meta.subscription_type.clone()))
+                    .unwrap_or_default(),
+            };
+            sp.push(Span::styled(
+                format!(" {}", fit(&text, quota_w.saturating_sub(1))),
+                if quiet { faint(app) } else { dim(app) },
+            ));
         }
-        sp.push(Span::styled(
-            format!(
-                " {}",
-                fit(
-                    &reset.map(|r| fmt::duration(r - now)).unwrap_or_default(),
-                    reset_w
-                )
-            ),
-            dim(app),
-        ));
         // Status: what to do or expect.
         let report = account
             .as_deref()
@@ -244,10 +307,14 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         parts.push(p);
                     }
                 }
-                (
-                    parts.join(" · "),
-                    if eta.is_some() { th.warn } else { th.dim },
-                )
+                let colour = if eta.is_some() {
+                    th.warn
+                } else if live > 0 && !h.supports_limits() {
+                    th.good
+                } else {
+                    th.dim
+                };
+                (parts.join(" · "), colour)
             }
             LimitsRow::Login(label) => {
                 let l = app.vault.logins.iter().find(|x| &x.label == label);
@@ -316,6 +383,45 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 limit_shares(app, side.width as usize, side.height as usize, detail),
             );
         }
+    }
+}
+
+/// A harness's section heading: its name on a plate, then what it holds.
+fn section_head(app: &App, h: Harness, rows: &[LimitsRow]) -> Line<'static> {
+    let th = app.theme;
+    let of = |want_seat: bool| {
+        rows.iter()
+            .filter(|r| app.row_harness(r) == h && matches!(r, LimitsRow::Seat(_)) == want_seat)
+            .count()
+    };
+    let (seats, logins) = (of(true), of(false));
+    let mut what = format!(
+        " · {seats} seat{} · {logins} login{}",
+        if seats == 1 { "" } else { "s" },
+        if logins == 1 { "" } else { "s" }
+    );
+    if !h.supports_limits() {
+        what.push_str(" · no local quota: spend shown");
+    }
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            format!(" {} ", h.display_name().to_uppercase()),
+            th.heading(),
+        ),
+        Span::styled(what, faint(app)),
+    ])
+}
+
+/// How an account is named on screen: the limit report's name (Anthropic accounts), else the
+/// email an agy account is keyed by, else a short id.
+fn account_name(app: &App, id: &str) -> String {
+    if app.analytics.limits.iter().any(|r| r.account_uuid == id) {
+        return app.account_label(id);
+    }
+    match id.strip_prefix("agy:") {
+        Some(email) => email.to_string(),
+        None => app.account_label(id),
     }
 }
 

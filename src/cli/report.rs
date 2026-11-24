@@ -133,6 +133,12 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
         } else {
             Tone::Accent
         };
+        let unpriced = r.requests > 0 && r.unpriced == r.requests && r.cost == 0.0;
+        let cost_cell = if unpriced {
+            Cell::tone("—", Tone::Dim)
+        } else {
+            Cell::tone(fmt::money(r.cost), Tone::Bold)
+        };
         t.row(vec![
             Cell::tone(label, tone),
             Cell::new(fmt::count(r.requests)),
@@ -140,7 +146,7 @@ pub fn run(ctx: &Ctx, a: &ReportArgs) -> anyhow::Result<()> {
             Cell::new(fmt::tokens(r.usage.cache_write())),
             Cell::new(fmt::tokens(r.usage.cache_read)),
             Cell::new(fmt::tokens(r.usage.output)),
-            Cell::tone(fmt::money(r.cost), Tone::Bold),
+            cost_cell,
             Cell::tone(
                 format!(
                     "{:<16} {}",
@@ -216,6 +222,9 @@ pub fn filter_label(ctx: &Ctx, f: &Filter) -> String {
     }
     if let Some(s) = &f.seat {
         parts.push(format!("seat={}", ctx.seat_label(s)));
+    }
+    if let Some(h) = f.harness {
+        parts.push(format!("harness={h}"));
     }
     if let Some(p) = &f.project {
         parts.push(format!("project={p}"));

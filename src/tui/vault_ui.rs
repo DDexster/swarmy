@@ -1,17 +1,20 @@
-//! The vault, operated inside the LIMITS · SEATS panel: seats first, then the logins parked in the
-//! vault. Enter on a seat opens a picker of logins sorted by limit left (the best one first);
-//! Enter on a parked login picks its seat. `S` puts the best login into the selected seat.
+//! The vault, operated inside the LIMITS · SEATS panel: per harness, its seats, then every saved
+//! login of that harness (one login may be in several seats). Enter on a seat opens a picker of
+//! that harness's logins sorted by limit left (the best one first); Enter on a login picks a seat
+//! for it. `S` puts the best login into the selected seat.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::app::{App, LimitsRow, Panel, Tone};
+use crate::claude::seats::Seat;
+use crate::core::harness::Harness;
 use crate::vault::{Login, Vault};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Capture(String),
     Rename(String),
-    Add,
+    Add(Harness),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,10 +53,10 @@ pub struct Picker {
     pub sel: usize,
 }
 
-/// Work that needs the real terminal (runs `claude` for a new login).
+/// Work that needs the real terminal (runs `claude` or `agy` for a new login).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum External {
-    AddLogin(String),
+    AddLogin(String, Harness),
 }
 
 #[derive(Debug, Default)]
@@ -66,9 +69,23 @@ pub struct VaultUi {
 }
 
 impl App {
+    /// The seats whose logins the vault keeps.
+    fn vault_seats(&self) -> Vec<Seat> {
+        self.seats
+            .iter()
+            .filter(|s| s.harness.supports_vault())
+            .cloned()
+            .collect()
+    }
+
+    fn seat_named(&self, label: &str) -> Option<&Seat> {
+        self.seats.iter().find(|s| s.label == label)
+    }
+
     pub fn vault_reload(&mut self) {
+        let vault_seats = self.vault_seats();
         match Vault::open(&self.vault_dir).and_then(|mut v| {
-            v.edit(|tx| tx.sync(&self.seats))?;
+            v.edit(|tx| tx.sync(&vault_seats))?;
             Ok(v.logins().to_vec())
         }) {
             Ok(l) => {
@@ -103,17 +120,57 @@ impl App {
         }
     }
 
-    /// Logins that could go into `seat`, the most limit left first.
-    pub fn candidates_for(&self, _seat: &str) -> Vec<String> {
-        // Logins mounted in another seat are left out: one grant in two seats breaks one of them.
+    /// Logins that could go into `seat`: every saved login of its harness except the one it
+    /// holds (a login in other seats too: one grant may serve several), the most limit left
+    /// first.
+    pub fn candidates_for(&self, seat: &str) -> Vec<String> {
+        let Some(s) = self.seat_named(seat) else {
+            return Vec::new();
+        };
         let mut v: Vec<&Login> = self
             .vault
             .logins
             .iter()
-            .filter(|l| l.mounted.is_none())
+            .filter(|l| l.harness == s.harness && !l.is_in(&s.id))
             .collect();
         v.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
         v.into_iter().map(|l| l.label.clone()).collect()
+    }
+
+    /// The login `S` puts into `seat`: the most limit left among the candidates, not of the
+    /// account the seat already runs (another login of it shares the same limit).
+    fn best_for(&self, seat: &str) -> Option<String> {
+        let current = self
+            .analytics
+            .seats
+            .iter()
+            .find(|s| s.label == seat)
+            .and_then(|s| s.account.clone());
+        self.candidates_for(seat).into_iter().find(|label| {
+            let acct = self
+                .vault
+                .logins
+                .iter()
+                .find(|l| &l.label == label)
+                .and_then(|l| l.account_uuid.clone());
+            current.is_none() || acct != current
+        })
+    }
+
+    /// Seats a login could go into: its harness's seats (those that hold it are marked by the
+    /// picker).
+    pub fn seats_for(&self, login: &str) -> Vec<String> {
+        let h = self
+            .vault
+            .logins
+            .iter()
+            .find(|l| l.label == login)
+            .map_or(Harness::Claude, |l| l.harness);
+        self.seats
+            .iter()
+            .filter(|s| s.harness == h && s.harness.supports_vault())
+            .map(|s| s.label.clone())
+            .collect()
     }
 
     fn selected_row(&self) -> Option<LimitsRow> {
@@ -135,32 +192,59 @@ impl App {
             }
             _ => String::new(),
         };
-        let running = if live > 0 {
-            format!(
-                "\n\nClaude Code runs there ({live} session{}): it picks up the new login on its next request; restart it to refresh the account it shows.",
-                if live == 1 { "" } else { "s" }
-            )
-        } else {
+        let harness = self
+            .seat_named(&seat)
+            .map_or(Harness::Claude, |s| s.harness);
+        let plural = if live == 1 { "" } else { "s" };
+        let running = match (live, harness) {
+            (0, _) => String::new(),
+            (_, Harness::Claude) => format!(
+                "\n\nClaude Code runs there ({live} session{plural}): it picks up the new login on its next request; restart it to refresh the account it shows."
+            ),
+            (_, Harness::Agy) => format!(
+                "\n\nagy runs there ({live} session{plural}): it keeps its current login until restarted (it does not write the old one back)."
+            ),
+        };
+        let others: Vec<String> = self
+            .vault
+            .logins
+            .iter()
+            .find(|l| l.label == login)
+            .map(|l| {
+                l.mounted
+                    .iter()
+                    .filter_map(|id| self.seats.iter().find(|s| &s.id == id))
+                    .filter(|s| s.label != seat)
+                    .map(|s| s.label.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shared = if others.is_empty() {
             String::new()
+        } else {
+            format!(
+                "\n\n'{login}' stays in seat {} too: both seats use one login (and one limit).",
+                others.join(", ")
+            )
         };
         self.vault.modal = Some(Modal::Confirm {
             text: format!(
-                "Put '{login}' into seat '{seat}'?\n\n{keeps}{running}\n\n[y] switch   [n] cancel"
+                "Put '{login}' into seat '{seat}'?\n\n{keeps}{shared}{running}\n\n[y] switch   [n] cancel"
             ),
             action: ConfirmAction::Switch { seat, login },
         });
     }
 
     fn do_switch(&mut self, seat: &str, login: &str) {
+        let vault_seats = self.vault_seats();
         let res = Vault::open(&self.vault_dir).and_then(|mut v| {
             v.edit(|tx| {
-                tx.sync(&self.seats)?;
-                let s = self
-                    .seats
+                tx.sync(&vault_seats)?;
+                let s = vault_seats
                     .iter()
                     .find(|s| s.label == seat)
                     .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
-                tx.switch(s, login, false)
+                tx.switch(s, login)
             })
         });
         match res {
@@ -188,7 +272,15 @@ impl App {
                 );
                 self.alerts
                     .insert("vault".into(), std::time::Instant::now());
-                self.toast(format!("seat '{}' now uses '{}'", r.seat, r.to), Tone::Good);
+                let also = if r.shared_with.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (also in {})", r.shared_with.join(", "))
+                };
+                self.toast(
+                    format!("seat '{}' now uses '{}'{also}", r.seat, r.to),
+                    Tone::Good,
+                );
             }
             Err(e) => self.toast(format!("{e:#}"), Tone::Bad),
         }
@@ -198,11 +290,11 @@ impl App {
 
     fn do_capture(&mut self, seat: &str, label: &str) {
         let label = label.trim();
+        let vault_seats = self.vault_seats();
         let res = Vault::open(&self.vault_dir).and_then(|mut v| {
             v.edit(|tx| {
-                tx.sync(&self.seats)?;
-                let s = self
-                    .seats
+                tx.sync(&vault_seats)?;
+                let s = vault_seats
                     .iter()
                     .find(|s| s.label == seat)
                     .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
@@ -267,7 +359,10 @@ impl App {
                 Some(LimitsRow::Seat(seat)) => {
                     let items = self.candidates_for(&seat);
                     if items.is_empty() {
-                        self.toast("no free saved login (the others are in seats): c saves this seat's login, a adds one", Tone::Warn);
+                        self.toast(
+                            "no other saved login for this seat's harness: c saves its login, a adds one",
+                            Tone::Warn,
+                        );
                     } else {
                         self.vault.picker = Some(Picker {
                             what: PickFor::Seat(seat),
@@ -277,39 +372,53 @@ impl App {
                     }
                 }
                 Some(LimitsRow::Login(login)) => {
-                    let items: Vec<String> = self.seats.iter().map(|s| s.label.clone()).collect();
-                    self.vault.picker = Some(Picker {
-                        what: PickFor::Login(login),
-                        items,
-                        sel: 0,
-                    });
+                    let items = self.seats_for(&login);
+                    if items.is_empty() {
+                        self.toast("no seat of this login's harness", Tone::Warn);
+                    } else {
+                        self.vault.picker = Some(Picker {
+                            what: PickFor::Login(login),
+                            items,
+                            sel: 0,
+                        });
+                    }
                 }
                 None => {}
             },
-            KeyCode::Char('S') => {
-                if let Some(LimitsRow::Seat(seat)) = self.selected_row() {
-                    match self.candidates_for(&seat).first().cloned() {
-                        Some(best) => self.request_switch(seat, best),
-                        None => self.toast("no other saved login to switch to", Tone::Warn),
+            KeyCode::Char('S') => match self.selected_row() {
+                Some(LimitsRow::Seat(seat)) => match self.best_for(&seat) {
+                    Some(best) => self.request_switch(seat, best),
+                    None => {
+                        self.toast("no saved login of another account to switch to", Tone::Warn)
                     }
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(LimitsRow::Seat(s)) = self.selected_row() {
+                },
+                Some(LimitsRow::Login(_)) | None => {}
+            },
+            KeyCode::Char('c') => match self.selected_row() {
+                Some(LimitsRow::Seat(s)) => {
                     self.vault.modal = Some(Modal::Input {
                         title: format!("Save the login of seat '{s}' as"),
                         value: s.clone(),
                         action: InputAction::Capture(s),
                     });
-                } else {
+                }
+                Some(LimitsRow::Login(_)) | None => {
                     self.toast("select a seat to save its login", Tone::Info);
                 }
-            }
+            },
             KeyCode::Char('a') => {
+                // A login for the harness of the selected row.
+                let h = self
+                    .selected_row()
+                    .map_or(Harness::Claude, |r| self.row_harness(&r));
+                let (program, hint) = crate::vault::new_login_recipe(h);
                 self.vault.modal = Some(Modal::Input {
-                    title: "Label for the new login (Claude Code opens: /login, then /exit)".into(),
+                    title: format!(
+                        "Label for the new {} login (`{program}` opens: {hint})",
+                        h.display_name()
+                    ),
                     value: String::new(),
-                    action: InputAction::Add,
+                    action: InputAction::Add(h),
                 });
             }
             KeyCode::Char('r') => {
@@ -380,12 +489,12 @@ impl App {
                             self.vault_reload();
                             self.request_analytics();
                         }
-                        InputAction::Add => {
+                        InputAction::Add(h) => {
                             if value.trim().is_empty() {
                                 self.toast("a label is needed", Tone::Warn);
                             } else {
                                 self.vault.external =
-                                    Some(External::AddLogin(value.trim().to_string()));
+                                    Some(External::AddLogin(value.trim().to_string(), h));
                             }
                         }
                     }
@@ -431,27 +540,22 @@ impl App {
         }
     }
 
-    /// Runs `claude` in a scratch seat for `/login`, then saves the login. Called with the
-    /// dashboard suspended (the terminal belongs to Claude Code meanwhile).
-    pub fn run_add_login(&mut self, label: &str) {
+    /// Runs the harness (`claude`, `agy`) in a scratch seat to sign in, then saves the login.
+    /// Called with the dashboard suspended (the terminal belongs to the harness meanwhile).
+    pub fn run_add_login(&mut self, label: &str, harness: Harness) {
         let scratch = self
             .vault_dir
             .join(format!("new-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
+        let (program, hint) = crate::vault::new_login_recipe(harness);
         println!(
-            "\nswarmy: starting Claude Code in a scratch seat for '{label}'. Run /login, choose the account, then /exit.\n"
+            "\nswarmy: starting {} in a scratch seat for '{label}'. {hint}\n",
+            harness.display_name()
         );
         let res = (|| -> anyhow::Result<()> {
             std::fs::create_dir_all(&scratch)?;
-            std::process::Command::new("claude")
-                .env("CLAUDE_CONFIG_DIR", &scratch)
-                .status()
-                .map_err(|e| anyhow::anyhow!("cannot start `claude`: {e}"))?;
-            let seat = crate::claude::seats::Seat::new(
-                format!("scratch-{label}"),
-                scratch.clone(),
-                scratch.join(".claude.json"),
-                false,
-            );
+            let (mut cmd, seat) = crate::vault::new_login(harness, label, &scratch);
+            cmd.status()
+                .map_err(|e| anyhow::anyhow!("cannot start `{program}`: {e}"))?;
             let s = crate::vault::read_seat(&seat)?;
             let secret = s
                 .secret

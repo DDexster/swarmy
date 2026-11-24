@@ -8,10 +8,12 @@ logins. Users run it in a spare terminal, mostly on laptops.
 ## Ground rules
 
 - **English only**: UI text, docs, code, commits.
-- **Offline and read-only.** No network calls, no telemetry. Claude Code's directories are only read;
-  the single write is an explicit vault switch (`src/vault`), which saves the seat's current login
-  first, backs up both files, writes atomically, merges only `oauthAccount` into `.claude.json` as
-  it is right before the write, and keeps `mcpOAuth`. Every vault change goes through
+- **Offline and read-only.** No network calls, no telemetry. The harnesses' directories (Claude
+  Code, Antigravity) are only read; the single write is an explicit vault switch (`src/vault`),
+  which saves the seat's current login first, backs up the seat's files, writes atomically,
+  merges only `oauthAccount` into `.claude.json` as it is right before the write, and keeps
+  `mcpOAuth` (Claude Code); for an agy seat it replaces `antigravity-oauth-token` whole. A login
+  belongs to one harness and may be in several seats of it (`Login::mounted`). Every vault change goes through
   `Vault::edit` (OS lock, re-read under it, backup, atomic writes); never write vault files elsewhere.
   A switch is all or nothing for the seat (`vault/switch.rs`): `.credentials.json` is replaced only
   while it holds what was saved (`store::replace_if_unchanged`), `.claude.json` through
@@ -61,7 +63,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
     `App::t`/`animating` makes its panel drawn every frame. `--mask` blanks words in one pass
     per row (`mask_words`).
   - The guard: `tools/perf.sh` (and `tools/perf.sh --mask`) runs a release build on
-    `swarmy demo --wall` (three seats, ten days of ~12,600 requests a day, ~18 agents at work)
+    `swarmy demo --wall` (three Claude Code seats and one agy seat, ten days of ~12,600 requests a
+    day, ~18 agents at work)
     in a 326×81 tmux window and fails above 2.0 (2.3 with `--mask`) CPU-seconds per minute.
     Run it before merging anything that touches the worker, the index reads or the view. CPU
     time still moves by 10–15% with the machine's load (SMT siblings): near the budget, run it
@@ -114,6 +117,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
 |---|---|
 | `src/lib.rs`, `src/main.rs` | the library holds everything; the binary only parses arguments and calls `cli::run` |
 | `src/core/` | pure domain: usage, pricing, periods, limits math, storage rules (raw window, growth, projection; no I/O) |
+| `src/agy/` | readers of Google Antigravity's files: seat discovery, `brain/<cid>/…/transcript.jsonl`, conversation metadata (SQLite reads in `index/agy_summaries.rs`, cached by file stamp), live conversations from `presence/*.lock` (Linux: `/proc/locks`, no lock of ours), the token file (`credentials.rs`) and its account |
+| `src/core/harness.rs`, `src/core/login.rs` | the harnesses and what each supports; a login's secret and non-secret facts per harness (pure) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
 | `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `archive.rs`: rollup columns declared once (`KEYS`, `SUMS`), read plans (a span inside the raw window reads `requests` with the old SQL; one reaching `rolled_until` reads the union with the rollups); `archive_scenarios.rs`: the proof that rolled-up spend reads the same everywhere; `compact.rs`: the compactor (raw rows older than `keep_raw_days` into the rollups, one transaction per 6-hour chunk; giving space back, the one-time `VACUUM`), proved in `compact_scenarios.rs`; `projects.rs`: the cwd → project table, recomputed over raw and rolled-up cwds, never downgraded; `storage.rs`: the index's size, daily samples, last compaction (doctor, SYSTEM); `marks.rs`: read marks, the one rule that keeps a file read again after a compaction from counting rolled-up records twice; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
 | `src/live/` | live agent states for the dashboard; `state.rs`: how an agent's state is decided (pure, table-tested) |
@@ -127,6 +132,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/demo.rs` | made-up world for `swarmy demo` and README media |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
+| `tools/prices-from-litellm.py` | compares the built-in prices with LiteLLM's list (run by hand; swarmy stays offline) |
 | `tools/perf.sh` | the battery budget measured on `swarmy demo --wall`, fails above it |
 | `tools/dist.sh`, `tools/release-local.sh` | release steps shared with `.github/workflows/release.yml`; the local Linux + Windows build into `dist/` |
 | `packaging/` | Homebrew formula template (`homebrew/swarmy.rb`) and the release / tap / signing notes (`README.md`) |
@@ -172,6 +178,26 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `<repo>`; a dir outside any repo (gone, or a scratch dir) takes the project of the session it ran
   in, or the session's own dir when it lies under it (never a home dir). Changing these rules means
   bumping `PROJECTS_REV` in `src/index/mod.rs`, which recomputes the table once.
+
+## Antigravity (agy) format notes (verified on the agy CLI of 2026-11)
+
+- Seat dir `$HOME/.gemini/antigravity-cli`: the CLI keys it on `HOME` and ignores
+  `ANTIGRAVITY_APP_DATA_DIR` for its token and conversations (verified), so a scratch seat for a
+  new login runs agy with `HOME=<scratch>` (`vault::new_login`); running agys' seats come from the
+  `HOME` of their environment. One conversation per
+  `brain/<cid>/.system_generated/logs/transcript.jsonl`, one step per line: `PLANNER_RESPONSE`
+  (`model` with an effort suffix such as `gemini-4-neon-high`, `input_tokens` without the cached
+  part, `cache_read_tokens`, `output_tokens`, `tool_calls`), `GENERIC` (tool `k`'s result at
+  `step_index + 1 + k`), `USER_INPUT`, `CHECKPOINT` (tokens but no model: not priced),
+  `ERROR_MESSAGE`, `SYSTEM_MESSAGE`. Older steps may have neither model nor tokens: they are
+  `<synthetic>` records (tools kept, no request).
+- Titles, workspaces, run status and subagent parents in `conversation_summaries.db` (read-only,
+  whole table, cached by the stamp of the db, its WAL and `cache/conversation_metadata.json`, the
+  fallback without status or parents).
+- A running agy holds `FLOCK WRITE` on `presence/<cid>.lock`; stale lock files stay behind.
+- The login is the whole `antigravity-oauth-token` (`token.refresh_token`, `token.expiry`,
+  `auth_method`, `id_token_email`); agy skips saving a refreshed token when the file changed
+  under it, so a vault switch is not undone by a running agy.
 
 ## Commands
 

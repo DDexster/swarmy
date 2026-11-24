@@ -8,6 +8,7 @@ use serde::Serialize;
 
 use super::archive::{self, Plan};
 use super::{Index, from_ms, ms, settled};
+use crate::core::harness::Harness;
 use crate::core::ids::{AccountId, SeatId};
 use crate::core::limits::{Reading, WindowKind};
 use crate::core::period::{BUCKET_MS, Span, bucket_start};
@@ -34,6 +35,7 @@ pub enum Dim {
     Project,
     Account,
     Seat,
+    Harness,
     Model,
     Effort,
     AgentType,
@@ -61,6 +63,10 @@ impl Dim {
             Dim::Seat => (
                 "r.seat",
                 "COALESCE((SELECT st.label FROM seats st WHERE st.seat = r.seat), r.seat)",
+            ),
+            Dim::Harness => (
+                "COALESCE((SELECT st.harness FROM seats st WHERE st.seat = r.seat), 'claude')",
+                "COALESCE((SELECT st.harness FROM seats st WHERE st.seat = r.seat), 'claude')",
             ),
             Dim::Model => ("r.model", "r.model"),
             Dim::Effort => ("COALESCE(r.effort, '-')", "COALESCE(r.effort, '-')"),
@@ -93,6 +99,7 @@ impl Dim {
             Dim::Project => "PROJECT",
             Dim::Account => "ACCOUNT",
             Dim::Seat => "SEAT",
+            Dim::Harness => "HARNESS",
             Dim::Model => "MODEL",
             Dim::Effort => "EFFORT",
             Dim::AgentType => "AGENT TYPE",
@@ -123,6 +130,7 @@ pub struct Filter {
     /// the user all end up here as the one account they name.
     pub account: Option<AccountId>,
     pub seat: Option<SeatId>,
+    pub harness: Option<Harness>,
     /// Matches the project name or key.
     pub project: Option<String>,
     pub model: Option<String>,
@@ -188,6 +196,13 @@ fn where_clause(plan: Plan, f: &Filter, args: &mut Vec<rusqlite::types::Value>) 
     if let Some(s) = &f.seat {
         w.push("r.seat = ?".into());
         args.push(V::Text(s.as_str().to_string()));
+    }
+    if let Some(h) = f.harness {
+        w.push(
+            "COALESCE((SELECT st.harness FROM seats st WHERE st.seat = r.seat), 'claude') = ?"
+                .into(),
+        );
+        args.push(V::Text(h.key().to_string()));
     }
     if let Some(p) = &f.project {
         w.push("(p.name = ? OR p.key = ?)".into());

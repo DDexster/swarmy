@@ -142,6 +142,7 @@ mod tests {
     fn session(status: SessionStatus, since: Option<i64>) -> LiveSession {
         LiveSession {
             seat: "work".into(),
+            harness: crate::core::harness::Harness::Claude,
             pid: 4242,
             session_id: "s1".into(),
             cwd: "/w/proj".into(),

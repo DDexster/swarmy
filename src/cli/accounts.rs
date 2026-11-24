@@ -45,17 +45,17 @@ pub enum AccountsCmd {
     Switch {
         seat: String,
         login: String,
-        /// Switch even though Claude Code is running in that seat.
+        /// Switch even though the seat's harness is running in it.
         #[arg(long)]
         force: bool,
-        /// Allow the same login in two seats (both refresh one grant; one is logged out if it is ever revoked).
-        #[arg(long)]
-        share: bool,
     },
-    /// Log into a new account in a scratch seat (runs `claude`; use /login, then /exit) and save it.
+    /// Log into a new account in a scratch seat (runs `claude` or `agy` there) and save it.
     Add {
         #[arg(long)]
         label: String,
+        /// The harness the login is for.
+        #[arg(long, value_enum, default_value_t = crate::core::harness::Harness::Claude)]
+        harness: crate::core::harness::Harness,
     },
     Rename {
         login: String,
@@ -69,8 +69,17 @@ pub enum AccountsCmd {
     },
 }
 
-fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
+fn vault_seats(ctx: &Ctx) -> Vec<Seat> {
     ctx.seats
+        .iter()
+        .filter(|s| s.harness.supports_vault())
+        .cloned()
+        .collect()
+}
+
+fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
+    let found = ctx
+        .seats
         .iter()
         .find(|s| s.label == key || s.dir.to_string_lossy() == key)
         .with_context(|| {
@@ -78,15 +87,27 @@ fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
                 "no seat '{key}'; seats: {}",
                 ctx.seats
                     .iter()
+                    .filter(|s| s.harness.supports_vault())
                     .map(|s| s.label.as_str())
                     .collect::<Vec<_>>()
                     .join(", ")
             )
-        })
+        })?;
+    if !found.harness.supports_vault() {
+        bail!(
+            "seat '{}' uses {} (the login vault supports Claude Code seats only)",
+            found.label,
+            found.harness.display_name()
+        );
+    }
+    Ok(found)
 }
 
 /// Claude Code processes using this seat right now.
 fn live_in(ctx: &Ctx, s: &Seat) -> usize {
+    if s.harness == crate::core::harness::Harness::Agy {
+        return crate::agy::live::locked_conversations_once(&s.dir).len();
+    }
     let registered = registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs).len();
     let by_env = ctx
         .procs
@@ -121,7 +142,8 @@ fn weekly(
 
 pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
     let mut v = Vault::open(&ctx.dirs.vault_dir())?;
-    v.edit(|tx| tx.sync(&ctx.seats))?;
+    let seats = vault_seats(ctx);
+    v.edit(|tx| tx.sync(&seats))?;
     let p = &ctx.painter;
     match a.cmd.clone().unwrap_or(AccountsCmd::List) {
         AccountsCmd::List => list(ctx, &mut v),
@@ -149,8 +171,12 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
         AccountsCmd::Import { file, label } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("cannot read {}", file.display()))?;
-            let secret =
-                credentials::parse_login(&text)?.context("no claudeAiOauth object in that file")?;
+            // A Claude Code credentials file (or `{"claudeAiOauth": …}`), else an agy token file.
+            let secret = match credentials::parse_login(&text)? {
+                Some(s) => s,
+                None => crate::agy::credentials::parse_login(&text)?
+                    .context("no Claude Code or Antigravity login in that file")?,
+            };
             v.edit(|tx| tx.put(&secret, None, None, Some(&label), None))?;
             println!(
                 "{} imported '{label}' ({})",
@@ -170,19 +196,26 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             seat: key,
             login,
             force,
-            share,
         } => {
             let s = seat(ctx, &key)?;
             let live = live_in(ctx, s);
             if live > 0 && !force {
+                let how = match s.harness {
+                    crate::core::harness::Harness::Claude => {
+                        "Running sessions re-read the credentials file when it changes and continue under the new login, \
+                         but their account display stays stale until restart."
+                    }
+                    crate::core::harness::Harness::Agy => {
+                        "A running agy keeps the login it loaded until it restarts (it does not write its old token back)."
+                    }
+                };
                 bail!(
-                    "Claude Code is running in seat '{}' ({live} process(es)). Running sessions re-read the credentials file when it changes \
-                     and continue under the new login, but their account display stays stale until restart. \
-                     Close them first, or pass --force.",
+                    "{} is running in seat '{}' ({live} session(s)). {how} Close them first, or pass --force.",
+                    s.harness.display_name(),
                     s.label
                 );
             }
-            let rep = v.edit(|tx| tx.switch(s, &login, share))?;
+            let rep = v.edit(|tx| tx.switch(s, &login))?;
             if rep.unchanged {
                 println!(
                     "{} seat '{}' already uses '{}'",
@@ -199,6 +232,19 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                 rep.from.as_deref().unwrap_or("(nothing)"),
                 p.paint(&rep.to, Tone::Bold)
             );
+            if !rep.shared_with.is_empty() {
+                println!(
+                    "{}",
+                    p.paint(
+                        &format!(
+                            "  '{}' is also in seat {}",
+                            rep.to,
+                            rep.shared_with.join(", ")
+                        ),
+                        Tone::Dim
+                    )
+                );
+            }
             if let Some(saved) = &rep.auto_saved {
                 println!("{}", p.paint(&format!("  the seat's previous login was not in the vault; saved it as '{saved}'"), Tone::Accent));
             }
@@ -216,29 +262,25 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             }
             Ok(())
         }
-        AccountsCmd::Add { label } => {
+        AccountsCmd::Add { label, harness } => {
             let scratch = ctx
                 .dirs
                 .vault_dir()
                 .join(format!("new-{}", chrono::Utc::now().format("%Y%m%d%H%M%S")));
             std::fs::create_dir_all(&scratch)?;
+            let (program, hint) = vault::new_login_recipe(harness);
             println!(
-                "Starting Claude Code in a scratch seat. Run /login, choose the account, then /exit."
+                "Starting {} in a scratch seat. {hint}",
+                harness.display_name()
             );
-            let status = std::process::Command::new("claude")
-                .env("CLAUDE_CONFIG_DIR", &scratch)
-                .status();
+            let (mut cmd, tmp) = vault::new_login(harness, &label, &scratch);
+            let status = cmd.status();
             let result = (|| -> anyhow::Result<()> {
-                let status = status.context("cannot start `claude` (is it on PATH?)")?;
+                let status =
+                    status.with_context(|| format!("cannot start `{program}` (is it on PATH?)"))?;
                 if !status.success() {
-                    eprintln!("claude exited with {status}");
+                    eprintln!("{program} exited with {status}");
                 }
-                let tmp = Seat::new(
-                    format!("scratch-{label}"),
-                    scratch.clone(),
-                    scratch.join(".claude.json"),
-                    false,
-                );
                 let s = vault::read_seat(&tmp)?;
                 let secret = s.secret.context("no login was made in the scratch seat")?;
                 v.edit(|tx| {
@@ -277,7 +319,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
 }
 
 fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
-    let states = v.edit(|tx| tx.seat_states(&ctx.seats))?;
+    let claude = vault_seats(ctx);
+    let states = v.edit(|tx| tx.seat_states(&claude))?;
     let (idx, _) = ctx.index()?;
     let reports = all_reports(ctx, &idx)?;
     let p = &ctx.painter;
@@ -297,7 +340,12 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         ("RESETS", Align::Left),
         ("LIVE", Align::Right),
     ]);
-    for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
+    for (s, si) in ctx
+        .seats
+        .iter()
+        .zip(&ctx.seat_info)
+        .filter(|(s, _)| s.harness.supports_vault())
+    {
         let st = states.get(&s.id).cloned().unwrap_or_default();
         let acct = si.account.as_ref().map(|a| a.id().to_string());
         let w = weekly(&reports, acct.as_deref());
@@ -384,7 +432,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
         let w = weekly(&reports, l.account_uuid.as_deref());
         let week = match w {
             Some((u, _, reset)) => {
-                if l.mounted.is_none() && best.as_ref().is_none_or(|(b, _)| u < *b) {
+                if l.mounted.is_empty() && best.as_ref().is_none_or(|(b, _)| u < *b) {
                     best = Some((u, mask::login_label(&l.label, l.email.as_deref(), ctx.mask)));
                 }
                 Cell::tone(
@@ -424,9 +472,17 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                 l.email.as_deref().unwrap_or_default(),
                 ctx.mask,
             )),
-            match &l.mounted {
-                Some(s) => Cell::tone(ctx.seat_label(s), Tone::Good),
-                None => Cell::tone("-", Tone::Dim),
+            if l.mounted.is_empty() {
+                Cell::tone("-", Tone::Dim)
+            } else {
+                Cell::tone(
+                    l.mounted
+                        .iter()
+                        .map(|s| ctx.seat_label(s))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Tone::Good,
+                )
             },
             week,
             expires.unwrap_or_else(|| Cell::tone("-", Tone::Dim)),

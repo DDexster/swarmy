@@ -284,9 +284,23 @@ fn draw_panel_now(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool)
     }
 }
 
-/// Rows the LIMITS · SEATS table needs: borders, header, one per seat and parked login, a hint.
+/// Rows the LIMITS · SEATS table needs: borders, header, one per seat and saved login, section
+/// headings and a hint.
 fn limits_height(app: &App) -> u16 {
-    app.limits_rows().len() as u16 + 4
+    let rows = app.limits_rows();
+    // One heading per harness section, or the one SAVED LOGINS heading.
+    let headings = if app.limits_sections() {
+        rows.iter()
+            .map(|r| app.row_harness(r))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    } else {
+        usize::from(
+            rows.iter()
+                .any(|r| matches!(r, super::app::LimitsRow::Login(_))),
+        )
+    };
+    (rows.len() + headings) as u16 + 4
 }
 
 /// Everything at once (from about 250×55).
@@ -601,7 +615,7 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(th.fg),
             ),
             Span::styled(
-                "   words match names; p:project m:model s:seat state:needs · Enter keep · Esc clear",
+                "   words match names; p:project m:model s:seat h:harness state:needs · Enter keep · Esc clear",
                 Style::new().fg(th.faint),
             ),
         ]);
@@ -726,6 +740,7 @@ mod tests {
         let agent = |id: &str, state: State| crate::live::Agent {
             seat: crate::core::ids::SeatId::from_stored("0123456789abcdef"),
             seat_label: "work".into(),
+            harness: crate::core::harness::Harness::Claude,
             session_id: crate::core::ids::SessionId::new("s1"),
             agent_id: id.into(),
             parent: (!id.is_empty()).then(String::new),
@@ -740,6 +755,7 @@ mod tests {
             last_activity: Utc::now(),
             cost: 1.5,
             requests: 3,
+            unpriced: false,
             context_tokens: 1000,
             spark: vec![0.1; 15],
             lane: Vec::new(),

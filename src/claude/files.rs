@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::seats::Seat;
+use crate::core::harness::Harness;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum FileKind {
@@ -41,11 +42,21 @@ pub struct TranscriptFile {
     /// Empty for the main thread.
     pub agent_id: String,
     pub kind: FileKind,
+    /// Which harness wrote this file.
+    pub harness: Harness,
+    /// Session working directory supplied out-of-band (used by harnesses like `agy` whose
+    /// transcript lines do not repeat `cwd`).
+    pub default_cwd: Option<String>,
+    /// Session title supplied out-of-band (e.g. `agy`'s `conversation_summaries.db`).
+    pub session_title: Option<String>,
+    /// Agent metadata supplied out-of-band (instead of Claude Code's `agent-*.meta.json`).
+    pub inline_meta: Option<AgentMeta>,
 }
 
 impl TranscriptFile {
     pub fn meta_path(&self) -> Option<PathBuf> {
-        (self.kind != FileKind::Main).then(|| self.path.with_extension("meta.json"))
+        (self.harness == Harness::Claude && self.kind != FileKind::Main)
+            .then(|| self.path.with_extension("meta.json"))
     }
 }
 
@@ -67,6 +78,26 @@ fn agent_id_of(p: &Path) -> Option<String> {
     stem.strip_prefix("agent-").map(str::to_string)
 }
 
+fn claude_file(
+    path: PathBuf,
+    seat: &Seat,
+    session_id: String,
+    agent_id: String,
+    kind: FileKind,
+) -> TranscriptFile {
+    TranscriptFile {
+        path,
+        seat: seat.id.clone(),
+        session_id,
+        agent_id,
+        kind,
+        harness: Harness::Claude,
+        default_cwd: None,
+        session_title: None,
+        inline_meta: None,
+    }
+}
+
 pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
     let mut out = Vec::new();
     let Ok(projects) = std::fs::read_dir(seat.projects_dir()) else {
@@ -85,13 +116,7 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
             sessions.push(sid.clone());
-            out.push(TranscriptFile {
-                path: f,
-                seat: seat.id.clone(),
-                session_id: sid,
-                agent_id: String::new(),
-                kind: FileKind::Main,
-            });
+            out.push(claude_file(f, seat, sid, String::new(), FileKind::Main));
         }
         let Ok(entries) = std::fs::read_dir(&pdir) else {
             continue;
@@ -105,13 +130,7 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
             let sub = sdir.join("subagents");
             for f in jsonl_in(&sub) {
                 if let Some(aid) = agent_id_of(&f) {
-                    out.push(TranscriptFile {
-                        path: f,
-                        seat: seat.id.clone(),
-                        session_id: sid.clone(),
-                        agent_id: aid,
-                        kind: FileKind::Subagent,
-                    });
+                    out.push(claude_file(f, seat, sid.clone(), aid, FileKind::Subagent));
                 }
             }
             if let Ok(runs) = std::fs::read_dir(sub.join("workflows")) {
@@ -119,13 +138,13 @@ pub fn list(seat: &Seat) -> Vec<TranscriptFile> {
                     let run_id = run.file_name().to_string_lossy().into_owned();
                     for f in jsonl_in(&run.path()) {
                         if let Some(aid) = agent_id_of(&f) {
-                            out.push(TranscriptFile {
-                                path: f,
-                                seat: seat.id.clone(),
-                                session_id: sid.clone(),
-                                agent_id: aid,
-                                kind: FileKind::Workflow(run_id.clone()),
-                            });
+                            out.push(claude_file(
+                                f,
+                                seat,
+                                sid.clone(),
+                                aid,
+                                FileKind::Workflow(run_id.clone()),
+                            ));
                         }
                     }
                 }
@@ -149,24 +168,24 @@ pub fn list_session(seat: &Seat, session_id: &str) -> Vec<TranscriptFile> {
             continue;
         }
         if main.exists() {
-            out.push(TranscriptFile {
-                path: main,
-                seat: seat.id.clone(),
-                session_id: session_id.into(),
-                agent_id: String::new(),
-                kind: FileKind::Main,
-            });
+            out.push(claude_file(
+                main,
+                seat,
+                session_id.into(),
+                String::new(),
+                FileKind::Main,
+            ));
         }
         let sub = sdir.join("subagents");
         for f in jsonl_in(&sub) {
             if let Some(aid) = agent_id_of(&f) {
-                out.push(TranscriptFile {
-                    path: f,
-                    seat: seat.id.clone(),
-                    session_id: session_id.into(),
-                    agent_id: aid,
-                    kind: FileKind::Subagent,
-                });
+                out.push(claude_file(
+                    f,
+                    seat,
+                    session_id.into(),
+                    aid,
+                    FileKind::Subagent,
+                ));
             }
         }
         if let Ok(runs) = std::fs::read_dir(sub.join("workflows")) {
@@ -174,13 +193,13 @@ pub fn list_session(seat: &Seat, session_id: &str) -> Vec<TranscriptFile> {
                 let run_id = run.file_name().to_string_lossy().into_owned();
                 for f in jsonl_in(&run.path()) {
                     if let Some(aid) = agent_id_of(&f) {
-                        out.push(TranscriptFile {
-                            path: f,
-                            seat: seat.id.clone(),
-                            session_id: session_id.into(),
-                            agent_id: aid,
-                            kind: FileKind::Workflow(run_id.clone()),
-                        });
+                        out.push(claude_file(
+                            f,
+                            seat,
+                            session_id.into(),
+                            aid,
+                            FileKind::Workflow(run_id.clone()),
+                        ));
                     }
                 }
             }

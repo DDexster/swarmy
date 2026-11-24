@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+pub use crate::core::harness::Harness;
 pub use crate::core::ids::SeatId;
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,10 +21,14 @@ pub struct Seat {
     /// the dir name, or the `label` of `config.toml`; may change between runs.
     pub label: String,
     pub dir: PathBuf,
-    /// `~/.claude.json` for the default dir, `<dir>/.claude.json` for the others.
+    /// `~/.claude.json` for the default Claude dir, `<dir>/.claude.json` for other Claude dirs;
+    /// empty for non-Claude harnesses.
     pub claude_json: PathBuf,
     pub is_default: bool,
     pub found_by: Vec<&'static str>,
+    /// Which agent harness owns this directory.
+    #[serde(default)]
+    pub harness: Harness,
 }
 
 /// The id of a config dir: [`SeatId::of_canonical_dir`] of its canonical path (the path as
@@ -45,7 +50,7 @@ pub fn claude_json_of(dir: &Path, home: &Path) -> PathBuf {
 }
 
 impl Seat {
-    /// A seat of `dir`, its id derived from the path.
+    /// A Claude Code seat of `dir`, its id derived from the path.
     pub fn new(
         label: impl Into<String>,
         dir: PathBuf,
@@ -59,6 +64,20 @@ impl Seat {
             claude_json,
             is_default,
             found_by: Vec::new(),
+            harness: Harness::Claude,
+        }
+    }
+
+    /// An Antigravity (`agy`) seat of `dir`, its id derived from the path.
+    pub fn agy(label: impl Into<String>, dir: PathBuf) -> Seat {
+        Seat {
+            id: seat_id(&dir),
+            label: label.into(),
+            dir,
+            claude_json: PathBuf::new(),
+            is_default: false,
+            found_by: Vec::new(),
+            harness: Harness::Agy,
         }
     }
 
@@ -70,15 +89,30 @@ impl Seat {
         self.dir.join("sessions")
     }
 
+    /// Directories holding this seat's transcripts on disk (for `SYSTEM` disk usage).
+    pub fn disk_dirs(&self) -> Vec<PathBuf> {
+        match self.harness {
+            Harness::Claude => vec![self.projects_dir()],
+            Harness::Agy => vec![self.dir.join("brain"), self.dir.join("conversations")],
+        }
+    }
+
     pub fn credentials_file(&self) -> PathBuf {
-        self.dir.join(".credentials.json")
+        match self.harness {
+            Harness::Claude => self.dir.join(".credentials.json"),
+            Harness::Agy => self.dir.join("antigravity-oauth-token"),
+        }
     }
 
     /// Days Claude Code keeps this seat's transcripts: `cleanupPeriodDays` of its
     /// `settings.json` (at least 1), `None` when not set (Claude Code's default applies,
-    /// `core::storage::DEFAULT_RETENTION_DAYS`). A file that exists but cannot be read or parsed
-    /// is an error, never "not set".
+    /// `core::storage::DEFAULT_RETENTION_DAYS`). Harnesses without automatic transcript deletion
+    /// return `Ok(None)`. A file that exists but cannot be read or parsed is an error, never "not
+    /// set".
     pub fn cleanup_period_days(&self) -> Result<Option<u32>, crate::errors::ConfigError> {
+        if !self.harness.has_transcript_retention() {
+            return Ok(None);
+        }
         let path = self.dir.join("settings.json");
         let damaged = |message: String| crate::errors::ConfigError::SeatSettings {
             path: path.clone(),
@@ -204,6 +238,7 @@ pub fn discover(c: &Candidates) -> Vec<Seat> {
                 claude_json,
                 is_default,
                 found_by,
+                harness: Harness::Claude,
             }
         })
         .collect();

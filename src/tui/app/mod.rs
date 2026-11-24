@@ -23,6 +23,7 @@ use super::theme::Theme;
 use super::{Analytics, Msg, SystemView};
 use crate::claude::registry::LiveSession;
 use crate::claude::seats::Seat;
+use crate::core::harness::Harness;
 use crate::core::limits::WindowKind;
 use crate::core::period::Period;
 use crate::index::Progress;
@@ -204,7 +205,8 @@ pub struct ShotKey {
     pub eco: bool,
 }
 
-/// One row of the LIMITS · SEATS panel.
+/// One row of the LIMITS · SEATS panel (section headings are drawn between them, never
+/// selected).
 #[derive(Debug, Clone)]
 pub enum LimitsRow {
     Seat(String),
@@ -386,7 +388,7 @@ impl App {
 
     // ───────────── agents ─────────────
 
-    /// Filter chips: `p:project m:model s:seat state:needs`, anything else matches names.
+    /// Filter chips: `p:project m:model s:seat h:harness state:needs`, anything else matches names.
     pub fn visible_agents(&self) -> Vec<&Agent> {
         let f = self.filter.as_deref().unwrap_or("").to_lowercase();
         let terms: Vec<&str> = f.split_whitespace().collect();
@@ -398,11 +400,34 @@ impl App {
                     Some(("p", v)) => a.project.to_lowercase().contains(v),
                     Some(("m", v)) => a.model.as_deref().unwrap_or("").to_lowercase().contains(v),
                     Some(("s", v)) => a.seat_label.to_lowercase().contains(v),
+                    Some(("h", v)) => a.harness.key().contains(v) || a.harness.short().contains(v),
                     Some(("state", v)) => format!("{:?}", a.state).to_lowercase().contains(v),
-                    _ => a.name.to_lowercase().contains(t) || a.project.to_lowercase().contains(t),
+                    // Not a chip: a word matched against names.
+                    Some((_, _)) | None => {
+                        a.name.to_lowercase().contains(t) || a.project.to_lowercase().contains(t)
+                    }
                 })
             })
             .collect()
+    }
+
+    /// True when more than one harness is present in the seats or live snapshot (so harness badges
+    /// add signal without cluttering Claude-only setups).
+    pub fn multi_harness(&self) -> bool {
+        let mut first = None;
+        for h in self
+            .seats
+            .iter()
+            .map(|s| s.harness)
+            .chain(self.snapshot.agents.iter().map(|a| a.harness))
+        {
+            match first {
+                None => first = Some(h),
+                Some(f) if f != h => return true,
+                Some(_) => {}
+            }
+        }
+        false
     }
 
     pub fn selected_index(&self) -> usize {
@@ -473,32 +498,60 @@ impl App {
             .unwrap_or_else(|| format!("acct-{}", crate::core::ids::short_account(uuid)))
     }
 
-    /// Rows of the LIMITS · SEATS panel: every seat, then every saved login that is in no seat.
+    /// Rows of the LIMITS · SEATS panel, one section per harness (in `Harness::ALL` order): its
+    /// seats, then every saved login of that harness, in a seat or not, the most limit left
+    /// first. A login fits only its harness's seats, so it is listed with them.
     pub fn limits_rows(&self) -> Vec<LimitsRow> {
-        let mut rows: Vec<LimitsRow> = self
-            .seats
-            .iter()
-            .map(|s| LimitsRow::Seat(s.label.clone()))
-            .collect();
-        let mut parked: Vec<&crate::vault::Login> = self
-            .vault
-            .logins
-            .iter()
-            .filter(|l| l.mounted.is_none())
-            .collect();
-        parked.sort_by(|a, b| {
-            let (fa, wa, _) = self.limits_of(a.account_uuid.as_deref());
-            let (fb, wb, _) = self.limits_of(b.account_uuid.as_deref());
-            let ka = fa.unwrap_or(0.0).max(wa.unwrap_or(200.0));
-            let kb = fb.unwrap_or(0.0).max(wb.unwrap_or(200.0));
-            ka.total_cmp(&kb)
-        });
-        rows.extend(
-            parked
-                .into_iter()
-                .map(|l| LimitsRow::Login(l.label.clone())),
-        );
+        let mut rows = Vec::new();
+        for h in Harness::ALL {
+            rows.extend(
+                self.seats
+                    .iter()
+                    .filter(|s| s.harness == h)
+                    .map(|s| LimitsRow::Seat(s.label.clone())),
+            );
+            let mut logins: Vec<&crate::vault::Login> = self
+                .vault
+                .logins
+                .iter()
+                .filter(|l| l.harness == h)
+                .collect();
+            logins.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
+            rows.extend(
+                logins
+                    .into_iter()
+                    .map(|l| LimitsRow::Login(l.label.clone())),
+            );
+        }
         rows
+    }
+
+    /// The harness a row of LIMITS · SEATS belongs to.
+    pub fn row_harness(&self, r: &LimitsRow) -> Harness {
+        match r {
+            LimitsRow::Seat(label) => self
+                .seats
+                .iter()
+                .find(|s| &s.label == label)
+                .map_or(Harness::Claude, |s| s.harness),
+            LimitsRow::Login(label) => self
+                .vault
+                .logins
+                .iter()
+                .find(|l| &l.label == label)
+                .map_or(Harness::Claude, |l| l.harness),
+        }
+    }
+
+    /// Whether LIMITS · SEATS shows one section per harness: when seats or logins of more than
+    /// one harness are there (a Claude-only setup looks as before).
+    pub fn limits_sections(&self) -> bool {
+        let rows = self.limits_rows();
+        rows.iter()
+            .map(|r| self.row_harness(r))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1
     }
 
     // ───────────── attention ─────────────

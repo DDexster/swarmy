@@ -8,6 +8,7 @@ use super::logins::SeatSeen;
 use super::{Login, SeatLogin, SeatState, VaultTx, read_seat};
 use crate::claude::credentials::{LoginMeta, Secret};
 use crate::claude::seats::{Seat, SeatId};
+use crate::core::harness::Harness;
 
 /// Refresh tokens are issued for 30 days: a token issued after the profile was read means a new
 /// login the profile does not describe yet.
@@ -27,6 +28,8 @@ impl VaultTx<'_> {
         let account = s.account.as_ref().map(|a| a.id().to_string());
         let prev = self.index.seats.get(&seat.id).cloned();
         let unverified_since = match &prev {
+            // An agy token file names its own account: nothing to confirm.
+            _ if seat.harness == Harness::Agy => None,
             // First sight: a refresh token issued after the profile was read is a newer login;
             // a file written after the profile with an access token already expired at that time
             // was copied in (Claude Code only writes fresh tokens).
@@ -51,7 +54,7 @@ impl VaultTx<'_> {
                 // The login the vault knows is in this seat (it wrote it there, or followed its
                 // rotation) and the profile names its account: nothing to confirm.
                 let known = self.index.logins.iter().any(|l| {
-                    l.mounted.as_ref() == Some(&seat.id)
+                    l.is_in(&seat.id)
                         && l.meta.fingerprint == fp
                         && l.account_uuid.is_some()
                         && l.account_uuid == account
@@ -87,7 +90,7 @@ impl VaultTx<'_> {
             .index
             .logins
             .iter()
-            .find(|l| l.meta.fingerprint == fp)
+            .find(|l| l.harness == seat.harness && l.meta.fingerprint == fp)
             .map(|l| l.label.clone());
         SeatState {
             fingerprint: Some(fp),
@@ -146,19 +149,24 @@ impl VaultTx<'_> {
     /// another login (a `/login`, a restored backup): the saved login is left untouched and no
     /// longer counts as mounted there, so its tokens are never overwritten by someone else's.
     ///
-    /// A seat that holds a saved login mounted nowhere (a switch that stopped between its two
-    /// writes, or a seat file restored by hand) gets it mounted, so one grant is never offered
-    /// to a second seat while it lives in this one (`VaultError::SharedGrant`).
+    /// A seat that holds a saved login the vault does not record there (a switch that stopped
+    /// between its two writes, a seat file restored by hand, the same login copied into a second
+    /// seat) gets it recorded, whatever other seats hold it too.
+    ///
+    /// One grant in several seats: each seat refreshes its own access token, and the saved copy
+    /// takes whichever is newer (`keep_current`). Should one seat rotate the refresh token, the
+    /// login follows that seat; the others then hold a token the vault no longer knows ("not
+    /// saved"), which the next switch saves first like any other.
     fn sync_seat(&mut self, seat: &Seat, s: &SeatLogin) {
         let mounted = self
             .index
             .logins
             .iter()
-            .find(|l| l.mounted.as_ref() == Some(&seat.id))
+            .find(|l| l.is_in(&seat.id))
             .cloned();
         let Some(sec) = &s.secret else {
             if let Some(l) = mounted.and_then(|m| self.index.find_mut(&m.id)) {
-                l.mounted = None;
+                l.mounted.retain(|m| *m != seat.id);
             }
             return;
         };
@@ -179,7 +187,7 @@ impl VaultTx<'_> {
             }
             Some(m) => {
                 if let Some(l) = self.index.find_mut(&m.id) {
-                    l.mounted = None;
+                    l.mounted.retain(|x| *x != seat.id);
                 }
                 self.journal(&format!(
                     "seat={} has a new login; '{}' kept unchanged",
@@ -188,18 +196,14 @@ impl VaultTx<'_> {
             }
             None => {}
         }
-        let free = self
+        let saved = self
             .index
             .logins
             .iter()
-            .find(|l| {
-                l.mounted.is_none()
-                    && l.mounted_label.is_none()
-                    && l.meta.fingerprint == meta.fingerprint
-            })
+            .find(|l| l.harness == seat.harness && l.meta.fingerprint == meta.fingerprint)
             .map(|l| (l.id.clone(), l.label.clone()));
-        if let Some((id, label)) = free {
-            self.mount(&id, seat);
+        if let Some((id, label)) = saved {
+            self.mount(&id, &seat.id);
             self.keep_current(&id, sec);
             self.journal(&format!(
                 "seat={} holds '{label}': recorded as mounted there",
@@ -208,9 +212,27 @@ impl VaultTx<'_> {
         }
     }
 
-    /// The saved copy of `id` takes the seat's tokens when they differ.
+    /// The saved copy of `id` takes the seat's tokens when they are newer: a rotated grant, or an
+    /// access token that expires later. Two seats sharing a grant each refresh their own access
+    /// token; taking any differing copy would rewrite the vault (and its backups) back and forth.
     fn keep_current(&mut self, id: &str, sec: &Secret) {
-        if self.secret(id).as_ref() != Some(sec) {
+        let saved = self.secret(id);
+        if saved.as_ref() == Some(sec) {
+            return;
+        }
+        let newer = match saved.map(|x| x.meta()) {
+            None => true,
+            Some(old) => {
+                let new = sec.meta();
+                old.fingerprint != new.fingerprint
+                    || match (old.access_expires_at, new.access_expires_at) {
+                        (Some(a), Some(b)) => b > a,
+                        // An expiry not known on one side: the seat's copy, as before.
+                        (None, _) | (Some(_), None) => true,
+                    }
+            }
+        };
+        if newer {
             self.set_secret(id, sec);
             if let Some(l) = self.index.find_mut(id) {
                 l.meta = sec.meta();

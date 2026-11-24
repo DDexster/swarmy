@@ -19,7 +19,7 @@ use crate::ui::style::{ColorChoice, Painter};
 #[command(
     name = "swarmy",
     version,
-    about = "Mission control for Claude Code agents: live swarm, API-equivalent spend, weekly-limit attribution, login vault",
+    about = "Mission control for AI coding agents (Claude Code, Antigravity): live swarm, API-equivalent spend, weekly-limit attribution, login vault",
     long_about = None,
     after_help = "Run without a command for the live dashboard. Data never leaves this machine."
 )]
@@ -121,6 +121,9 @@ pub struct FilterArgs {
     /// Only this seat (its label, or its id from `swarmy doctor`).
     #[arg(long)]
     pub seat: Option<String>,
+    /// Only this harness (`claude`, `agy`).
+    #[arg(long, value_enum)]
+    pub harness: Option<crate::core::harness::Harness>,
     /// Only this project (name or path).
     #[arg(long)]
     pub project: Option<String>,
@@ -148,6 +151,7 @@ impl FilterArgs {
         Ok(Filter {
             account,
             seat,
+            harness: self.harness,
             project: self.project.clone(),
             model: self.model.clone(),
         })
@@ -323,11 +327,49 @@ fn jump(list: bool) -> anyhow::Result<()> {
                     }
                 }
             }
-            seat_dirs
+            let mut found: Vec<(String, String, Option<crate::core::pane::Pane>)> = seat_dirs
                 .iter()
                 .flat_map(|d| crate::claude::registry::waiting_sessions(&d.join("sessions")))
                 .map(|w| (w.label(), w.what.clone(), w.pane.clone()))
-                .collect()
+                .collect();
+            // Every Antigravity seat the dashboard would find, short of running processes.
+            let agy_seats =
+                crate::agy::discovery::discover(&crate::agy::discovery::AgyCandidates {
+                    home: &dirs.home,
+                    env_dirs: Vec::new(),
+                    configured: config
+                        .seat_entries(&dirs.home)
+                        .into_iter()
+                        .filter(|(p, _, h)| {
+                            *h == Some(crate::core::harness::Harness::Agy)
+                                || (h.is_none() && crate::agy::discovery::looks_like_agy_dir(p))
+                        })
+                        .map(|(p, l, _)| (p, l))
+                        .collect(),
+                });
+            for seat in &agy_seats {
+                let agy_dir = &seat.dir;
+                let locked = crate::agy::live::locked_conversations_once(agy_dir);
+                if locked.is_empty() {
+                    continue;
+                }
+                let mut cache = crate::agy::live::AgyLiveCache::default();
+                cache.resolve_procs(agy_dir, &locked);
+                let metas = crate::index::agy_summaries::read_all(agy_dir);
+                for cid in &locked {
+                    if let Some(m) = metas.get(cid)
+                        && m.status == crate::agy::meta::RunStatus::WaitingForUser
+                    {
+                        let name = m
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| crate::core::ids::short(cid).to_string());
+                        let pane = cache.proc_of(cid).and_then(|p| p.pane.clone());
+                        found.push((name, "input needed".into(), pane));
+                    }
+                }
+            }
+            found
         }
     };
     if waiting.is_empty() {

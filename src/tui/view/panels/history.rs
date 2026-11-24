@@ -55,6 +55,8 @@ pub fn history(f: &mut Frame, app: &mut App, area: Rect) {
         Family::Fable,
         Family::Sonnet,
         Family::Haiku,
+        Family::Gemini,
+        Family::Gpt,
         Family::Other,
     ];
     let mut stacks: std::collections::HashMap<&str, Vec<(Family, f64)>> = Default::default();

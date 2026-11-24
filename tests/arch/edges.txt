@@ -1,6 +1,11 @@
 # Allowed `crate::<module>::` references between top-level modules (production code).
 # New lines need a reason; lines only ever get removed.
+# Google Antigravity (`agy`) reader: shares normalized Seat, Event, LiveSession and ProcTable.
+agy -> claude
+agy -> core
+agy -> fsutil
 # The composition root (Ctx) reads seats, config, prices, the index and the vault's labels.
+app -> agy
 app -> claude
 app -> config
 app -> core
@@ -18,6 +23,7 @@ claude -> core
 # A seat's damaged settings.json is a coded failure from the error catalogue (src/errors.rs).
 claude -> errors
 # Commands start from the composition root.
+cli -> agy
 cli -> app
 cli -> claude
 cli -> config
@@ -51,6 +57,7 @@ fleet -> core
 fleet -> fsutil
 # A temp file that cannot be removed is reported on the debug channel.
 fsutil -> diag
+index -> agy
 index -> claude
 index -> core
 # Coded failures from the error catalogue (src/errors.rs).
@@ -61,6 +68,7 @@ limits -> app
 limits -> core
 # The queries feeding the estimation.
 limits -> index
+live -> agy
 live -> claude
 # The status line reads Claude Code's files through the reader layer (seat ids, the session
 # registry, a transcript's tail, `.claude.json`'s account).
@@ -76,6 +84,7 @@ statusline -> fleet
 statusline -> fsutil
 live -> core
 live -> index
+tui -> agy
 tui -> claude
 # The theme named in config.toml (config::ThemeName).
 tui -> config
@@ -95,8 +104,12 @@ tui -> statusline
 tui -> ui
 tui -> vault
 ui -> core
+# Antigravity logins: the token file's format and the account it names (agy::credentials).
+vault -> agy
 vault -> claude
 # Seats that cannot be read and a journal that cannot be written go to the debug channel.
+# A login belongs to one harness (core::harness); its secret and meta (core::login).
+vault -> core
 vault -> diag
 # Coded failures from the error catalogue (src/errors.rs).
 vault -> errors

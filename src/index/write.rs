@@ -279,6 +279,17 @@ pub(super) fn write_file(
         {
             agg.title = Some(t);
         }
+        if agg.title.is_none() && f.session_title.is_some() {
+            agg.title = f.session_title.clone();
+        }
+        if agg.cwd.is_none() && f.default_cwd.is_some() {
+            agg.cwd = f.default_cwd.clone();
+            if let Some(c) = &f.default_cwd
+                && !cwds.contains(c)
+            {
+                cwds.insert(c.clone());
+            }
+        }
         tx.prepare_cached("INSERT INTO sessions(seat, session_id, title, ai_title, cwd, first_ts, last_ts, compactions)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, (SELECT COUNT(*) FROM compact_events WHERE seat = ?1 AND session_id = ?2))
              ON CONFLICT(seat, session_id) DO UPDATE SET
@@ -287,10 +298,13 @@ pub(super) fn write_file(
                last_ts = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
                compactions = excluded.compactions")?.execute(params![f.seat, f.session_id, agg.title, agg.ai_title, agg.cwd, agg.first_ts, agg.last_ts])?;
     }
-    let meta = f
-        .meta_path()
-        .and_then(|p| files::read_meta(&p))
-        .unwrap_or_default();
+    let meta = match &f.inline_meta {
+        Some(m) => m.clone(),
+        None => f
+            .meta_path()
+            .and_then(|p| files::read_meta(&p))
+            .unwrap_or_default(),
+    };
     let workflow_run = match &f.kind {
         FileKind::Workflow(r) => Some(r.clone()),
         _ => None,

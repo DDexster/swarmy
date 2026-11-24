@@ -40,9 +40,9 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
     let th = &app.theme;
     let title = match &p.what {
         PickFor::Seat(s) => format!("put a saved login into seat '{s}' · most limit left first"),
-        PickFor::Login(l) => format!("put login '{l}' into a seat"),
+        PickFor::Login(l) => format!("put login '{l}' into a seat (it may be in several)"),
     };
-    let r = centered(area, 96, p.items.len() as u16 + 6);
+    let r = centered(area, 108, p.items.len() as u16 + 6);
     f.render_widget(Clear, r);
     let block = dialog(app, &title);
     let inner = block.inner(r);
@@ -104,13 +104,57 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
             .and_then(|l| l.meta.refresh_expires_at)
             .map(|t| format!(" · exp. {}", fmt::duration(t - now)))
             .unwrap_or_default();
+        // Where the login already is: a login may serve several seats.
+        let (login, seat) = match &p.what {
+            PickFor::Seat(s) => (item.as_str(), s.as_str()),
+            PickFor::Login(l) => (l.as_str(), item.as_str()),
+        };
+        let l = app.vault.logins.iter().find(|x| x.label == login);
+        let seat_id = app
+            .analytics
+            .seats
+            .iter()
+            .find(|x| x.label == seat)
+            .map(|x| &x.id);
+        let quota = l.is_none_or(|x| x.harness.supports_limits());
+        let where_ = match &p.what {
+            PickFor::Seat(_) => {
+                let others: Vec<String> = l
+                    .map(|x| {
+                        x.mounted
+                            .iter()
+                            .filter(|id| Some(*id) != seat_id)
+                            .filter_map(|id| app.analytics.seats.iter().find(|s| &s.id == id))
+                            .map(|s| s.label.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if others.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · also in {}", others.join(", "))
+                }
+            }
+            PickFor::Login(_) => {
+                if l.zip(seat_id).is_some_and(|(x, id)| x.is_in(id)) {
+                    " · has it".to_string()
+                } else {
+                    String::new()
+                }
+            }
+        };
         let mut sp = vec![
             Span::styled(if i == p.sel { "▸ " } else { "  " }, th.bold(th.accent)),
             Span::styled(fit(item, 20), th.bold(th.fg)),
             Span::styled(format!(" {}", fit(&acct, 22)), Style::new().fg(th.dim)),
             Span::raw(" "),
         ];
-        if five.is_none() && week.is_none() {
+        if !quota {
+            sp.push(Span::styled(
+                fit("no local quota", 26),
+                Style::new().fg(th.faint),
+            ));
+        } else if five.is_none() && week.is_none() {
             // Nothing known yet: say why instead of two "unknown" columns.
             sp.push(Span::styled(
                 fit("limit unknown until this login is used", 26),
@@ -122,7 +166,7 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
         }
         sp.push(Span::styled(
             format!(
-                "{}{expires}",
+                "{}{where_}{expires}",
                 reset.map(|r| fmt::duration(r - now)).unwrap_or_default()
             ),
             Style::new().fg(th.dim),

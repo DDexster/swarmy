@@ -9,6 +9,7 @@ use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::claude::project::Alias;
+use crate::core::harness::Harness;
 use crate::core::pricing::{PriceBook, RateOverrides, Rates};
 use crate::errors::ConfigError;
 
@@ -81,6 +82,8 @@ pub struct Config {
     pub theme: Option<ThemeName>,
     /// How long per-request detail is kept, and the size the index may grow to.
     pub storage: StorageConf,
+    /// Harnesses to skip during auto-discovery (e.g. `disabled_harnesses = ["agy"]`).
+    pub disabled_harnesses: Vec<Harness>,
 }
 
 /// The dashboard's colour themes, by the name `config.toml` and `:theme` use.
@@ -165,6 +168,9 @@ impl Default for StorageConf {
 pub struct SeatConf {
     pub path: String,
     pub label: Option<String>,
+    /// Optional harness (`claude`, `agy`); auto-detected from the directory shape when omitted.
+    #[serde(default)]
+    pub harness: Option<Harness>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -207,8 +213,21 @@ impl Config {
     pub fn seat_paths(&self, home: &Path) -> Vec<(PathBuf, Option<String>)> {
         self.seat
             .iter()
+            .filter(|s| s.harness.is_none_or(|h| h == Harness::Claude))
             .map(|s| (expand_home(&s.path, home), s.label.clone()))
             .collect()
+    }
+
+    /// Configured seats with their explicit harness (when set).
+    pub fn seat_entries(&self, home: &Path) -> Vec<(PathBuf, Option<String>, Option<Harness>)> {
+        self.seat
+            .iter()
+            .map(|s| (expand_home(&s.path, home), s.label.clone(), s.harness))
+            .collect()
+    }
+
+    pub fn harness_enabled(&self, h: Harness) -> bool {
+        !self.disabled_harnesses.contains(&h)
     }
 
     /// Rules TOML cannot express: prices are finite and not negative.

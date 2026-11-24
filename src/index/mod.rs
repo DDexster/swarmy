@@ -8,6 +8,9 @@
 #[cfg(test)]
 mod account_scenarios;
 mod accounts;
+#[cfg(test)]
+mod agy_scenarios;
+pub mod agy_summaries;
 pub mod archive;
 #[cfg(test)]
 pub(crate) mod archive_scenarios;
@@ -28,6 +31,7 @@ pub mod schema;
 mod seat_scenarios;
 pub(crate) mod seats;
 mod settled;
+mod source;
 pub mod storage;
 mod write;
 
@@ -41,10 +45,11 @@ use rayon::prelude::*;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::claude::config_json::{Account, Utilization};
-use crate::claude::files::{self, FileKind, TranscriptFile};
+use crate::claude::files::TranscriptFile;
 use crate::claude::project::Resolver;
 use crate::claude::seats::{Seat, SeatId};
 use crate::claude::transcript;
+use crate::core::harness::Harness;
 use crate::core::pricing::PriceBook;
 
 /// The account of a request (review H1). The transcripts say which account a request used:
@@ -65,13 +70,13 @@ pub struct Index {
     conn: Connection,
     /// Session dirs listed by the hot refresh, with their modification time: a dir is listed
     /// again only when a file was added to it.
-    session_dirs: HashMap<(SeatId, String), ListedDirs>,
+    session_dirs: HashMap<(SeatId, String), source::ListedDirs>,
     /// The last price book dated by `dated_prices`, by the fingerprint of the undated one.
     dated: Option<(String, PriceBook)>,
     /// Settled spend already summed (`query::settled_total`).
     settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
-    /// The seats (id, label) last named in the `seats` table (`seats::adopt_seats`).
-    adopted: Option<Vec<(SeatId, String)>>,
+    /// The seats (id, label, harness) last named in the `seats` table (`seats::adopt_seats`).
+    adopted: Option<Vec<(SeatId, String, Harness)>>,
     /// The (seat, account) pairs and known accounts last checked for legacy bare-uuid migration
     /// (`accounts::adopt_accounts`).
     adopted_accounts: Option<AdoptedAccounts>,
@@ -170,12 +175,6 @@ type Known = (u64, u64, u64, Option<String>, i64);
 /// Up to this many files (the hot refresh), `plan` looks each one up by its path instead of
 /// loading the whole `files` table.
 const KNOWN_BY_PATH: usize = 512;
-
-/// The dirs a session's files were listed from (with their mtimes), and the files.
-type ListedDirs = (
-    Vec<(std::path::PathBuf, Option<std::time::SystemTime>)>,
-    Vec<TranscriptFile>,
-);
 
 // Seat ids are stored as their text (`core` knows nothing of SQLite).
 impl rusqlite::ToSql for SeatId {
@@ -422,7 +421,7 @@ impl Index {
         prices: &PriceBook,
         progress: &mut dyn FnMut(Progress),
     ) -> anyhow::Result<RefreshStats> {
-        let all: Vec<TranscriptFile> = seats.iter().flat_map(files::list).collect();
+        let all: Vec<TranscriptFile> = seats.iter().flat_map(source::list_seat_files).collect();
         self.refresh_files(all, seats, seat_info, resolver, prices, progress)
     }
 
@@ -437,77 +436,17 @@ impl Index {
         prices: &PriceBook,
     ) -> anyhow::Result<RefreshStats> {
         let since = Utc::now().timestamp() - 1800;
-        let mut out: Vec<TranscriptFile> = Vec::new();
-        {
-            let mut st = self.conn.prepare(
-                "SELECT path, seat, session_id, agent_id, kind FROM files WHERE mtime >= ?1",
-            )?;
-            let rows = st.query_map([since], |r| {
-                let kind: String = r.get(4)?;
-                Ok(TranscriptFile {
-                    path: std::path::PathBuf::from(r.get::<_, String>(0)?),
-                    seat: r.get(1)?,
-                    session_id: r.get(2)?,
-                    agent_id: r.get(3)?,
-                    kind: match kind.as_str() {
-                        "main" => FileKind::Main,
-                        "subagent" => FileKind::Subagent,
-                        _ => FileKind::Workflow(String::new()),
-                    },
-                })
-            })?;
-            for r in rows {
-                out.push(r?);
-            }
-        }
+        let mut out = source::recent_files(&self.conn, seats, since)?;
         for (seat_id, sid) in live {
             let Some(seat) = seats.iter().find(|s| &s.id == seat_id) else {
                 continue;
             };
-            out.extend(self.session_files(seat, sid));
+            out.extend(source::session_files(&mut self.session_dirs, seat, sid));
         }
         let mut seen = std::collections::HashSet::new();
         out.retain(|f| seen.insert(f.path.clone()));
         let mut quiet = |_p: Progress| {};
         self.refresh_files(out, seats, seat_info, resolver, prices, &mut quiet)
-    }
-
-    /// The files of a live session, listed again only when one of its dirs changed.
-    fn session_files(&mut self, seat: &Seat, sid: &str) -> Vec<TranscriptFile> {
-        let key = (seat.id.clone(), sid.to_string());
-        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        if let Some((dirs, cached)) = self.session_dirs.get(&key)
-            && !dirs.is_empty()
-            && dirs.iter().all(|(d, t)| mtime(d) == *t)
-        {
-            return cached.clone();
-        }
-        let list = files::list_session(seat, sid);
-        // Watch the dirs that hold these files (main dir, subagents, workflow runs).
-        let mut dirs: Vec<std::path::PathBuf> = list
-            .iter()
-            .filter_map(|f| f.path.parent().map(|p| p.to_path_buf()))
-            .collect();
-        // Also dirs that may not exist yet: creating them is how a first subagent shows up.
-        for f in list.iter().filter(|f| f.kind == FileKind::Main) {
-            if let Some(pdir) = f.path.parent() {
-                let base = pdir.join(sid);
-                dirs.push(base.join("subagents").join("workflows"));
-                dirs.push(base.join("subagents"));
-                dirs.push(base);
-            }
-        }
-        dirs.sort();
-        dirs.dedup();
-        let stamped = dirs
-            .into_iter()
-            .map(|d| {
-                let t = mtime(&d);
-                (d, t)
-            })
-            .collect();
-        self.session_dirs.insert(key, (stamped, list.clone()));
-        list
     }
 
     fn refresh_files(
@@ -680,12 +619,12 @@ impl Index {
             let mut parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
                 batch
                     .iter()
-                    .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
+                    .map(|w| (w, source::read_transcript_chunk(&w.file, w.start)))
                     .collect()
             } else {
                 batch
                     .par_iter()
-                    .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
+                    .map(|w| (w, source::read_transcript_chunk(&w.file, w.start)))
                     .collect()
             };
             // Owner records without an organization take the one they must be in.

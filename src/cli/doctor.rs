@@ -1,7 +1,8 @@
 //! `swarmy doctor`: what was found, what is readable, what looks off.
 
-use crate::claude::registry::{self, SessionStatus};
+use crate::claude::registry::{self, LiveSession, SessionStatus};
 use crate::claude::transcript::ParseStats;
+use crate::core::harness::Harness;
 use crate::core::period::Period;
 use crate::index::query::{Counted, Filter};
 use crate::ui::fmt;
@@ -17,15 +18,12 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let warn = |s: &str| format!("{} {s}", p.paint("[WARN]", Tone::Warn));
     let info = |s: &str| format!("{} {s}", p.paint("[ .. ]", Tone::Dim));
 
-    println!(
-        "{}",
-        p.paint("SEATS (Claude Code config dirs)", Tone::Header)
-    );
+    println!("{}", p.paint("SEATS (config/data dirs)", Tone::Header));
     if ctx.seats.is_empty() {
         println!(
             "{}",
             warn(
-                "no Claude Code config dir found (looked for ~/.claude and ~/.claude-*; add [[seat]] to config.toml)"
+                "no agent config dir found (looked for ~/.claude*, ~/.gemini/antigravity-cli; add [[seat]] to config.toml)"
             )
         );
     }
@@ -33,17 +31,35 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     for problem in &ctx.problems {
         println!("{}", warn(problem));
     }
+    let mut agy_cache = crate::agy::live::AgyLiveCache::default();
+    let mut live_by_seat: std::collections::HashMap<crate::core::ids::SeatId, Vec<LiveSession>> =
+        Default::default();
+    for s in &ctx.seats {
+        let sessions = match s.harness {
+            Harness::Claude => registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs),
+            Harness::Agy => {
+                let locked = agy_cache.locked_conversations(&s.dir);
+                agy_cache.resolve_procs(&s.dir, &locked);
+                let metas = crate::index::agy_summaries::read_all(&s.dir);
+                crate::agy::live::build_live_sessions(
+                    &s.id, &locked, &metas, &agy_cache, &ctx.procs, ctx.now,
+                )
+            }
+        };
+        live_by_seat.insert(s.id.clone(), sessions);
+    }
     let mut t = Table::new(&[
         ("SEAT", Align::Left),
+        ("HARNESS", Align::Left),
         ("DIR", Align::Left),
         ("ACCOUNT", Align::Left),
         ("PLAN", Align::Left),
         ("LIVE", Align::Right),
         ("FOUND BY", Align::Left),
     ]);
-    t.flex_col = 1;
+    t.flex_col = 2;
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
-        let live = registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs);
+        let live_n = live_by_seat.get(&s.id).map_or(0, Vec::len);
         let acct = si
             .account
             .as_ref()
@@ -56,44 +72,53 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             .unwrap_or_default();
         t.row(vec![
             Cell::tone(&s.label, Tone::Bold),
+            Cell::tone(s.harness.key(), Tone::Dim),
             Cell::new(ctx.show_path(&s.dir.to_string_lossy())),
             Cell::new(acct),
             Cell::tone(plan, Tone::Dim),
-            Cell::new(live.len().to_string()),
+            Cell::new(live_n.to_string()),
             Cell::tone(s.found_by.join(", "), Tone::Dim),
         ]);
     }
     println!("{}", t.render(p));
 
-    // The optional status line: exact limits after every response.
+    // The optional status line: exact limits after every response (Claude Code seats).
+    let claude_seats = ctx
+        .seats
+        .iter()
+        .filter(|s| s.harness.supports_statusline())
+        .count();
     let with: Vec<&str> = ctx
         .seats
         .iter()
         .filter(|s| {
-            matches!(
-                super::setup::seat_status_line(s),
-                super::setup::StatusLine::Swarmy { .. }
-            )
+            s.harness.supports_statusline()
+                && matches!(
+                    super::setup::seat_status_line(s),
+                    super::setup::StatusLine::Swarmy { .. }
+                )
         })
         .map(|s| s.label.as_str())
         .collect();
-    println!();
-    if with.is_empty() {
-        println!(
-            "{}",
-            p.paint(
-                "limits come from Claude Code's cached readings (≈ between them); optional: `swarmy setup` adds a status line for exact ones",
-                Tone::Dim
-            )
-        );
-    } else {
-        println!(
-            "{}",
-            ok(&format!(
-                "swarmy status line in: {} (exact limits after every response)",
-                with.join(", ")
-            ))
-        );
+    if claude_seats > 0 {
+        println!();
+        if with.is_empty() {
+            println!(
+                "{}",
+                p.paint(
+                    "limits come from Claude Code's cached readings (≈ between them); optional: `swarmy setup` adds a status line for exact ones",
+                    Tone::Dim
+                )
+            );
+        } else {
+            println!(
+                "{}",
+                ok(&format!(
+                    "swarmy status line in: {} (exact limits after every response)",
+                    with.join(", ")
+                ))
+            );
+        }
     }
 
     // Accounts shared by several seats share one limit.
@@ -132,7 +157,11 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     println!("{}", p.paint("LIVE SESSIONS", Tone::Header));
     let mut any = false;
     for s in &ctx.seats {
-        for l in registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs) {
+        let sessions = match live_by_seat.get(&s.id) {
+            Some(v) => v.as_slice(),
+            None => &[],
+        };
+        for l in sessions {
             any = true;
             let (st, tone) = match &l.status {
                 SessionStatus::Busy => ("busy".to_string(), Tone::Good),
@@ -140,23 +169,33 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 SessionStatus::Waiting(w) => (format!("NEEDS YOU: {w}"), Tone::Warn),
                 SessionStatus::Other(o) => (o.clone(), Tone::Plain),
             };
+            let ver = match l.version.as_deref() {
+                Some(v) if !v.is_empty() => format!(" · v{v}"),
+                Some(_) | None => String::new(),
+            };
+            let pid_s = if l.pid > 0 {
+                format!("pid {} · ", l.pid)
+            } else {
+                String::new()
+            };
+            let raw_name = l
+                .name
+                .clone()
+                .unwrap_or_else(|| l.session_id.short().to_string());
+            let name = if raw_name.chars().count() > 24 {
+                let mut t: String = raw_name.chars().take(23).collect();
+                t.push('…');
+                t
+            } else {
+                raw_name
+            };
             println!(
-                "  {} {:<16} {:<10} {} {}",
+                "  {} {:<24} {:<10} {} {}",
                 p.paint("●", tone),
-                l.name
-                    .clone()
-                    .unwrap_or_else(|| l.session_id.short().to_string()),
+                name,
                 s.label,
                 p.paint(&st, tone),
-                p.paint(
-                    &format!(
-                        "pid {} · {} · v{}",
-                        l.pid,
-                        ctx.show_path(&l.cwd),
-                        l.version.clone().unwrap_or_default()
-                    ),
-                    Tone::Dim
-                )
+                p.paint(&format!("{pid_s}{}{ver}", ctx.show_path(&l.cwd)), Tone::Dim)
             );
         }
     }
@@ -242,7 +281,11 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
             ))
         );
     }
-    let unknown = ps.unknown_types();
+    let unknown: Vec<(&str, u64)> = ps
+        .unknown_types()
+        .into_iter()
+        .filter(|(t, _)| !crate::agy::transcript::KNOWN_TYPES.contains(t))
+        .collect();
     if unknown.is_empty() {
         println!("{}", ok("every transcript record type is recognised"));
     } else {

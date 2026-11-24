@@ -15,7 +15,7 @@ pub fn system(f: &mut Frame, app: &mut App, area: Rect) {
         app,
         Panel::System,
         area,
-        "Claude Code processes and resources",
+        "Agent processes and resources",
         false,
     );
     let app: &App = app;
@@ -25,9 +25,14 @@ pub fn system(f: &mut Frame, app: &mut App, area: Rect) {
     let hb = crate::ui::fmt::human_bytes;
     let mut lines = Vec::new();
     for (seat, name, pid, cpu, mem, kids) in &app.system.instances {
+        let pid_s = if *pid > 0 {
+            format!(" · pid {pid}")
+        } else {
+            String::new()
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("● {name}"), th.bold(th.fg)),
-            Span::styled(format!("  {seat} · pid {pid}"), dim(app)),
+            Span::styled(format!("  {seat}{pid_s}"), dim(app)),
             Span::styled(
                 format!("  cpu {cpu:.0}% · {}", hb(*mem)),
                 Style::new().fg(if *cpu > 200.0 { th.warn } else { th.accent }),

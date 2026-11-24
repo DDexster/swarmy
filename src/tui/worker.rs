@@ -16,6 +16,7 @@ use super::{Msg, SystemView, Wants, debug, lock};
 use crate::app::context::Ctx;
 use crate::claude::procs::ProcTable;
 use crate::claude::registry::{self, LiveSession};
+use crate::core::harness::Harness;
 use crate::core::period::Period;
 use crate::index::compact::{self, CompactOpts};
 use crate::index::query::{Dim, Filter};
@@ -92,6 +93,7 @@ pub(super) fn worker(
     let mut prev_analytics: Option<super::Analytics> = None;
     let mut fleet_last: Option<crate::fleet::Fleet> = None;
     let mut slow: Option<SlowParts> = None;
+    let mut agy_live = crate::agy::live::AgyLiveCache::default();
     loop {
         let tick_start = Instant::now();
         let mut marks: Vec<(&str, Instant)> = Vec::new();
@@ -103,11 +105,13 @@ pub(super) fn worker(
                 ctx.procs = ProcTable::snapshot_with_cpu(s);
                 jobs.done(Job::SystemProcs);
             } else if !want_system || jobs.due(Job::SystemProcs) {
-                let pids: Vec<u32> = ctx
+                let mut pids: Vec<u32> = ctx
                     .seats
                     .iter()
+                    .filter(|st| st.harness == Harness::Claude)
                     .flat_map(|st| registry::session_pids(&st.sessions_dir()))
                     .collect();
+                pids.extend(agy_live.tracked_pids());
                 ctx.procs = ProcTable::for_pids(s, &pids);
             }
         }
@@ -142,11 +146,28 @@ pub(super) fn worker(
         marks.push(("seatinfo", Instant::now()));
         let dbg = debug();
         let t0 = Instant::now();
-        let live_sessions: Vec<LiveSession> = ctx
-            .seats
-            .iter()
-            .flat_map(|s| registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs))
-            .collect();
+        let mut live_sessions: Vec<LiveSession> = Vec::new();
+        for s in &ctx.seats {
+            match s.harness {
+                Harness::Claude => {
+                    live_sessions.extend(registry::live_sessions(
+                        &s.id,
+                        &s.sessions_dir(),
+                        &ctx.procs,
+                    ));
+                }
+                Harness::Agy => {
+                    let locked = agy_live.locked_conversations(&s.dir);
+                    if !locked.is_empty() {
+                        agy_live.resolve_procs(&s.dir, &locked);
+                        let metas = crate::index::agy_summaries::read_all(&s.dir);
+                        live_sessions.extend(crate::agy::live::build_live_sessions(
+                            &s.id, &locked, &metas, &agy_live, &ctx.procs, ctx.now,
+                        ));
+                    }
+                }
+            }
+        }
         let full_refresh = jobs.due(Job::FullRefresh);
         let res = if full_refresh {
             jobs.done(Job::FullRefresh);
@@ -302,7 +323,10 @@ pub(super) fn worker(
                 disk_cache = ctx
                     .seats
                     .iter()
-                    .map(|s| (s.label.clone(), dir_size(&s.projects_dir())))
+                    .map(|s| {
+                        let bytes: u64 = s.disk_dirs().iter().map(|d| dir_size(d)).sum();
+                        (s.label.clone(), bytes)
+                    })
                     .collect();
                 match outlook(&ctx, &idx) {
                     Ok(o) => storage_cache = Some(o),
@@ -333,6 +357,7 @@ pub(super) fn worker(
                 idx: &idx,
                 wants: &w,
                 jobs: &jobs,
+                live: &live_sessions,
                 disk: &disk_cache,
                 storage: storage_cache,
                 slow: slow.clone(),
@@ -537,6 +562,9 @@ fn fleet_of(
     }
     f.needs_you.sort_by_key(|n| n.since);
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
+        if !s.harness.supports_limits() {
+            continue;
+        }
         let Some(acct) = si.account.as_ref().map(|a| a.id().to_string()) else {
             continue;
         };
@@ -585,20 +613,27 @@ fn statusline_stamp(ctx: &Ctx) -> Vec<Option<std::time::SystemTime>> {
 fn system_view(ctx: &Ctx, live: &[LiveSession], sys: Option<&sysinfo::System>) -> SystemView {
     let mut v = SystemView::default();
     for l in live {
-        let (cpu, mem) = ctx.procs.tree_usage(l.pid);
-        let mut kids: Vec<(String, f32, u64)> = ctx
-            .procs
-            .descendants(l.pid)
-            .into_iter()
-            .map(|n| {
-                let cmd = if n.cmd.is_empty() {
-                    n.name.clone()
-                } else {
-                    n.cmd.clone()
-                };
-                (cmd, n.cpu, n.memory)
-            })
-            .collect();
+        let (cpu, mem) = if l.pid > 0 {
+            ctx.procs.tree_usage(l.pid)
+        } else {
+            (0.0, 0)
+        };
+        let mut kids: Vec<(String, f32, u64)> = if l.pid > 0 {
+            ctx.procs
+                .descendants(l.pid)
+                .into_iter()
+                .map(|n| {
+                    let cmd = if n.cmd.is_empty() {
+                        n.name.clone()
+                    } else {
+                        n.cmd.clone()
+                    };
+                    (cmd, n.cpu, n.memory)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         kids.sort_by(|a, b| b.1.total_cmp(&a.1).then(b.2.cmp(&a.2)));
         kids.truncate(6);
         let seat = ctx
@@ -606,8 +641,13 @@ fn system_view(ctx: &Ctx, live: &[LiveSession], sys: Option<&sysinfo::System>) -
             .iter()
             .find(|s| s.id == l.seat)
             .map_or_else(|| l.seat.to_string(), |s| s.label.clone());
+        let seat_disp = if l.harness == Harness::Claude {
+            seat
+        } else {
+            format!("{seat} [{}]", l.harness.short())
+        };
         v.instances.push((
-            seat,
+            seat_disp,
             l.name
                 .clone()
                 .unwrap_or_else(|| l.session_id.short().to_string()),

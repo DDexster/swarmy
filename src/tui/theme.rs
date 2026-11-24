@@ -34,6 +34,8 @@ pub struct Theme {
     pub opus: Color,
     pub sonnet: Color,
     pub haiku: Color,
+    pub gemini: Color,
+    pub gpt: Color,
     pub other: Color,
     pub animate: bool,
 }
@@ -59,6 +61,8 @@ const OPS: Theme = Theme {
     opus: Color::Rgb(255, 140, 66),
     sonnet: Color::Rgb(98, 160, 234),
     haiku: Color::Rgb(64, 224, 208),
+    gemini: Color::Rgb(236, 112, 200),
+    gpt: Color::Rgb(245, 169, 184),
     other: Color::Rgb(160, 160, 160),
     animate: true,
 };
@@ -84,6 +88,8 @@ const PHOSPHOR: Theme = Theme {
     opus: Color::Rgb(150, 255, 150),
     sonnet: Color::Rgb(100, 220, 120),
     haiku: Color::Rgb(70, 190, 100),
+    gemini: Color::Rgb(140, 255, 190),
+    gpt: Color::Rgb(180, 240, 160),
     other: Color::Rgb(60, 160, 80),
     animate: true,
 };
@@ -109,6 +115,8 @@ const AMBER: Theme = Theme {
     opus: Color::Rgb(255, 180, 80),
     sonnet: Color::Rgb(220, 150, 60),
     haiku: Color::Rgb(190, 130, 50),
+    gemini: Color::Rgb(235, 210, 120),
+    gpt: Color::Rgb(255, 160, 110),
     other: Color::Rgb(150, 100, 40),
     animate: true,
 };
@@ -134,6 +142,8 @@ const PLAIN: Theme = Theme {
     opus: Color::Yellow,
     sonnet: Color::Blue,
     haiku: Color::Cyan,
+    gemini: Color::LightMagenta,
+    gpt: Color::White,
     other: Color::Gray,
     animate: false,
 };
@@ -174,6 +184,8 @@ impl Theme {
             Family::Opus => self.opus,
             Family::Sonnet => self.sonnet,
             Family::Haiku => self.haiku,
+            Family::Gemini => self.gemini,
+            Family::Gpt => self.gpt,
             Family::Other => self.other,
         }
     }

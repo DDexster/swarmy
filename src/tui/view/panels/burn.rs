@@ -39,8 +39,29 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or_default();
     let today = fmt::usd(app.snapshot.today_cost);
     let period_cost = app.analytics.total.as_ref().map(|t| fmt::usd(t.cost));
-    // The left column fits the big number and both captions, so the chart never covers them.
-    let labels_w = (6 + w(&today)).max(
+    // Today by harness, when more than one runs here (`cc $98 · agy $22`).
+    let split = if app.multi_harness() {
+        crate::core::harness::Harness::ALL
+            .iter()
+            .filter_map(|h| {
+                let seats: Vec<_> = app
+                    .analytics
+                    .seats
+                    .iter()
+                    .filter(|s| s.harness == *h)
+                    .collect();
+                (!seats.is_empty()).then(|| {
+                    let c: f64 = seats.iter().map(|s| s.today_cost).sum();
+                    format!("{} {}", h.short(), fmt::usd(c))
+                })
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    } else {
+        String::new()
+    };
+    // The left column fits the big number and all captions, so the chart never covers them.
+    let labels_w = (6 + w(&today)).max(w(&split)).max(
         period_cost
             .as_ref()
             .map_or(0, |c| w(&period_label) + 1 + w(c)),
@@ -63,6 +84,9 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("today ", faint(app)),
             Span::styled(today, th.bold(th.fg)),
         ]));
+        if !split.is_empty() {
+            lines.push(Line::from(Span::styled(split.clone(), faint(app))));
+        }
         if let Some(c) = period_cost {
             lines.push(Line::from(vec![
                 Span::styled(format!("{period_label} "), faint(app)),
@@ -96,7 +120,9 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
             ..chart_area
         },
     ];
-    let fams = ["fable", "mythos", "opus", "sonnet", "haiku", "other"];
+    let fams = [
+        "fable", "mythos", "opus", "sonnet", "haiku", "gemini", "gpt", "other",
+    ];
     let burn = &app.snapshot.burn;
     let mut totals = vec![0.0f64; 60];
     for s in burn.values() {
@@ -132,7 +158,7 @@ pub fn burn(f: &mut Frame, app: &mut App, area: Rect) {
         });
     f.render_widget(canvas, chart);
     let mut spans = Vec::new();
-    for n in ["fable", "opus", "sonnet", "haiku"] {
+    for n in ["fable", "opus", "sonnet", "haiku", "gemini", "gpt"] {
         if burn.contains_key(n) {
             spans.push(Span::styled(
                 format!("■ {n}  "),

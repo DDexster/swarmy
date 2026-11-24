@@ -32,10 +32,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
     let agents = app.visible_agents();
     if agents.is_empty() {
         let lines: Vec<Line> = if app.snapshot.taken_at.is_none() {
-            vec![Line::from(Span::styled(
-                "reading Claude Code's files…",
-                dim(app),
-            ))]
+            vec![Line::from(Span::styled("reading transcripts…", dim(app)))]
         } else if app.filter.as_deref().is_some_and(|f| !f.is_empty()) {
             vec![Line::from(Span::styled(
                 "no agent matches the filter · Esc clears it",
@@ -49,7 +46,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "start `claude` in any seat and it shows up here within a second",
+                    "start `claude` or `agy` in any seat and it shows up here within a second",
                     faint(app),
                 )),
                 Line::from(Span::styled(
@@ -62,6 +59,8 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let width = inner.width as usize;
+    let show_har = app.multi_harness();
+    let har_w: usize = if show_har { 4 } else { 0 };
     let tree_w = |d: u32| if d == 0 { 0 } else { 2 * d as usize };
     let longest = agents
         .iter()
@@ -85,6 +84,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
     let extra = width >= 210;
     let (reqs_w, age_w) = if extra { (7usize, 8usize) } else { (0, 0) };
     let fixed = 3
+        + har_w
         + 1
         + model_w
         + 1
@@ -102,7 +102,12 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         act_w = width.saturating_sub(fixed + name_w).max(8);
     }
     let mut header = format!(
-        "   {} {} {} {}",
+        "   {}{} {} {} {}",
+        if show_har {
+            fit("HAR", har_w)
+        } else {
+            String::new()
+        },
         fit("AGENT", name_w),
         fit("MODEL", model_w),
         fit("ACTIVITY", act_w),
@@ -213,10 +218,20 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
             State::Tool { .. } => Style::new().fg(th.fg),
             s => Style::new().fg(th.state(s)),
         };
-        let mut spans = vec![
-            Span::styled(format!("{g}  "), Style::new().fg(gc)),
-            Span::styled(tree.clone(), Style::new().fg(th.faint)),
-        ];
+        let mut spans = vec![Span::styled(format!("{g}  "), Style::new().fg(gc))];
+        if show_har {
+            if a.is_main() {
+                // The harness is a fact about the session, not a model: plain text, no colour.
+                let hc = if quiet { th.faint } else { th.dim };
+                spans.push(Span::styled(
+                    fit(a.harness.short(), har_w),
+                    Style::new().fg(hc),
+                ));
+            } else {
+                spans.push(Span::raw(" ".repeat(har_w)));
+            }
+        }
+        spans.push(Span::styled(tree.clone(), Style::new().fg(th.faint)));
         // A session row: its name, then the project in the directory colour.
         let nw = name_w.saturating_sub(w(&tree));
         if a.is_main() {
@@ -297,14 +312,26 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                 dim(app),
             ));
         }
-        let cost = if a.is_main() {
+        let unpriced = a.unpriced
+            && if a.is_main() {
+                a.session_cost == 0.0
+            } else {
+                a.cost == 0.0
+            };
+        let cost = if unpriced {
+            "—".to_string()
+        } else if a.is_main() {
             format!("Σ{}", fmt::usd(a.session_cost))
         } else {
             fmt::usd(a.cost)
         };
         spans.push(Span::styled(
             format!(" {}", fit_right(&cost, cost_w)),
-            th.bold(if quiet { th.dim } else { th.fg }),
+            if unpriced || quiet {
+                Style::new().fg(th.dim)
+            } else {
+                th.bold(th.fg)
+            },
         ));
         let mut line = Line::from(spans);
         let alert = app.alerts.get(&a.key()).map(|t| t.elapsed().as_secs_f32());

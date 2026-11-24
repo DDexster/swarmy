@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{OptionalExtension, params};
 
 use super::{Index, ms, settled};
+use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
 use crate::core::period::Span;
 
@@ -17,6 +18,7 @@ pub struct AgentRow {
     pub seat: SeatId,
     /// The seat's label, for display (`seats`).
     pub seat_label: String,
+    pub harness: Harness,
     pub session_id: SessionId,
     pub agent_id: String,
     pub kind: String,
@@ -53,6 +55,8 @@ pub struct LastRequest {
     /// Prompt size: input plus cache writes and reads.
     pub context_tokens: Option<i64>,
     pub account: Option<String>,
+    /// `Some(1)` when priced, `Some(0)` when the model has no known price, `None` before pricing.
+    pub priced: Option<i64>,
 }
 
 /// A tool call that has not finished.
@@ -134,11 +138,13 @@ impl Index {
             () => {
                 "SELECT a.seat, a.session_id, a.agent_id, a.kind, a.agent_type, a.description, a.parent_agent_id, a.depth,
                     a.requested_model, a.effort, a.finished, a.last_ts, COALESCE(s.title, s.ai_title), s.cwd, a.first_ts,
-                    COALESCE((SELECT st.label FROM seats st WHERE st.seat = a.seat), a.seat)
+                    COALESCE((SELECT st.label FROM seats st WHERE st.seat = a.seat), a.seat),
+                    COALESCE((SELECT st.harness FROM seats st WHERE st.seat = a.seat), 'claude')
              FROM agents a LEFT JOIN sessions s ON s.seat = a.seat AND s.session_id = a.session_id"
             };
         }
         let row = |r: &rusqlite::Row| {
+            let h_raw: String = r.get(16)?;
             Ok(AgentRow {
                 seat: r.get(0)?,
                 session_id: r.get(1)?,
@@ -156,6 +162,7 @@ impl Index {
                 cwd: r.get(13)?,
                 first_ts: r.get(14)?,
                 seat_label: r.get(15)?,
+                harness: Harness::from_key(&h_raw).unwrap_or(Harness::Claude),
             })
         };
         let mut out: Vec<AgentRow> = self
@@ -196,8 +203,9 @@ impl Index {
 
     pub fn last_request(&self, a: AgentKey) -> anyhow::Result<Option<LastRequest>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid FROM requests
-             WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 ORDER BY ts DESC LIMIT 1",
+            "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid, priced FROM requests
+             WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND model != '<synthetic>'
+             ORDER BY ts DESC LIMIT 1",
         )?;
         Ok(st
             .query_row(params![a.seat, a.session_id, a.agent_id], |x| {
@@ -207,6 +215,7 @@ impl Index {
                     ts: x.get(2)?,
                     context_tokens: x.get(3)?,
                     account: x.get(4)?,
+                    priced: x.get(5)?,
                 })
             })
             .optional()?)
@@ -219,8 +228,7 @@ impl Index {
             rolled!(),
             "), 0), TOTAL(cost) + COALESCE((SELECT cost ",
             rolled!(),
-            "), 0)
-             FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3"
+            "), 0) FROM requests WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3"
         ))?;
         let (n, cost): (i64, f64) = st
             .query_row(params![a.seat, a.session_id, a.agent_id], |x| {

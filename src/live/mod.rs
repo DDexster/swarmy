@@ -8,6 +8,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 
 use crate::claude::registry::LiveSession;
+use crate::core::harness::Harness;
 use crate::core::ids::{SeatId, SessionId};
 use crate::core::models::Family;
 use crate::core::tools::ToolClass;
@@ -22,6 +23,7 @@ pub struct Agent {
     pub seat: SeatId,
     /// The seat's label, for display only.
     pub seat_label: String,
+    pub harness: Harness,
     pub session_id: SessionId,
     /// Empty for the main thread.
     pub agent_id: String,
@@ -38,6 +40,8 @@ pub struct Agent {
     pub last_activity: DateTime<Utc>,
     pub cost: f64,
     pub requests: u64,
+    /// True when the agent has requests, zero priced cost, and its latest model has no known price.
+    pub unpriced: bool,
     /// Prompt size of the last request: how full the context is.
     pub context_tokens: u64,
     /// USD per minute over the last 15 minutes.
@@ -188,6 +192,7 @@ pub fn build(
             rows.push(AgentRow {
                 seat: l.seat.clone(),
                 seat_label,
+                harness: l.harness,
                 session_id: l.session_id.clone(),
                 agent_id: String::new(),
                 kind: "main".into(),
@@ -256,6 +261,7 @@ pub fn build(
             spark,
             ..
         } = got;
+        let unpriced = requests > 0 && cost == 0.0 && last_req.priced == Some(0);
         let req_ts = last_req.ts;
         let last = [r.last_ts, req_ts, done_ts]
             .into_iter()
@@ -300,6 +306,7 @@ pub fn build(
         agents.push(Agent {
             seat: r.seat.clone(),
             seat_label: r.seat_label.clone(),
+            harness: live_session.map_or(r.harness, |l| l.harness),
             session_id: r.session_id.clone(),
             agent_id: r.agent_id.clone(),
             parent: if r.agent_id.is_empty() {
@@ -324,11 +331,12 @@ pub fn build(
             last_activity: last,
             cost,
             requests,
+            unpriced,
             context_tokens: last_req.context_tokens.unwrap_or(0).max(0) as u64,
             spark,
             lane: Vec::new(),
             pane: live_session.and_then(|l| l.pane.clone()),
-            pid: live_session.map(|l| l.pid),
+            pid: live_session.and_then(|l| (l.pid > 0).then_some(l.pid)),
             account: last_req.account,
             first_seen: r.first_ts.map(from_ms).unwrap_or(last),
             session_cost: 0.0,
@@ -635,6 +643,9 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
 pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let path = idx.transcript_path(key_of(a)).ok().flatten()?;
+    if a.harness == Harness::Agy {
+        return crate::agy::transcript::last_message(std::path::Path::new(&path));
+    }
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
     let start = len.saturating_sub(256 * 1024);
@@ -746,6 +757,7 @@ mod tests {
         Agent {
             seat: SeatId::from_stored("0123456789abcdef"),
             seat_label: "s".into(),
+            harness: Harness::Claude,
             session_id: SessionId::new("x"),
             agent_id: id.into(),
             parent: parent.map(str::to_string),
@@ -760,6 +772,7 @@ mod tests {
             last_activity: Utc::now(),
             cost: 0.0,
             requests: 0,
+            unpriced: false,
             context_tokens: 0,
             spark: vec![],
             pane: None,

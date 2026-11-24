@@ -1,7 +1,10 @@
-//! The login vault: saved Claude Code OAuth logins, and switching which one a seat uses.
+//! The login vault: saved OAuth logins of every harness (Claude Code, Antigravity), and switching
+//! which one a seat uses.
 //!
-//! A *login* is the `claudeAiOauth` object of a credentials file (an OAuth grant) plus facts
-//! about it, named by the fingerprint of its refresh token. A *seat* is a Claude Code config dir.
+//! A *login* is the secret object of a seat's credentials (Claude Code's `claudeAiOauth`, agy's
+//! whole `antigravity-oauth-token`; an OAuth grant) plus facts about it, named by the fingerprint
+//! of its refresh token. It belongs to one harness and only goes into seats of that harness. A
+//! *seat* is a harness's config dir; one login may be in several seats at once (`mounted`).
 //! Claude Code refreshes the access token every few hours and keeps the refresh token (verified
 //! on 2.1.329), so a saved copy's access token goes stale while the login is in use: the vault
 //! tracks which seat each login is mounted in and, before every change, takes the seat's
@@ -33,6 +36,7 @@ use serde_json::Value;
 use crate::claude::config_json;
 use crate::claude::credentials::{self, LoginMeta, Secret};
 use crate::claude::seats::{Seat, SeatId};
+use crate::core::harness::Harness;
 pub use crate::errors::VaultError;
 use store::{Secrets, atomic_write};
 
@@ -40,6 +44,9 @@ use store::{Secrets, atomic_write};
 pub struct Login {
     pub id: String,
     pub label: String,
+    /// The harness whose seats this login fits (logins saved before harnesses: Claude Code).
+    #[serde(default)]
+    pub harness: Harness,
     pub account_uuid: Option<String>,
     pub email: Option<String>,
     pub plan: Option<String>,
@@ -48,12 +55,33 @@ pub struct Login {
     pub oauth_account: Option<Value>,
     pub captured_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    /// The seat this login is currently written into.
-    pub mounted: Option<SeatId>,
+    /// The seats this login is currently written into (one grant may serve several seats).
+    /// `logins.json` before v4 held one seat or `null`; both still read.
+    #[serde(default, deserialize_with = "one_or_many")]
+    pub mounted: Vec<SeatId>,
     /// A seat label an older swarmy stored in `mounted`, not matched to a seat yet
     /// (`Index::adopt_seats`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mounted_label: Option<String>,
+}
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<SeatId>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        Many(Vec<SeatId>),
+        One(Option<SeatId>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::Many(v) => v,
+        OneOrMany::One(o) => o.into_iter().collect(),
+    })
+}
+
+impl Login {
+    pub fn is_in(&self, seat: &SeatId) -> bool {
+        self.mounted.contains(seat)
+    }
 }
 
 /// What a seat holds, as the vault sees it.
@@ -93,36 +121,105 @@ pub struct SeatLogin {
 }
 
 pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
-    let secret = match std::fs::read_to_string(seat.credentials_file()) {
-        Ok(t) => credentials::parse_login(&t)?,
+    let path = seat.credentials_file();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => Some(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if cfg!(target_os = "macos") {
-                return Err(VaultError::Keychain.into());
+            match seat.harness {
+                Harness::Claude if cfg!(target_os = "macos") => {
+                    return Err(VaultError::Keychain.into());
+                }
+                Harness::Agy if !cfg!(target_os = "linux") => {
+                    return Err(VaultError::Keyring(seat.harness.display_name().into()).into());
+                }
+                Harness::Claude | Harness::Agy => {}
             }
             None
         }
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("cannot read {}", seat.credentials_file().display()));
+            return Err(e).with_context(|| format!("cannot read {}", path.display()));
         }
     };
-    // A damaged `.claude.json` fails the read: saving a login without its account would label
-    // it wrongly later.
-    let cj = config_json::read_seat_file(&seat.claude_json)?;
-    let mut account = cj.account;
-    if let (Some(a), Some(sec)) = (account.as_mut(), secret.as_ref()) {
-        a.apply_credentials(&sec.meta());
-    }
-    let written_at = std::fs::metadata(seat.credentials_file())
+    let written_at = std::fs::metadata(&path)
         .ok()
         .and_then(|m| m.modified().ok())
         .map(DateTime::<Utc>::from);
-    Ok(SeatLogin {
-        secret,
-        written_at,
-        oauth_account: cj.oauth_account_raw,
-        account,
-    })
+    match seat.harness {
+        Harness::Claude => {
+            let secret = text
+                .as_deref()
+                .map(credentials::parse_login)
+                .transpose()?
+                .flatten();
+            // A damaged `.claude.json` fails the read: saving a login without its account would
+            // label it wrongly later.
+            let cj = config_json::read_seat_file(&seat.claude_json)?;
+            let mut account = cj.account;
+            if let (Some(a), Some(sec)) = (account.as_mut(), secret.as_ref()) {
+                a.apply_credentials(&sec.meta());
+            }
+            Ok(SeatLogin {
+                secret,
+                written_at,
+                oauth_account: cj.oauth_account_raw,
+                account,
+            })
+        }
+        Harness::Agy => {
+            let secret = text
+                .as_deref()
+                .map(crate::agy::credentials::parse_login)
+                .transpose()
+                .with_context(|| format!("{} is damaged", path.display()))?
+                .flatten();
+            // The token file names its own account: there is no separate profile.
+            let account = secret
+                .as_ref()
+                .and_then(|s| crate::agy::account::account_of(s.expose()));
+            Ok(SeatLogin {
+                secret,
+                written_at,
+                oauth_account: None,
+                account,
+            })
+        }
+    }
+}
+
+/// What to run for a new login of `h`, and what to do in it.
+pub fn new_login_recipe(h: Harness) -> (&'static str, &'static str) {
+    match h {
+        Harness::Claude => ("claude", "Run /login, choose the account, then /exit."),
+        Harness::Agy => ("agy", "Sign in with Google when agy asks, then quit agy."),
+    }
+}
+
+/// The process that makes a new login of `h` in the scratch dir `scratch`, and the seat the
+/// login lands in. Claude Code takes its config dir from `CLAUDE_CONFIG_DIR`; the agy CLI keys its
+/// dir on `HOME` (`$HOME/.gemini/antigravity-cli`; verified: it ignores
+/// `ANTIGRAVITY_APP_DATA_DIR` for its token and conversations), so it runs with `HOME=scratch`.
+pub fn new_login(h: Harness, label: &str, scratch: &Path) -> (std::process::Command, Seat) {
+    let (program, _) = new_login_recipe(h);
+    let mut cmd = std::process::Command::new(program);
+    let seat = match h {
+        Harness::Claude => {
+            cmd.env("CLAUDE_CONFIG_DIR", scratch);
+            Seat::new(
+                format!("scratch-{label}"),
+                scratch.to_path_buf(),
+                scratch.join(".claude.json"),
+                false,
+            )
+        }
+        Harness::Agy => {
+            cmd.env("HOME", scratch);
+            Seat::agy(
+                format!("scratch-{label}"),
+                scratch.join(".gemini").join("antigravity-cli"),
+            )
+        }
+    };
+    (cmd, seat)
 }
 
 /// The index as a reader sees it: labels an older version duplicated are told apart the way the
@@ -363,7 +460,16 @@ impl<'a> VaultTx<'a> {
     }
 
     fn secret(&self, id: &str) -> Option<Secret> {
-        self.secrets.get(id).cloned().map(Secret::new)
+        let harness = self
+            .index
+            .logins
+            .iter()
+            .find(|l| l.id == id)
+            .map_or(Harness::Claude, |l| l.harness);
+        self.secrets
+            .get(id)
+            .cloned()
+            .map(|v| Secret::of(harness, v))
     }
 
     fn set_secret(&mut self, id: &str, secret: &Secret) {
@@ -435,14 +541,18 @@ impl<'a> VaultTx<'a> {
         let account_id = account.map(|a| a.id().to_string());
         let logins = &self.index.logins;
         let existing = mounted_in
-            .and_then(|seat| logins.iter().find(|l| l.mounted.as_ref() == Some(seat)))
+            .and_then(|seat| {
+                logins
+                    .iter()
+                    .find(|l| l.is_in(seat) && l.harness == secret.harness())
+            })
             .filter(|l| {
                 account_id.is_none() || l.account_uuid.is_none() || l.account_uuid == account_id
             })
             .or_else(|| {
-                logins
-                    .iter()
-                    .find(|l| l.meta.fingerprint == meta.fingerprint)
+                logins.iter().find(|l| {
+                    l.harness == secret.harness() && l.meta.fingerprint == meta.fingerprint
+                })
             })
             .map(|l| l.id.clone());
         // An existing login keeps its label unless one is given; a new one gets a free one.
@@ -473,10 +583,6 @@ impl<'a> VaultTx<'a> {
                 if let Some(lb) = new_label {
                     l.label = lb;
                 }
-                if mounted_in.is_some() {
-                    l.mounted = mounted_in.cloned();
-                    l.mounted_label = None;
-                }
                 id
             }
             None => {
@@ -484,6 +590,7 @@ impl<'a> VaultTx<'a> {
                 self.index.logins.push(Login {
                     id: id.clone(),
                     label: new_label.context("a new login without a label")?,
+                    harness: secret.harness(),
                     account_uuid: account_id,
                     email: account.and_then(|a| a.email.clone()),
                     plan: account.and_then(|a| a.effective_tier()),
@@ -491,12 +598,15 @@ impl<'a> VaultTx<'a> {
                     oauth_account,
                     captured_at: now,
                     updated_at: now,
-                    mounted: mounted_in.cloned(),
+                    mounted: Vec::new(),
                     mounted_label: None,
                 });
                 id
             }
         };
+        if let Some(seat) = mounted_in {
+            self.mount(&id, seat);
+        }
         self.set_secret(&id, secret);
         Ok(id)
     }
@@ -556,11 +666,13 @@ impl<'a> VaultTx<'a> {
     /// Forgets a login. Its secret leaves the disk only after the index no longer lists it.
     pub fn remove(&mut self, key: &str, force: bool) -> anyhow::Result<Login> {
         let l = self.find(key).cloned()?;
-        let in_seat = l
+        let names: Vec<String> = l
             .mounted
-            .as_ref()
+            .iter()
             .map(|m| self.index.seat_name(m))
-            .or_else(|| l.mounted_label.clone());
+            .chain(l.mounted_label.clone())
+            .collect();
+        let in_seat = (!names.is_empty()).then(|| names.join(", "));
         if let Some(seat) = in_seat
             && !force
         {

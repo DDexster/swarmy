@@ -1,7 +1,9 @@
-//! The domain model: usage, prices, periods, limits, tool classes. Pure functions, no I/O.
+//! The domain model: usage, prices, periods, limits, tool classes, harnesses. Pure functions, no I/O.
 
+pub mod harness;
 pub mod ids;
 pub mod limits;
+pub mod login;
 pub mod models;
 pub mod pane;
 pub mod period;

@@ -3,12 +3,13 @@
 use super::*;
 
 const PERIODS: [&str; 4] = ["today", "7d", "30d", "all"];
-const GROUPS: [Dim; 6] = [
+const GROUPS: [Dim; 7] = [
     Dim::Project,
     Dim::Model,
     Dim::AgentType,
     Dim::Account,
     Dim::Seat,
+    Dim::Harness,
     Dim::Session,
 ];
 
@@ -405,10 +406,15 @@ impl App {
         &mut self,
         f: impl FnOnce(&mut VaultTx<'_>, &[Seat]) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        let seats = &self.seats;
+        let seats: Vec<Seat> = self
+            .seats
+            .iter()
+            .filter(|s| s.harness.supports_vault())
+            .cloned()
+            .collect();
         Vault::open(&self.vault_dir)?.edit(|tx| {
-            tx.sync(seats)?;
-            f(tx, seats)
+            tx.sync(&seats)?;
+            f(tx, &seats)
         })
     }
 }

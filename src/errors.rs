@@ -23,10 +23,13 @@ pub enum VaultError {
     LabelTaken(String),
     #[error("a label is needed")]
     LabelEmpty,
-    #[error(
-        "login '{login}' is in use in seat '{seat}'. One OAuth grant in two seats is refreshed by both, and if the server ever rotates or revokes its refresh token one of them is logged out. Log in separately there (`swarmy accounts add`), or pass --share to copy it anyway."
-    )]
-    SharedGrant { login: String, seat: String },
+    #[error("login '{login}' is a {login_harness} login; seat '{seat}' runs {seat_harness}")]
+    WrongHarness {
+        login: String,
+        login_harness: String,
+        seat: String,
+        seat_harness: String,
+    },
     #[error(
         "login '{login}' is in use in seat '{seat}'; pass --force to forget it anyway (the seat keeps working)"
     )]
@@ -35,6 +38,8 @@ pub enum VaultError {
     MissingSecret(String),
     #[error("on macOS Claude Code keeps the login in the Keychain; the vault cannot read it yet")]
     Keychain,
+    #[error("{0} keeps its login in the OS keyring here; the vault cannot read it")]
+    Keyring(String),
     #[error(
         "{} kept changing while swarmy tried to write it (Claude Code is writing it); nothing was overwritten, try again",
         .0.display()
@@ -117,10 +122,11 @@ impl Coded for VaultError {
             VaultError::AmbiguousLogin { .. } => "vault-ambiguous-login",
             VaultError::LabelTaken(_) => "vault-label-taken",
             VaultError::LabelEmpty => "vault-label-empty",
-            VaultError::SharedGrant { .. } => "vault-shared-grant",
+            VaultError::WrongHarness { .. } => "vault-wrong-harness",
             VaultError::InUse { .. } => "vault-in-use",
             VaultError::MissingSecret(_) => "vault-missing-secret",
             VaultError::Keychain => "vault-keychain",
+            VaultError::Keyring(_) => "vault-keyring",
             VaultError::SeatBusy(_) => "vault-seat-busy",
             VaultError::SwitchIncomplete { .. } => "vault-switch-incomplete",
         }
@@ -221,9 +227,11 @@ mod tests {
             .code(),
             VaultError::LabelTaken(String::new()).code(),
             VaultError::LabelEmpty.code(),
-            VaultError::SharedGrant {
+            VaultError::WrongHarness {
                 login: String::new(),
+                login_harness: String::new(),
                 seat: String::new(),
+                seat_harness: String::new(),
             }
             .code(),
             VaultError::InUse {
@@ -233,6 +241,7 @@ mod tests {
             .code(),
             VaultError::MissingSecret(String::new()).code(),
             VaultError::Keychain.code(),
+            VaultError::Keyring(String::new()).code(),
             VaultError::SeatBusy(PathBuf::new()).code(),
             VaultError::SwitchIncomplete {
                 seat: String::new(),

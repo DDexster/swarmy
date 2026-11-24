@@ -26,6 +26,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::claude::files::FileKind;
+use crate::core::harness::Harness;
 use crate::core::limits::WindowKind;
 
 /// Version of the raw tables; a change drops them and reads the transcripts again (never the
@@ -39,7 +40,7 @@ pub const CACHE_VERSION: &str = "6";
 const DIMENSIONS_SINCE: u32 = 6;
 
 /// Version of the fact tables; each step up has a migration in `migrate_facts`.
-pub const FACTS_VERSION: u32 = 3;
+pub const FACTS_VERSION: u32 = 4;
 
 /// Read from the transcripts row by row: dropped and read again when `CACHE_VERSION` changes.
 pub const RAW_TABLES: &[&str] = &[
@@ -102,6 +103,10 @@ pub fn window_kinds() -> String {
 
 pub fn file_kinds() -> String {
     in_list(&FileKind::TAGS)
+}
+
+pub fn harness_kinds() -> String {
+    in_list(&Harness::TAGS)
 }
 
 /// The parts of a request's cost (`core::pricing::CostParts`), stored next to `cost` so the
@@ -320,6 +325,7 @@ CREATE TABLE IF NOT EXISTS cost_states (
 
 pub fn facts_sql() -> String {
     let window_kinds = window_kinds();
+    let harnesses = harness_kinds();
     format!(
         r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -373,6 +379,7 @@ CREATE TABLE IF NOT EXISTS seats (
   seat TEXT PRIMARY KEY,
   label TEXT NOT NULL,
   dir TEXT,
+  harness TEXT NOT NULL DEFAULT 'claude' CHECK (harness IN ({harnesses})),
   seen_at INTEGER NOT NULL
 );
 "#
@@ -746,6 +753,13 @@ fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
     if version < 3 && !columns(conn, "accounts")?.iter().any(|c| c == "org_uuid") {
         conn.execute_batch("ALTER TABLE accounts ADD COLUMN org_uuid TEXT;")?;
     }
+    // 3 → 4: seats record which harness owns them (`claude`, `agy`, …); existing seats are claude.
+    if version < 4 && !columns(conn, "seats")?.iter().any(|c| c == "harness") {
+        conn.execute_batch(&format!(
+            "ALTER TABLE seats ADD COLUMN harness TEXT NOT NULL DEFAULT 'claude' CHECK (harness IN ({}));",
+            harness_kinds()
+        ))?;
+    }
     set_meta(conn, "facts_version", &FACTS_VERSION.to_string())?;
     Ok(())
 }
@@ -900,6 +914,45 @@ mod tests {
     }
 
     #[test]
+    fn facts_version_3_adds_harness_column_and_defaults_to_claude() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(
+            "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('facts_version', '3');
+             CREATE TABLE seat_accounts (seat TEXT NOT NULL, ts INTEGER NOT NULL, account_uuid TEXT NOT NULL, PRIMARY KEY (seat, ts));
+             CREATE TABLE accounts (account_uuid TEXT PRIMARY KEY, email TEXT, display_name TEXT, org_name TEXT, plan TEXT, tier TEXT, seen_at INTEGER);
+             CREATE TABLE readings (account_uuid TEXT NOT NULL, kind TEXT NOT NULL, ts INTEGER NOT NULL, used REAL NOT NULL, resets_at INTEGER NOT NULL, PRIMARY KEY (account_uuid, kind, ts));
+             CREATE TABLE observed_prices (model TEXT NOT NULL, seen_at INTEGER NOT NULL, since TEXT NOT NULL, seat TEXT NOT NULL, rates TEXT NOT NULL, PRIMARY KEY (model, since));
+             CREATE TABLE seats (seat TEXT PRIMARY KEY, label TEXT NOT NULL, dir TEXT NOT NULL, seen_at INTEGER NOT NULL);
+             INSERT INTO seats VALUES ('0123456789abcdef', 'work', '/d/work', 100);",
+        )
+        .unwrap();
+        migrate(&c).unwrap();
+        assert_eq!(
+            meta(&c, "facts_version").unwrap().as_deref(),
+            Some(FACTS_VERSION.to_string().as_str())
+        );
+        let h: String = c
+            .query_row(
+                "SELECT harness FROM seats WHERE seat = '0123456789abcdef'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(h, "claude");
+        // CHECK constraint rejects unknown harness tags.
+        assert!(
+            c.execute(
+                "INSERT INTO seats(seat, label, dir, seen_at, harness) VALUES ('fedcba9876543210', 'x', '/x', 1, 'unknown')",
+                [],
+            )
+            .is_err()
+        );
+        // Second open is a no-op.
+        assert!(!migrate(&c).unwrap());
+    }
+
+    #[test]
     fn a_newer_facts_version_is_refused() {
         let c = Connection::open_in_memory().unwrap();
         migrate(&c).unwrap();
@@ -986,7 +1039,7 @@ mod tests {
              INSERT INTO accounts(account_uuid, email) VALUES ('acc-a', 'a@example.com');
              INSERT INTO readings VALUES ('acc-a', 'seven_day', 1, 40, 9);
              INSERT INTO observed_prices VALUES ('m', 1, '2026-11-01', 'work', '{}');
-             INSERT INTO seats VALUES ('0123456789abcdef', 'work', '/d', 1);
+             INSERT INTO seats(seat, label, dir, seen_at, harness) VALUES ('0123456789abcdef', 'work', '/d', 1, 'claude');
              INSERT INTO requests(msg_id, seat, session_id, agent_id, ts, model) VALUES ('m', 's', 'x', '', 1, 'm');
              UPDATE meta SET value = '0' WHERE key = 'schema_version';",
         )

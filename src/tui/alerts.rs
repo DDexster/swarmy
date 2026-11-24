@@ -172,6 +172,9 @@ pub fn attention(s: &Scene) -> Vec<Attn> {
     }
     limit_items(s, &mut out);
     for seat in s.seats {
+        if !seat.harness.supports_vault() {
+            continue;
+        }
         if seat.state.unverified_since.is_some() {
             out.push(Attn {
                 severity: severity::CONTEXT_OR_UNVERIFIED,
@@ -538,6 +541,7 @@ mod tests {
         Agent {
             seat: "work".into(),
             seat_label: "work".into(),
+            harness: crate::core::harness::Harness::Claude,
             session_id: session.into(),
             agent_id: id.into(),
             parent: None,
@@ -552,6 +556,7 @@ mod tests {
             last_activity: now() - Duration::minutes(1),
             cost: 1.0,
             requests: 3,
+            unpriced: false,
             context_tokens: 1_000,
             spark: Vec::new(),
             lane: Vec::new(),
@@ -610,9 +615,14 @@ mod tests {
         SeatRow {
             id: label.into(),
             label: label.into(),
+            harness: crate::core::harness::Harness::Claude,
             account: account.map(String::from),
             login: login.map(String::from),
+            plan: None,
             live: 0,
+            today_cost: 0.0,
+            today_requests: 0,
+            week_cost: 0.0,
             state: SeatState {
                 fingerprint: Some("f1".into()),
                 ..Default::default()

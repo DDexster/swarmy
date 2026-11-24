@@ -446,6 +446,7 @@ mod tests {
             Dim::Project,
             Dim::Account,
             Dim::Seat,
+            Dim::Harness,
             Dim::Model,
             Dim::Effort,
             Dim::AgentType,
@@ -471,6 +472,10 @@ mod tests {
             },
             Filter {
                 model: Some("opus".into()),
+                ..Default::default()
+            },
+            Filter {
+                harness: Some(crate::core::harness::Harness::Claude),
                 ..Default::default()
             },
         ];

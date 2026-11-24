@@ -8,7 +8,8 @@ use chrono::Utc;
 use super::jobs::{Job, Schedule};
 use super::{Analytics, ProjectRow, SeatRow, Wants, debug};
 use crate::app::context::Ctx;
-use crate::claude::registry;
+use crate::claude::registry::LiveSession;
+use crate::claude::seats::Seat;
 use crate::core::period::{Period, Span};
 use crate::index::Index;
 use crate::index::query::{Dim, Filter, Row};
@@ -28,6 +29,8 @@ pub struct Inputs<'a> {
     pub idx: &'a Index,
     pub wants: &'a Wants,
     pub jobs: &'a Schedule,
+    /// Running sessions across all harnesses.
+    pub live: &'a [LiveSession],
     /// Bytes of each seat's transcripts.
     pub disk: &'a [(String, u64)],
     /// The index's outlook (read with the transcript sizes).
@@ -47,6 +50,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         idx,
         wants: w,
         jobs,
+        live,
         disk,
         storage,
         slow,
@@ -78,19 +82,32 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         }
     }
     let mut vault_logins = Vec::new();
+    let multi_harness = ctx
+        .seats
+        .iter()
+        .map(|s| s.harness)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        > 1;
     let mut seats = Vec::new();
     let mut states = std::collections::BTreeMap::new();
     let mut problems = ctx.problems.clone();
+    let vault_seats: Vec<Seat> = ctx
+        .seats
+        .iter()
+        .filter(|s| s.harness.supports_vault())
+        .cloned()
+        .collect();
     // An unreadable vault is said so in ATTENTION, never shown as an empty one.
     match Vault::open(&ctx.dirs.vault_dir()) {
         Ok(mut v) => {
             // The dashboard keeps the vault's bookkeeping current, but never waits for another
             // swarmy's change: when the vault is busy it shows what the vault says now.
             let checked = v
-                .try_edit(|tx| tx.seat_states(&ctx.seats))
+                .try_edit(|tx| tx.seat_states(&vault_seats))
                 .and_then(|s| match s {
                     Some(s) => Ok(s),
-                    None => v.seat_states(&ctx.seats),
+                    None => v.seat_states(&vault_seats),
                 });
             match checked {
                 Ok(s) => states = s,
@@ -105,23 +122,68 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         problems.push(format!("cannot read {}: {error}", ctx.show_path(&path)));
     }
     problems.dedup();
+    let midnight = chrono::Local::now()
+        .date_naive()
+        .and_time(chrono::NaiveTime::MIN)
+        .and_local_timezone(chrono::Local)
+        .earliest()
+        .map(|t| t.with_timezone(&Utc))
+        .unwrap_or(ctx.now);
+    let end = ctx.now + chrono::Duration::seconds(1);
+    let today_by_seat: std::collections::HashMap<String, (f64, u64)> = idx
+        .spend_by(
+            Dim::Seat,
+            Span {
+                start: midnight,
+                end,
+            },
+            &f,
+        )?
+        .into_iter()
+        .map(|r| (r.key, (r.cost, r.requests)))
+        .collect();
+    let week_by_seat: std::collections::HashMap<String, f64> = idx
+        .spend_by(
+            Dim::Seat,
+            Span {
+                start: ctx.now - chrono::Duration::days(7),
+                end,
+            },
+            &f,
+        )?
+        .into_iter()
+        .map(|r| (r.key, r.cost))
+        .collect();
     for (s, si) in ctx.seats.iter().zip(&ctx.seat_info) {
         let state = states.get(&s.id).cloned().unwrap_or_default();
+        let (today_cost, today_requests) = today_by_seat
+            .get(s.id.as_str())
+            .copied()
+            .unwrap_or((0.0, 0));
         seats.push(SeatRow {
             id: s.id.clone(),
             label: s.label.clone(),
+            harness: s.harness,
             account: if state.unverified_since.is_some() {
                 None
             } else {
                 si.account.as_ref().map(|a| a.id().to_string())
             },
-            login: state.saved_as.clone().or_else(|| {
-                vault_logins
-                    .iter()
-                    .find(|l| l.mounted.as_ref() == Some(&s.id))
-                    .map(|l| l.label.clone())
-            }),
-            live: registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs).len(),
+            login: if s.harness.supports_vault() {
+                state.saved_as.clone().or_else(|| {
+                    vault_logins
+                        .iter()
+                        .find(|l| l.is_in(&s.id))
+                        .map(|l| l.label.clone())
+                })
+            } else {
+                None
+            },
+            plan: si.account.as_ref().and_then(|a| a.plan_label()),
+            live: live.iter().filter(|l| l.seat == s.id).count(),
+            today_cost,
+            today_requests,
+            week_cost: week_by_seat.get(s.id.as_str()).copied().unwrap_or(0.0),
             state,
         });
     }
@@ -136,14 +198,6 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
             v
         }};
     }
-    let midnight = chrono::Local::now()
-        .date_naive()
-        .and_time(chrono::NaiveTime::MIN)
-        .and_local_timezone(chrono::Local)
-        .earliest()
-        .map(|t| t.with_timezone(&Utc))
-        .unwrap_or(ctx.now);
-    let end = ctx.now + chrono::Duration::seconds(1);
     // The period before, of the same length, for trends.
     let prev_span = (!matches!(period, Period::All)).then(|| span.previous());
     let mut projects: Vec<ProjectRow> = match reuse {
@@ -250,6 +304,17 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
         by_model: match reuse {
             Some(p) => p.by_model.clone(),
             None => timed!("by_model", idx.spend_by(Dim::Model, span, &f)?),
+        },
+        model_harness: match reuse {
+            Some(p) => p.model_harness.clone(),
+            None if multi_harness => timed!(
+                "model_harness",
+                idx.matrix(Dim::Model, Dim::Harness, span, &f)?
+                    .into_iter()
+                    .map(|(m, h, _)| (m, h))
+                    .collect()
+            ),
+            None => Vec::new(),
         },
         total: match reuse {
             Some(p) => p.total.clone(),

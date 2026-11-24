@@ -70,17 +70,10 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
 
     v.edit(|tx| tx.capture(&work, Some("alice")))?;
     v.edit(|tx| tx.capture(&spare, Some("bob")))?;
-    assert_eq!(login(&v, "alice")?.mounted.as_ref(), Some(&work.id));
+    assert_eq!(login(&v, "alice")?.mounted, vec![work.id.clone()]);
     assert_eq!(login(&v, "bob")?.email.as_deref(), Some("bob@example.com"));
 
-    // bob is mounted in `spare`: refused without --share.
-    let err = v
-        .edit(|tx| tx.switch(&work, "bob", false))
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("in use in seat 'spare'"), "{err}");
-
-    // Free bob by putting a third login into `spare`.
+    // Free bob by putting a third login into `spare` (sharing has its own test).
     let carol = Secret::new(json!({"accessToken": "acc-c", "refreshToken": "r-carol"}));
     v.edit(|tx| {
         tx.put(
@@ -91,10 +84,10 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
             None,
         )
     })?;
-    v.edit(|tx| tx.switch(&spare, "carol", false))?;
-    assert_eq!(login(&v, "bob")?.mounted, None);
+    v.edit(|tx| tx.switch(&spare, "carol"))?;
+    assert_eq!(login(&v, "bob")?.mounted, Vec::<SeatId>::new());
 
-    let rep = v.edit(|tx| tx.switch(&work, "bob", false))?;
+    let rep = v.edit(|tx| tx.switch(&work, "bob"))?;
     assert_eq!(
         (rep.from.as_deref(), rep.to.as_str()),
         (Some("alice"), "bob")
@@ -111,8 +104,8 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
         cj["numStartups"], 7,
         "the rest of .claude.json is untouched"
     );
-    assert_eq!(login(&v, "alice")?.mounted, None);
-    assert_eq!(login(&v, "bob")?.mounted.as_ref(), Some(&work.id));
+    assert_eq!(login(&v, "alice")?.mounted, Vec::<SeatId>::new());
+    assert_eq!(login(&v, "bob")?.mounted, vec![work.id.clone()]);
     let backups = std::fs::read_dir(rep.backup.context("no backup")?)?.count();
     assert!(backups >= 2);
     #[cfg(unix)]
@@ -128,7 +121,7 @@ fn capture_switch_and_back() -> anyhow::Result<()> {
     }
 
     // Back again.
-    v.edit(|tx| tx.switch(&work, "alice", false))?;
+    v.edit(|tx| tx.switch(&work, "alice"))?;
     assert_eq!(
         read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
         "r-alice"
@@ -154,7 +147,7 @@ fn a_fresh_access_token_is_followed() -> anyhow::Result<()> {
     write_creds(&work, "acc-new", "r-alice")?;
     v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
     let alice = login(&v, "alice")?.clone();
-    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
+    assert_eq!(alice.mounted, vec![work.id.clone()]);
     assert_eq!(secret_of(&v, &alice.id)?["accessToken"], "acc-new");
     Ok(())
 }
@@ -178,7 +171,7 @@ fn a_new_login_never_overwrites_the_saved_one() -> anyhow::Result<()> {
     assert_eq!(st.account_uuid, None);
     assert_eq!(st.saved_as, None);
     let alice = login(&v, "alice")?.clone();
-    assert_eq!(alice.mounted, None);
+    assert_eq!(alice.mounted, Vec::<SeatId>::new());
     assert_eq!(
         secret_of(&v, &alice.id)?["refreshToken"],
         "r-alice",
@@ -188,7 +181,7 @@ fn a_new_login_never_overwrites_the_saved_one() -> anyhow::Result<()> {
     v.edit(|tx| tx.capture(&work, Some("bob")))?;
     let bob = login(&v, "bob")?;
     assert_eq!(bob.account_uuid, None);
-    assert_eq!(bob.mounted.as_ref(), Some(&work.id));
+    assert_eq!(bob.mounted, vec![work.id.clone()]);
     assert_eq!(v.logins().len(), 2);
     // Claude Code re-reads the profile: now the account is known.
     let cj = json!({"oauthAccount": {"accountUuid": "bob", "emailAddress": "bob@example.com", "profileFetchedAt": Utc::now().timestamp_millis()}});
@@ -209,7 +202,7 @@ fn switching_away_from_an_unsaved_login_keeps_it() -> anyhow::Result<()> {
     v.edit(|tx| tx.capture(&work, Some("alice")))?;
     v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
     write_creds(&work, "acc-x", "r-unknown")?;
-    let rep = v.edit(|tx| tx.switch(&work, "alice", false))?;
+    let rep = v.edit(|tx| tx.switch(&work, "alice"))?;
     assert_eq!(rep.auto_saved.as_deref(), Some("work"));
     assert_eq!(
         read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
@@ -310,7 +303,7 @@ fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<(
                             let login = format!("t{th}-{}", r - 3);
                             v.edit(|tx| {
                                 tx.sync(seats)?;
-                                tx.switch(seat, &login, false)
+                                tx.switch(seat, &login)
                             })
                             .map(drop)
                         };
@@ -357,11 +350,7 @@ fn concurrent_changes_never_lose_a_login_or_corrupt_a_file() -> anyhow::Result<(
         );
     }
     for s in &seats {
-        let mounted = v
-            .logins()
-            .iter()
-            .filter(|l| l.mounted.as_ref() == Some(&s.id))
-            .count();
+        let mounted = v.logins().iter().filter(|l| l.is_in(&s.id)).count();
         assert!(mounted <= 1, "{} logins mounted in {}", mounted, s.label);
     }
     let mut labels: Vec<&str> = v.logins().iter().map(|l| l.label.as_str()).collect();
@@ -624,11 +613,11 @@ fn seat_backups_are_kept_per_seat_and_never_overwrite() -> anyhow::Result<()> {
             )
         })?;
     }
-    let rep = v.edit(|tx| tx.switch(&spare, "dave", false))?;
+    let rep = v.edit(|tx| tx.switch(&spare, "dave"))?;
     let spare_dir = rep.backup.context("no backup")?;
     // Three switches within one second: three copies.
     for login in ["carol", "alice", "carol"] {
-        v.edit(|tx| tx.switch(&work, login, false))?;
+        v.edit(|tx| tx.switch(&work, login))?;
     }
     // Kept under the seat's id: a new label changes nothing.
     let work_dir = t.path().join("vault/backups/seats").join(work.id.as_str());
@@ -636,7 +625,7 @@ fn seat_backups_are_kept_per_seat_and_never_overwrite() -> anyhow::Result<()> {
     assert_eq!(count(&work_dir, "-claude.json"), 3);
     for i in 0..SEAT_BACKUPS + 5 {
         let login = if i % 2 == 0 { "alice" } else { "carol" };
-        v.edit(|tx| tx.switch(&work, login, false))?;
+        v.edit(|tx| tx.switch(&work, login))?;
     }
     assert_eq!(count(&work_dir, "-credentials.json"), SEAT_BACKUPS);
     assert_eq!(count(&work_dir, "-claude.json"), SEAT_BACKUPS);
@@ -684,24 +673,24 @@ fn an_old_vault_keyed_by_labels_moves_to_seat_ids() -> anyhow::Result<()> {
     // Read as it is: the labels are kept aside, not taken for ids.
     let mut v = Vault::open(&vdir)?;
     assert_eq!(v.logins().len(), 2);
-    assert!(v.logins().iter().all(|l| l.mounted.is_none()));
+    assert!(v.logins().iter().all(|l| l.mounted.is_empty()));
     assert_eq!(v.index.logins[0].mounted_label.as_deref(), Some("work"));
 
     // The first change that sees the seat adopts its label.
     let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
     assert_eq!(states[&work.id].saved_as.as_deref(), Some("alice"));
     let alice = login_of(&v, "alice")?;
-    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
+    assert_eq!(alice.mounted, vec![work.id.clone()]);
     assert_eq!(alice.mounted_label, None);
     let bob = login_of(&v, "bob")?;
-    assert_eq!(bob.mounted, None);
+    assert_eq!(bob.mounted, Vec::<SeatId>::new());
     assert_eq!(
         bob.mounted_label.as_deref(),
         Some("gone"),
         "waits for its seat"
     );
     let disk = read_json(&vdir.join("logins.json"))?;
-    assert_eq!(disk["v"], 3);
+    assert_eq!(disk["v"], 4);
     assert!(disk["seats"].get(work.id.as_str()).is_some(), "{disk}");
     assert!(disk["seats"].get("work").is_none());
     assert!(
@@ -721,7 +710,7 @@ fn an_old_vault_keyed_by_labels_moves_to_seat_ids() -> anyhow::Result<()> {
     assert_eq!(job.id, work.id);
     v.edit(|tx| tx.capture(&job, None))?;
     assert_eq!(v.logins().len(), 2, "the same login, not a new one");
-    assert_eq!(login_of(&v, "alice")?.mounted.as_ref(), Some(&work.id));
+    assert_eq!(login_of(&v, "alice")?.mounted, vec![work.id.clone()]);
     let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&job)))?;
     assert_eq!(states[&job.id].unverified_since, None);
     Ok(())
@@ -846,7 +835,7 @@ fn a_switch_that_fails_half_way_puts_the_seat_back() -> anyhow::Result<()> {
         chmod(&home, 0o700)?;
         return Ok(());
     }
-    let res = v.edit(|tx| tx.switch(&work, "bob", false));
+    let res = v.edit(|tx| tx.switch(&work, "bob"));
     chmod(&home, 0o700)?;
     let err = format!("{:#}", res.err().context("the switch had to fail")?);
     assert!(err.contains("the seat is as it was"), "{err}");
@@ -859,10 +848,10 @@ fn a_switch_that_fails_half_way_puts_the_seat_back() -> anyhow::Result<()> {
         read_json(&work.claude_json)?["oauthAccount"]["accountUuid"],
         "alice"
     );
-    assert_eq!(login(&v, "alice")?.mounted.as_ref(), Some(&work.id));
-    assert_eq!(login(&v, "bob")?.mounted, None);
+    assert_eq!(login(&v, "alice")?.mounted, vec![work.id.clone()]);
+    assert_eq!(login(&v, "bob")?.mounted, Vec::<SeatId>::new());
     // Nothing is half done: the same switch works once the file can be written.
-    v.edit(|tx| tx.switch(&work, "bob", false))?;
+    v.edit(|tx| tx.switch(&work, "bob"))?;
     assert_eq!(
         read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
         "r-bob"
@@ -892,13 +881,8 @@ fn a_seat_holding_a_free_saved_login_gets_it_mounted() -> anyhow::Result<()> {
     write_creds(&work, "acc-r-bob", "r-bob")?;
     let both = [work.clone(), spare.clone()];
     v.edit(|tx| tx.sync(&both))?;
-    assert_eq!(login(&v, "bob")?.mounted.as_ref(), Some(&work.id));
-    assert_eq!(login(&v, "alice")?.mounted, None);
-    let e = v
-        .edit(|tx| tx.switch(&spare, "bob", false))
-        .err()
-        .context("bob is in `work`: refused without --share")?;
-    assert_eq!(crate::errors::code_of(&e), Some("vault-shared-grant"));
+    assert_eq!(login(&v, "bob")?.mounted, vec![work.id.clone()]);
+    assert_eq!(login(&v, "alice")?.mounted, Vec::<SeatId>::new());
     Ok(())
 }
 
@@ -924,7 +908,7 @@ fn a_token_refreshed_during_a_switch_is_saved_not_overwritten() -> anyhow::Resul
             }
         }
     })));
-    let res = v.edit(|tx| tx.switch(&work, "bob", false));
+    let res = v.edit(|tx| tx.switch(&work, "bob"));
     hooks::set_before_seat_write(None);
     res?;
     let alice = login(&v, "alice")?.clone();
@@ -1025,7 +1009,7 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
     assert_eq!(st.account_uuid.as_deref(), Some("alice"));
     assert_eq!(st.saved_as.as_deref(), Some("alice"));
     let alice = login(&v, "alice")?.clone();
-    assert_eq!(alice.mounted.as_ref(), Some(&work.id));
+    assert_eq!(alice.mounted, vec![work.id.clone()]);
     assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
     assert_eq!(v.logins().len(), 1, "no second login for the same grant");
 
@@ -1039,8 +1023,8 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
             None,
         )
     })?;
-    v.edit(|tx| tx.switch(&work, "bob", false))?;
-    v.edit(|tx| tx.switch(&work, "alice", false))?;
+    v.edit(|tx| tx.switch(&work, "bob"))?;
+    v.edit(|tx| tx.switch(&work, "alice"))?;
     assert_eq!(
         read_json(&work.credentials_file())?["claudeAiOauth"]["refreshToken"],
         "r-alice-2"
@@ -1051,7 +1035,7 @@ fn a_rotated_refresh_token_keeps_the_login() -> anyhow::Result<()> {
     write("r-alice-old", Utc::now() - chrono::Duration::hours(1))?;
     v.edit(|tx| tx.sync(std::slice::from_ref(&work)))?;
     let alice = login(&v, "alice")?.clone();
-    assert_eq!(alice.mounted, None);
+    assert_eq!(alice.mounted, Vec::<SeatId>::new());
     assert_eq!(secret_of(&v, &alice.id)?["refreshToken"], "r-alice-2");
     Ok(())
 }
@@ -1167,7 +1151,10 @@ fn multi_org_logins_stay_distinct_and_do_not_trigger_rotation() -> anyhow::Resul
         l_team_after.meta.fingerprint, l_team.meta.fingerprint,
         "dev-team was not overwritten by another organization's grant"
     );
-    assert_eq!(l_team_after.mounted, None, "dev-team unmounted cleanly");
+    assert!(
+        l_team_after.mounted.is_empty(),
+        "dev-team unmounted cleanly"
+    );
     Ok(())
 }
 
@@ -1223,10 +1210,176 @@ fn a_switch_to_a_login_without_profile_leaves_the_seat_unverified() -> anyhow::R
     let mut v = Vault::open(&t.path().join("vault"))?;
     v.edit(|tx| tx.capture(&work, Some("alice")))?;
     v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
-    v.edit(|tx| tx.switch(&work, "bob", false))?;
+    v.edit(|tx| tx.switch(&work, "bob"))?;
     let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
     let st = &states[&work.id];
     assert!(st.unverified_since.is_some(), "{st:?}");
     assert_eq!(st.account_uuid, None);
+    Ok(())
+}
+
+/// One login in two seats: the user asks for it when a second seat has to keep working. The
+/// seat's own login is saved first; the shared one stays in both and stays listed.
+#[test]
+fn one_login_goes_into_several_seats() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    let lab = seat(t.path(), "lab")?;
+    write_seat(&work, "r-alice", "alice")?;
+    write_seat(&lab, "r-unsaved", "carol")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    let rep = v.edit(|tx| tx.switch(&lab, "alice"))?;
+    assert_eq!(rep.shared_with, ["work"]);
+    assert_eq!(
+        rep.auto_saved.as_deref(),
+        Some("lab"),
+        "lab's login saved first"
+    );
+    let alice = login(&v, "alice")?.clone();
+    assert_eq!(alice.mounted, vec![work.id.clone(), lab.id.clone()]);
+    assert_eq!(
+        secret_of(&v, &login(&v, "lab")?.id)?["refreshToken"],
+        "r-unsaved"
+    );
+
+    // Each seat refreshes its own access token: the vault keeps the newer one and does not
+    // rewrite itself when the older copy is seen again.
+    let creds = |access: &str, exp: i64| {
+        json!({"claudeAiOauth": {"accessToken": access, "refreshToken": "r-alice", "expiresAt": exp}})
+            .to_string()
+    };
+    std::fs::write(work.credentials_file(), creds("acc-w", 1_900_000_000_000))?;
+    std::fs::write(lab.credentials_file(), creds("acc-l", 1_900_000_100_000))?;
+    let both = [work.clone(), lab.clone()];
+    v.edit(|tx| tx.sync(&both))?;
+    assert_eq!(secret_of(&v, &alice.id)?["accessToken"], "acc-l");
+    let logins = std::fs::read_to_string(v.dir.join("logins.json"))?;
+    let secrets = std::fs::read_to_string(v.dir.join("secrets.json"))?;
+    v.edit(|tx| tx.sync(&both))?;
+    assert_eq!(std::fs::read_to_string(v.dir.join("logins.json"))?, logins);
+    assert_eq!(
+        std::fs::read_to_string(v.dir.join("secrets.json"))?,
+        secrets
+    );
+
+    // Moving `work` to another login leaves alice in `lab`.
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    v.edit(|tx| tx.switch(&work, "bob"))?;
+    assert_eq!(login(&v, "alice")?.mounted, vec![lab.id.clone()]);
+    // Forgetting a login in use names every seat it is in.
+    v.edit(|tx| tx.switch(&work, "alice"))?;
+    let e = v
+        .edit(|tx| tx.remove("alice", false))
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("lab, work") || e.contains("work, lab"), "{e}");
+    Ok(())
+}
+
+/// A login only goes into seats of its harness.
+#[test]
+fn a_login_never_goes_into_another_harness() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let agy = agy_seat(t.path(), "agy")?;
+    write_agy(&agy, "ya-sam", "sam@example.com")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    let e = v.edit(|tx| tx.switch(&agy, "alice")).unwrap_err();
+    assert_eq!(crate::errors::code_of(&e), Some("vault-wrong-harness"));
+    Ok(())
+}
+
+fn agy_seat(root: &Path, label: &str) -> anyhow::Result<Seat> {
+    let dir = root.join(format!(".gemini-{label}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(Seat::agy(label, dir))
+}
+
+fn write_agy(s: &Seat, refresh: &str, email: &str) -> anyhow::Result<()> {
+    let v = json!({
+        "token": {"access_token": format!("acc-{refresh}"), "token_type": "Bearer",
+                  "refresh_token": refresh, "expiry": "2026-11-24T10:00:00Z", "expires_in": 3599},
+        "auth_method": "consumer",
+        "id_token_email": email
+    });
+    std::fs::write(s.credentials_file(), v.to_string())?;
+    Ok(())
+}
+
+/// Antigravity: capture, switch (the token file replaced whole, backed up first), and the
+/// account read from the token itself, never unverified.
+#[test]
+fn agy_logins_are_saved_and_switched() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = agy_seat(t.path(), "agy")?;
+    let other = agy_seat(t.path(), "agy-work")?;
+    write_agy(&main, "ya-sam", "sam@example.com")?;
+    write_agy(&other, "ya-team", "team@example.com")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.harness, crate::core::harness::Harness::Agy);
+    assert_eq!(sam.account_uuid.as_deref(), Some("agy:sam@example.com"));
+
+    let rep = v.edit(|tx| tx.switch(&other, "sam"))?;
+    assert_eq!(rep.auto_saved.as_deref(), Some("agy-work"));
+    assert_eq!(
+        read_json(&other.credentials_file())?["token"]["refresh_token"],
+        "ya-sam"
+    );
+    assert!(std::fs::read_dir(rep.backup.context("no backup")?)?.count() >= 1);
+    let states = v.edit(|tx| tx.seat_states(&[main.clone(), other.clone()]))?;
+    for s in [&main, &other] {
+        let st = &states[&s.id];
+        assert_eq!(st.unverified_since, None);
+        assert_eq!(st.account_uuid.as_deref(), Some("agy:sam@example.com"));
+        assert_eq!(st.saved_as.as_deref(), Some("sam"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(other.credentials_file())?
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    // And back: the saved team login returns intact.
+    v.edit(|tx| tx.switch(&other, "agy-work"))?;
+    assert_eq!(
+        read_json(&other.credentials_file())?["token"]["refresh_token"],
+        "ya-team"
+    );
+    Ok(())
+}
+
+/// `logins.json` v3 (one seat or `null` in `mounted`, no harness) reads as v4.
+#[test]
+fn v3_logins_read_with_one_seat_and_claude_harness() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let dir = t.path().join("vault");
+    std::fs::create_dir_all(&dir)?;
+    let l = |id: &str, mounted: Value| {
+        json!({"id": id, "label": id, "account_uuid": null, "email": null, "plan": null,
+               "meta": {"fingerprint": id, "subscription_type": null, "rate_limit_tier": null,
+                        "access_expires_at": null, "refresh_expires_at": null, "scopes": []},
+               "oauth_account": null, "captured_at": "2026-11-01T00:00:00Z",
+               "updated_at": "2026-11-01T00:00:00Z", "mounted": mounted})
+    };
+    std::fs::write(
+        dir.join("logins.json"),
+        json!({"v": 3, "logins": [l("a", json!("0123456789abcdef")), l("b", Value::Null)], "seats": {}})
+            .to_string(),
+    )?;
+    let v = Vault::open(&dir)?;
+    let a = login(&v, "a")?;
+    assert_eq!(a.mounted, vec![SeatId::from_stored("0123456789abcdef")]);
+    assert_eq!(a.harness, crate::core::harness::Harness::Claude);
+    assert!(login(&v, "b")?.mounted.is_empty());
     Ok(())
 }
