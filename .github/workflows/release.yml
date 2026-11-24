@@ -211,24 +211,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - id: token
-        name: Tap token present?
+        name: Tap key present?
         env:
+          KEY: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
           TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          if [ -n "$TOKEN" ]; then echo "set=true" >> "$GITHUB_OUTPUT"; else
+          if [ -n "$KEY" ] || [ -n "$TOKEN" ]; then echo "set=true" >> "$GITHUB_OUTPUT"; else
             echo "set=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::HOMEBREW_TAP_TOKEN is not set: the tap koorchik/homebrew-tap is not updated"
+            echo "::notice::neither HOMEBREW_TAP_DEPLOY_KEY nor HOMEBREW_TAP_TOKEN is set: the tap koorchik/homebrew-tap is not updated"
           fi
       - uses: actions/download-artifact@v8.0.2
         if: steps.token.outputs.set == 'true'
         with:
           name: formula
           path: formula
+      # A deploy key with write access to the tap only (preferred), else a token.
       - uses: actions/checkout@v7.0.1
         if: steps.token.outputs.set == 'true'
         with:
           repository: koorchik/homebrew-tap
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN || github.token }}
           path: tap
       - name: Commit the formula
         if: steps.token.outputs.set == 'true'

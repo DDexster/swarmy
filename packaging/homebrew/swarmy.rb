@@ -3,7 +3,7 @@
 # @SHA256_*@ checksums from the release's SHA256SUMS (`tools/dist.sh formula`) and commits the
 # result to the tap as Formula/swarmy.rb. Do not edit the tap's copy by hand.
 class Swarmy < Formula
-  desc "Mission control for Claude Code agents: swarm, spend, limits, logins"
+  desc "Live swarm, spend and limits of Claude Code, Antigravity and Codex agents"
   homepage "@REPO@"
   license any_of: ["MIT", "Apache-2.0"]
 

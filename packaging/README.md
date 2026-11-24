@@ -91,20 +91,25 @@ emulation. macOS is built only by the workflow (it needs the SDK and `lipo`).
 
 `packaging/homebrew/swarmy.rb` is the formula's source of truth. After each release the
 `homebrew` job fills in the version and checksums and commits it to the tap
-`koorchik/homebrew-tap` as `Formula/swarmy.rb`; without the token the job says so and does
-nothing. Users then run `brew install koorchik/tap/swarmy` (macOS universal binary, Linux x86_64
+`koorchik/homebrew-tap` as `Formula/swarmy.rb`; without the key (or token) the job says so and
+does nothing. Users then run `brew install koorchik/tap/swarmy` (macOS universal binary, Linux x86_64
 and aarch64), or `brew install --HEAD koorchik/tap/swarmy` to build `main` from source with
 Homebrew's Rust.
 
-One-time setup:
+One-time setup (done for `koorchik/swarmy`):
 
 1. Create the public repository `koorchik/homebrew-tap` on GitHub (the `homebrew-` prefix is
    what makes `koorchik/tap` work) with a `README.md`; the job creates `Formula/` itself.
-2. Create a fine-grained personal access token (GitHub → Settings → Developer settings →
-   Personal access tokens → Fine-grained): repository access *only* `koorchik/homebrew-tap`,
-   permission *Contents: Read and write*, an expiry you will renew.
-3. In `koorchik/swarmy` → Settings → Secrets and variables → Actions, add it as
-   `HOMEBREW_TAP_TOKEN`.
+2. Give the workflow write access to that repository only, with a deploy key:
+   ```sh
+   ssh-keygen -t ed25519 -N "" -C "swarmy release → homebrew-tap" -f tapkey
+   gh repo deploy-key add tapkey.pub --repo koorchik/homebrew-tap --allow-write --title "swarmy release workflow"
+   gh secret set HOMEBREW_TAP_DEPLOY_KEY --repo koorchik/swarmy < tapkey
+   rm tapkey tapkey.pub
+   ```
+   (A fine-grained personal access token with *Contents: Read and write* on the tap, saved as
+   `HOMEBREW_TAP_TOKEN`, works too; the deploy key is preferred: it never expires and reaches
+   one repository.)
 
 To publish a formula by hand (or for the first release, before the secret exists): download
 `SHA256SUMS` of the release into `dist/`, run `tools/dist.sh formula`, and commit
