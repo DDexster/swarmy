@@ -171,6 +171,26 @@ impl AccountId {
         self.org_uuid().is_some()
     }
 
+    /// A bare id (an older `session-owner` record without an organization) completed with the
+    /// organization it must be in: the seat's own account when it is the same user, else the one
+    /// known organization of that user. Two known organizations and no matching seat leave it
+    /// bare: a guess would book one org's spend to the other.
+    pub fn completed(self, seat: Option<&AccountId>, known: &[AccountId]) -> AccountId {
+        if self.has_org() {
+            return self;
+        }
+        if let Some(s) = seat.filter(|s| s.has_org() && s.user_uuid() == self.as_str()) {
+            return s.clone();
+        }
+        let mut same = known
+            .iter()
+            .filter(|k| k.has_org() && k.user_uuid() == self.as_str());
+        match (same.next(), same.next()) {
+            (Some(one), None) => one.clone(),
+            (None, _) | (Some(_), Some(_)) => self,
+        }
+    }
+
     /// The first 8 characters, for a name of last resort (`acct-1a2b3c4d`).
     pub fn short(&self) -> &str {
         short(&self.0)
@@ -265,6 +285,32 @@ mod tests {
             scoped,
             AccountId::of("acc-123456789", Some("org-other")),
             "two organizations of the same user are distinct accounts"
+        );
+    }
+
+    #[test]
+    fn a_bare_owner_is_completed_only_when_the_organization_is_certain() {
+        let bare = || AccountId::new("u1");
+        let o1 = AccountId::of("u1", Some("o1"));
+        let o2 = AccountId::of("u1", Some("o2"));
+        let other = AccountId::of("u2", Some("o9"));
+        // The seat runs the same user: its organization.
+        assert_eq!(bare().completed(Some(&o2), std::slice::from_ref(&o1)), o2);
+        // Another user in the seat: the one known organization of this user.
+        assert_eq!(
+            bare().completed(Some(&other), std::slice::from_ref(&o1)),
+            o1
+        );
+        // Two known organizations and no matching seat: stays bare.
+        assert_eq!(
+            bare().completed(Some(&other), &[o1.clone(), o2.clone()]),
+            bare()
+        );
+        assert_eq!(bare().completed(None, &[]), bare());
+        // A scoped id is never changed.
+        assert_eq!(
+            o1.clone().completed(Some(&o2), std::slice::from_ref(&o2)),
+            o1
         );
     }
 }

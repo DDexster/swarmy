@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::{Index, READING_REPEAT_MS, SeatInfo, ms};
+use super::{Index, READING_REPEAT_MS, SeatInfo, archive, ms, schema};
 use crate::core::ids::{AccountId, SeatId};
 
 /// Tables whose `account_uuid` column holds an `AccountId`.
@@ -50,11 +50,132 @@ fn has_legacy_bare(conn: &Connection, user_uuid: &str) -> rusqlite::Result<bool>
     Ok(false)
 }
 
+/// `meta` key set while transcripts scheduled for a re-read (the multi-organization split) have
+/// not all been read again: until then every `post_pass` re-attributes requests by their owners,
+/// so a pass cut short (Ctrl-C, a busy database, a hot refresh) never leaves requests on the
+/// seat's guess for good.
+pub(super) const OWNERS_PENDING: &str = "owners_reattribute";
+
+/// `meta` key naming the account set the last migration ran for, so a set already handled takes
+/// no write transaction on the next start (bare rows no seat can claim may stay).
+const ADOPTED_FOR: &str = "accounts_adopted_for";
+
+/// Moves the rollups of `filter` from account `?2` to `?1`, adding into rows the target already
+/// has (a plain `UPDATE OR IGNORE` would leave the colliding rows on the old id).
+fn rekey_rollups(
+    tx: &Connection,
+    to: &str,
+    from: &str,
+    seat: Option<&SeatId>,
+) -> rusqlite::Result<usize> {
+    let keys: Vec<&str> = archive::KEYS.iter().map(|k| k.col).collect();
+    let sums: Vec<&str> = archive::SUMS.iter().map(|s| s.col).collect();
+    let select: Vec<String> = keys
+        .iter()
+        .map(|k| {
+            if *k == "account_uuid" {
+                "?1".to_string()
+            } else {
+                (*k).to_string()
+            }
+        })
+        .chain(sums.iter().map(|s| (*s).to_string()))
+        .collect();
+    let merge: Vec<String> = archive::SUMS
+        .iter()
+        .map(|s| format!("{} = {}", s.col, s.merge))
+        .collect();
+    let seat_sql = if seat.is_some() { " AND seat = ?3" } else { "" };
+    let insert =
+        format!(
+        "INSERT INTO usage_rollup({}) SELECT {} FROM usage_rollup WHERE account_uuid = ?2{seat_sql}
+         ON CONFLICT({}) DO UPDATE SET {}",
+        keys.iter().chain(sums.iter()).copied().collect::<Vec<_>>().join(", "),
+        select.join(", "),
+        keys.join(", "),
+        merge.join(", ")
+    );
+    let delete = format!("DELETE FROM usage_rollup WHERE account_uuid = ?2{seat_sql}");
+    match seat {
+        Some(s) => {
+            tx.execute(&insert, params![to, from, s])?;
+            tx.execute(&delete, params![to, from, s])
+        }
+        None => {
+            tx.execute(&insert, params![to, from])?;
+            tx.execute(&delete, params![to, from])
+        }
+    }
+}
+
+/// Clears `OWNERS_PENDING` once every transcript scheduled for a re-read has been read again
+/// (a transcript deleted meanwhile is never read again: it does not hold this up).
+pub(super) fn finish_reattribution(tx: &Connection) -> rusqlite::Result<()> {
+    let mut st = tx.prepare_cached("SELECT path FROM files WHERE offset > size")?;
+    let paths = st.query_map([], |r| r.get::<_, String>(0))?;
+    for p in paths {
+        if std::path::Path::new(&p?).exists() {
+            return Ok(());
+        }
+    }
+    tx.execute("DELETE FROM meta WHERE key = ?1", [OWNERS_PENDING])?;
+    Ok(())
+}
+
 impl Index {
+    /// Organization-scoped accounts known beyond the seats' current logins (the vault's saved
+    /// logins): a legacy user whose second organization is parked is then not folded into the
+    /// visible one (`adopt_accounts`), and a bare `session-owner` can be completed (`owner_of`).
+    pub fn set_known_accounts(&mut self, ids: impl IntoIterator<Item = AccountId>) {
+        let mut v: Vec<AccountId> = ids.into_iter().filter(AccountId::has_org).collect();
+        v.sort();
+        v.dedup();
+        self.known_accounts = v;
+    }
+
+    /// The account a `session-owner` record names, completed with its organization when it has
+    /// none ([`AccountId::completed`]): the same rule as the status line's, so a transcript read
+    /// again never books spend to a bare id while readings use the scoped one.
+    pub(super) fn owner_of(
+        &self,
+        owner: AccountId,
+        seat: &SeatId,
+        seat_info: &[SeatInfo],
+    ) -> AccountId {
+        let seat_account = seat_info
+            .iter()
+            .find(|si| &si.seat == seat)
+            .and_then(|si| si.account.as_ref())
+            .map(|a| a.id());
+        let known: Vec<AccountId> = seat_info
+            .iter()
+            .filter_map(|si| si.account.as_ref().map(|a| a.id()))
+            .chain(self.known_accounts.iter().cloned())
+            .collect();
+        owner.completed(seat_account.as_ref(), &known)
+    }
+
+    /// Completes the `session-owner` records of one file's events that name no organization
+    /// ([`Index::owner_of`]), so spend never splits between `<u>` and `<u>/<o>`.
+    pub(super) fn complete_owners(
+        &self,
+        seat: &SeatId,
+        events: &mut [crate::claude::transcript::Event],
+        seat_info: &[SeatInfo],
+    ) {
+        for ev in events {
+            if let crate::claude::transcript::Event::Owner { account } = ev
+                && !account.has_org()
+            {
+                *account = self.owner_of(std::mem::take(account), seat, seat_info);
+            }
+        }
+    }
+
     /// Migrates legacy bare `<accountUuid>` rows to `<accountUuid>/<organizationUuid>` in place.
-    /// Returns `true` when multi-org transcripts were scheduled for re-read so `post_pass` should
-    /// re-attribute owner-backed requests afterwards.
+    /// Returns `true` while owner-backed requests still need re-attribution (`OWNERS_PENDING`).
     pub(super) fn adopt_accounts(&mut self, seat_info: &[SeatInfo]) -> anyhow::Result<bool> {
+        let pending = schema::meta(&self.conn, OWNERS_PENDING)?.is_some();
         let mut sig: Vec<(SeatId, AccountId)> = seat_info
             .iter()
             .filter_map(|si| {
@@ -63,13 +184,21 @@ impl Index {
             })
             .collect();
         sig.sort();
-        if sig.is_empty() || self.adopted_accounts.as_ref() == Some(&sig) {
-            return Ok(false);
+        let mut known: BTreeSet<AccountId> = sig.iter().map(|(_, id)| id.clone()).collect();
+        known.extend(self.known_accounts.iter().cloned());
+        let key = (sig.clone(), known.iter().cloned().collect::<Vec<_>>());
+        if known.is_empty() || self.adopted_accounts.as_ref() == Some(&key) {
+            return Ok(pending);
+        }
+        let stamp = format!("{key:?}");
+        if schema::meta(&self.conn, ADOPTED_FOR)?.as_deref() == Some(stamp.as_str()) {
+            self.adopted_accounts = Some(key);
+            return Ok(pending);
         }
 
         // Fast read-only check: avoid taking a write lock or bumping SQLite's `data_version` when
-        // there are no legacy bare rows for any of the current seats' users.
-        let users: BTreeSet<&str> = sig.iter().map(|(_, id)| id.user_uuid()).collect();
+        // there are no legacy bare rows for any known user.
+        let users: BTreeSet<String> = known.iter().map(|id| id.user_uuid().to_string()).collect();
         let mut any_legacy = false;
         for u in &users {
             if has_legacy_bare(&self.conn, u)? {
@@ -78,18 +207,20 @@ impl Index {
             }
         }
         if !any_legacy {
-            self.adopted_accounts = Some(sig);
-            return Ok(false);
+            self.adopted_accounts = Some(key);
+            return Ok(pending);
         }
 
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        // Gather all known `<user>/<org>` identities per user: current seats plus any already-scoped
-        // accounts in the database.
+        // Every known `<user>/<org>` identity per user: the seats, the vault's saved logins, and
+        // accounts already scoped in the database. A user with one organization here may still
+        // have had another one nobody knows of any more; that is the one case decided on the best
+        // evidence left.
         let mut orgs_by_user: BTreeMap<String, BTreeSet<AccountId>> = BTreeMap::new();
-        for (_, id) in &sig {
+        for id in &known {
             orgs_by_user
                 .entry(id.user_uuid().to_string())
                 .or_default()
@@ -112,7 +243,7 @@ impl Index {
         }
 
         let mut moved = 0usize;
-        let mut reattribute_owners = false;
+        let mut reset_any = false;
 
         for (user, orgs) in &orgs_by_user {
             if !has_legacy_bare(&tx, user)? {
@@ -126,14 +257,12 @@ impl Index {
                         "UPDATE requests SET account_uuid = ?1 WHERE account_uuid = ?2",
                         params![target.as_str(), user],
                     )?;
-                    moved += tx.execute(
-                    "UPDATE OR IGNORE usage_rollup SET account_uuid = ?1 WHERE account_uuid = ?2",
-                    params![target.as_str(), user],
-                )?;
+                    moved += rekey_rollups(&tx, target.as_str(), user, None)?;
                     moved += tx.execute(
                         "UPDATE OR IGNORE owners SET account_uuid = ?1 WHERE account_uuid = ?2",
                         params![target.as_str(), user],
                     )?;
+                    // What is left collided with a scoped copy of the same row.
                     tx.execute("DELETE FROM owners WHERE account_uuid = ?1", [user])?;
                     moved += tx.execute(
                         "UPDATE files SET account_uuid = ?1 WHERE account_uuid = ?2",
@@ -149,29 +278,31 @@ impl Index {
                     )?;
                     tx.execute("DELETE FROM readings WHERE account_uuid = ?1", [user])?;
                     moved += tx.execute(
-                    "UPDATE OR IGNORE accounts SET account_uuid = ?1, org_uuid = COALESCE(org_uuid, ?3)
-                     WHERE account_uuid = ?2",
-                    params![target.as_str(), user, org_uuid],
-                )?;
+                        "UPDATE OR IGNORE accounts SET account_uuid = ?1, org_uuid = COALESCE(org_uuid, ?3)
+                         WHERE account_uuid = ?2",
+                        params![target.as_str(), user, org_uuid],
+                    )?;
                     tx.execute("DELETE FROM accounts WHERE account_uuid = ?1", [user])?;
                 }
                 (Some(_), Some(_)) => {
-                    // Multi-org split: legacy bare readings and account metadata were mixed across orgs.
-                    // Remove them so no ghost account remains; fresh readings arrive in `post_pass`.
+                    // Multi-org split: legacy bare readings and account metadata were mixed across
+                    // orgs. Remove them so no ghost account remains; fresh readings arrive in
+                    // `post_pass`.
                     tx.execute("DELETE FROM readings WHERE account_uuid = ?1", [user])?;
                     tx.execute("DELETE FROM accounts WHERE account_uuid = ?1", [user])?;
-                    // Schedule any transcript indexed under the bare id (or holding a bare owner) for
-                    // re-read from offset 0 (`size + 1` forces `reset = true` on all OSes, and `marks`
-                    // skips rolled-up records while repopulating `owners` with `<account>/<org>`).
+                    // Schedule any transcript indexed under the bare id (or holding a bare owner)
+                    // for re-read from offset 0 (`size + 1` forces `reset = true` on all OSes, and
+                    // `marks` skips rolled-up records while repopulating `owners` with
+                    // `<account>/<org>`).
                     let reset_files = tx.execute(
                         "UPDATE files
-                     SET size = size + 1, offset = size + 1, account_uuid = NULL, last_ts = 0
-                     WHERE account_uuid = ?1
-                        OR (kind = 'main' AND EXISTS (
-                              SELECT 1 FROM owners o
-                              WHERE o.seat = files.seat AND o.session_id = files.session_id
-                                AND o.account_uuid = ?1
-                            ))",
+                         SET size = size + 1, offset = size + 1, account_uuid = NULL, last_ts = 0
+                         WHERE account_uuid = ?1
+                            OR (kind = 'main' AND EXISTS (
+                                  SELECT 1 FROM owners o
+                                  WHERE o.seat = files.seat AND o.session_id = files.session_id
+                                    AND o.account_uuid = ?1
+                                ))",
                         [user],
                     )?;
                     tx.execute("DELETE FROM owners WHERE account_uuid = ?1", [user])?;
@@ -181,20 +312,18 @@ impl Index {
                             continue;
                         }
                         moved += tx.execute(
-                        "UPDATE seat_accounts SET account_uuid = ?1 WHERE seat = ?2 AND account_uuid = ?3",
-                        params![target.as_str(), seat, user],
-                    )?;
+                            "UPDATE seat_accounts SET account_uuid = ?1 WHERE seat = ?2 AND account_uuid = ?3",
+                            params![target.as_str(), seat, user],
+                        )?;
+                        moved += rekey_rollups(&tx, target.as_str(), user, Some(seat))?;
                         moved += tx.execute(
-                        "UPDATE OR IGNORE usage_rollup SET account_uuid = ?1 WHERE seat = ?2 AND account_uuid = ?3",
-                        params![target.as_str(), seat, user],
-                    )?;
-                        moved += tx.execute(
-                        "UPDATE requests SET account_uuid = ?1 WHERE seat = ?2 AND account_uuid = ?3",
-                        params![target.as_str(), seat, user],
-                    )?;
+                            "UPDATE requests SET account_uuid = ?1 WHERE seat = ?2 AND account_uuid = ?3",
+                            params![target.as_str(), seat, user],
+                        )?;
                     }
                     if reset_files > 0 {
-                        reattribute_owners = true;
+                        reset_any = true;
+                        schema::set_meta(&tx, OWNERS_PENDING, "1")?;
                     }
                     moved += reset_files;
                 }
@@ -205,9 +334,10 @@ impl Index {
         if moved > 0 {
             super::bump_settled(&tx)?;
         }
+        schema::set_meta(&tx, ADOPTED_FOR, &stamp)?;
         tx.commit()?;
-        self.adopted_accounts = Some(sig);
-        Ok(reattribute_owners)
+        self.adopted_accounts = Some(key);
+        Ok(pending || reset_any)
     }
 }
 

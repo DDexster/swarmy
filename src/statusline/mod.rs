@@ -60,15 +60,7 @@ fn record(input: &input::Input, data: &Path, home: &Path, dir: &Path, now: chron
     };
     let account = match tail.owner {
         Some(owner) if owner.has_org() => Some(owner),
-        Some(owner) => {
-            if let Some(a) = seat_account()
-                && a.account_uuid == owner.user_uuid()
-            {
-                Some(a.id())
-            } else {
-                Some(owner)
-            }
-        }
+        Some(owner) => Some(owner.completed(seat_account().map(|a| a.id()).as_ref(), &[])),
         None => seat_account().map(|a| a.id()),
     };
     let Some(account) = account else {

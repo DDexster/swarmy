@@ -12,6 +12,7 @@ mod tests {
     use crate::claude::procs::ProcTable;
     use crate::claude::project::Resolver;
     use crate::config::{Config, Dirs};
+    use crate::core::ids::AccountId;
     use crate::core::pricing::PriceBook;
     use crate::index::SeatInfo;
     use crate::index::compact::CompactOpts;
@@ -497,5 +498,120 @@ mod tests {
             45.0
         );
         let _ = Utc::now();
+    }
+
+    fn work_seat(w: &World, org: &str) -> SeatInfo {
+        SeatInfo {
+            seat: w.id("work"),
+            label: "work".into(),
+            account: Some(org_account(
+                "acc-1",
+                org,
+                "Acme Corp",
+                "dev@example.com",
+                None,
+                None,
+            )),
+            utilization: None,
+        }
+    }
+
+    /// Review A1/A2: the seat runs one organization now, the user's other one is parked in the
+    /// vault. The old index holds only bare `acc-1`; the parked organization must not be folded
+    /// into the visible one, and the owners' re-attribution survives until the re-read is done.
+    #[test]
+    fn a_parked_second_organization_is_not_folded_into_the_visible_one() {
+        let w = World::new(&["work"]);
+        let req =
+            |id: &str, ts: &str, usd: u64| assistant(id, ts, M, "/w/app", (usd * 500_000, 0), &[]);
+        w.append(
+            "work",
+            "s-old",
+            &[
+                owner_org("acc-1", "org-max"),
+                req("m1", "2026-11-10T10:00:00Z", 30),
+            ],
+        );
+        w.append(
+            "work",
+            "s-new",
+            &[
+                owner_org("acc-1", "org-team"),
+                req("t1", "2026-11-18T10:00:00Z", 10),
+            ],
+        );
+        let book = PriceBook::builtin();
+        let mut idx = w.index("i.sqlite");
+        w.refresh(&mut idx, &[], &book);
+        idx.conn
+            .execute_batch(
+                "UPDATE requests SET account_uuid = 'acc-1';
+                 UPDATE owners SET account_uuid = 'acc-1';
+                 UPDATE files SET account_uuid = 'acc-1';",
+            )
+            .unwrap();
+        drop(idx);
+        let mut idx = w.index("i.sqlite");
+        idx.set_known_accounts([AccountId::of("acc-1", Some("org-max"))]);
+        let infos = vec![work_seat(&w, "org-team")];
+        // The migration alone (as if the pass stopped right after it): the flag is on disk.
+        assert!(idx.adopt_accounts(&infos).unwrap());
+        assert_eq!(
+            idx.meta(super::super::accounts::OWNERS_PENDING)
+                .unwrap()
+                .as_deref(),
+            Some("1")
+        );
+        drop(idx);
+        // A later run (fresh process, nothing in memory) still re-attributes, then clears it.
+        let mut idx = w.index("i.sqlite");
+        idx.set_known_accounts([AccountId::of("acc-1", Some("org-max"))]);
+        w.refresh(&mut idx, &infos, &book);
+        assert_eq!(
+            dump(&idx, "SELECT msg_id, account_uuid FROM requests ORDER BY 1"),
+            ["m1|acc-1/org-max", "t1|acc-1/org-team"]
+        );
+        assert_eq!(
+            idx.meta(super::super::accounts::OWNERS_PENDING).unwrap(),
+            None
+        );
+    }
+
+    /// Review A3: an older `session-owner` without `organizationUuid` takes the seat's
+    /// organization (as the status line does), so spend never lands on a bare id.
+    #[test]
+    fn an_owner_without_organization_takes_the_seats() {
+        let w = World::new(&["work"]);
+        let bare_owner = serde_json::json!({
+            "type": "session-owner", "accountUuid": "acc-1", "sessionId": "s"
+        })
+        .to_string();
+        w.append(
+            "work",
+            "s-1",
+            &[
+                bare_owner,
+                assistant(
+                    "r1",
+                    "2026-11-18T10:00:00Z",
+                    M,
+                    "/w/app",
+                    (1_000_000, 0),
+                    &[],
+                ),
+            ],
+        );
+        let book = PriceBook::builtin();
+        let mut idx = w.index("i.sqlite");
+        let infos = vec![work_seat(&w, "org-team")];
+        w.refresh(&mut idx, &infos, &book);
+        assert_eq!(
+            dump(&idx, "SELECT account_uuid FROM owners"),
+            ["acc-1/org-team"]
+        );
+        assert_eq!(
+            dump(&idx, "SELECT msg_id, account_uuid FROM requests"),
+            ["r1|acc-1/org-team"]
+        );
     }
 }

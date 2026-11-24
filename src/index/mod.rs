@@ -72,8 +72,11 @@ pub struct Index {
     settled: std::cell::RefCell<HashMap<SettledKey, f64>>,
     /// The seats (id, label) last named in the `seats` table (`seats::adopt_seats`).
     adopted: Option<Vec<(SeatId, String)>>,
-    /// The (seat, account) pairs last checked for legacy bare-uuid migration (`accounts::adopt_accounts`).
-    adopted_accounts: Option<Vec<(SeatId, crate::core::ids::AccountId)>>,
+    /// The (seat, account) pairs and known accounts last checked for legacy bare-uuid migration
+    /// (`accounts::adopt_accounts`).
+    adopted_accounts: Option<AdoptedAccounts>,
+    /// Organization-scoped accounts known beyond the seats (`Index::set_known_accounts`).
+    known_accounts: Vec<crate::core::ids::AccountId>,
     /// Which agents this connection wrote, for readers that keep per-agent figures between
     /// refreshes (`agent_seq`).
     changes: Changes,
@@ -111,6 +114,11 @@ impl Changes {
 }
 
 /// A settled total: (settled generation, price fingerprint, account, span start, span end).
+type AdoptedAccounts = (
+    Vec<(SeatId, crate::core::ids::AccountId)>,
+    Vec<crate::core::ids::AccountId>,
+);
+
 type SettledKey = (Option<String>, String, String, i64, i64);
 
 /// How long a write waits for another process's write (a compaction chunk, a VACUUM).
@@ -350,6 +358,7 @@ impl Index {
             settled: Default::default(),
             adopted: None,
             adopted_accounts: None,
+            known_accounts: Vec::new(),
             changes: Changes::default(),
             parts: settled::Parts::default(),
         })
@@ -668,7 +677,7 @@ impl Index {
         let settled_before = ms(Utc::now()) - SETTLED_AFTER_MS;
         for batch in work.chunks(48) {
             // A few small files parse faster on this thread than by waking the whole pool.
-            let parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
+            let mut parsed: Vec<(&Work, std::io::Result<transcript::Chunk>)> = if batch.len() < 8 {
                 batch
                     .iter()
                     .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
@@ -679,6 +688,12 @@ impl Index {
                     .map(|w| (w, transcript::read_from(&w.file.path, w.start)))
                     .collect()
             };
+            // Owner records without an organization take the one they must be in.
+            for (w, chunk) in &mut parsed {
+                if let Ok(c) = chunk {
+                    self.complete_owners(&w.file.seat, &mut c.events, seat_info);
+                }
+            }
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -799,6 +814,9 @@ impl Index {
                 ),
                 [],
             )?;
+            // Until every transcript scheduled for a re-read was read again, the next pass does
+            // this again (`accounts::OWNERS_PENDING`).
+            accounts::finish_reattribution(&tx)?;
         }
         if moved > 0 {
             bump_settled(&tx)?;

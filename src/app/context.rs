@@ -216,6 +216,27 @@ impl Ctx {
                 }
             }
         }
+        // A reading for another user than the profile's (left in `.claude.json` by the login the
+        // seat ran before a switch) names no organization: it takes the one the saved logins know
+        // that user by, or is dropped rather than booked to a bare id no limit report matches.
+        let known: Vec<AccountId> = v
+            .logins()
+            .iter()
+            .filter_map(|l| l.account_uuid.as_deref().map(AccountId::new))
+            .collect();
+        for si in &mut self.seat_info {
+            if let Some(u) = si.utilization.as_mut()
+                && !u.account_id.has_org()
+            {
+                let profile = si.account.as_ref().map(|a| a.id());
+                let done = std::mem::take(&mut u.account_id).completed(profile.as_ref(), &known);
+                if done.has_org() || profile.is_some_and(|p| p == done) {
+                    u.account_id = done;
+                } else {
+                    si.utilization = None;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -262,10 +283,28 @@ impl Ctx {
         Ok(ctx)
     }
 
+    /// The accounts of the vault's saved logins (read without the lock): organizations the index
+    /// must know of even while no seat runs them (`Index::set_known_accounts`). An unreadable
+    /// vault knows of none; it is reported where the vault is shown.
+    pub fn saved_accounts(&self) -> Vec<AccountId> {
+        match crate::vault::Vault::open(&self.dirs.vault_dir()) {
+            Ok(v) => v
+                .logins()
+                .iter()
+                .filter_map(|l| l.account_uuid.as_deref().map(AccountId::new))
+                .collect(),
+            Err(e) => {
+                crate::diag::log("vault", &format!("saved accounts: {e:#}"));
+                Vec::new()
+            }
+        }
+    }
+
     /// Opens the index and reads whatever changed since the last run. The first run shows
     /// progress on stderr.
     pub fn index(&self) -> anyhow::Result<(Index, RefreshStats)> {
         let mut idx = Index::open(&self.dirs.index_file())?;
+        idx.set_known_accounts(self.saved_accounts());
         let mut resolver = Resolver::new(self.config.project.clone());
         let tty = std::io::stderr().is_terminal();
         let mut last_draw = std::time::Instant::now();
@@ -488,12 +527,16 @@ impl Ctx {
                 } else {
                     // A config entry keyed by bare `accountUuid`: map to any matching org-scoped
                     // account when present, else keep the bare id.
-                    let scoped: Vec<AccountId> = self
+                    // Seats first, then the vault's saved logins (an account in no seat now).
+                    let mut scoped: Vec<AccountId> = self
                         .seat_info
                         .iter()
                         .filter_map(|s| s.account.as_ref().map(config_json::Account::id))
-                        .filter(|id| id.user_uuid() == uuid)
+                        .chain(self.saved_accounts())
+                        .filter(|id| id.has_org() && id.user_uuid() == uuid)
                         .collect();
+                    scoped.sort();
+                    scoped.dedup();
                     if scoped.is_empty() {
                         found.insert(cfg_id);
                     } else {

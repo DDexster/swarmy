@@ -1212,3 +1212,21 @@ fn v2_logins_upgrade_bare_account_uuid_and_plan_from_oauth_account() -> anyhow::
     assert_eq!(l.plan.as_deref(), Some("default_raven"));
     Ok(())
 }
+
+/// Review A6: a login saved without a profile (`oauth_account = None`) leaves `.claude.json`
+/// naming the previous account after a switch; the seat must not count as verified under it.
+#[test]
+fn a_switch_to_a_login_without_profile_leaves_the_seat_unverified() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let work = seat(t.path(), "work")?;
+    write_seat(&work, "r-alice", "alice")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&work, Some("alice")))?;
+    v.edit(|tx| tx.put(&secret("r-bob"), None, None, Some("bob"), None))?;
+    v.edit(|tx| tx.switch(&work, "bob", false))?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&work)))?;
+    let st = &states[&work.id];
+    assert!(st.unverified_since.is_some(), "{st:?}");
+    assert_eq!(st.account_uuid, None);
+    Ok(())
+}

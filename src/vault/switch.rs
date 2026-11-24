@@ -128,15 +128,19 @@ impl VaultTx<'_> {
                 .as_ref()
                 .and_then(config_json::Account::from_value)
                 .and_then(|a| a.profile_fetched_at);
+            // Without a saved profile, `.claude.json` still names the previous account: the
+            // seat's account is unknown until Claude Code reads the new login's profile.
+            let now = chrono::Utc::now();
+            let known_profile = target.oauth_account.is_some() && target.account_uuid.is_some();
             self.index.seats.insert(
                 seat.id.clone(),
                 super::logins::SeatSeen {
                     label: seat.label.clone(),
                     fingerprint: target.meta.fingerprint.clone(),
-                    account_uuid: target.account_uuid.clone(),
+                    account_uuid: target.account_uuid.clone().filter(|_| known_profile),
                     profile_at: target_profile_at,
-                    unverified_since: None,
-                    switched_at: Some(chrono::Utc::now()),
+                    unverified_since: (!known_profile).then_some(now),
+                    switched_at: Some(now),
                 },
             );
             self.journal(&format!(

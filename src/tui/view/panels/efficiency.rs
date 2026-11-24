@@ -364,7 +364,14 @@ fn efficiency_sections(app: &App, cw: usize) -> Vec<Vec<Line<'static>>> {
                 .analytics
                 .subscriptions
                 .iter()
-                .find(|(k, _)| *k == rep.name || *k == rep.account_uuid)
+                // A key may be a bare `accountUuid` (written before organizations counted).
+                .find(|(k, _)| {
+                    *k == rep.name
+                        || *k == rep.account_uuid
+                        || *k
+                            == crate::core::ids::AccountId::new(rep.account_uuid.clone())
+                                .user_uuid()
+                })
                 .map(|x| x.1)
             else {
                 continue;
