@@ -3,7 +3,9 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
-## Unreleased
+## v0.2.0
+
+Antigravity next to Claude Code, worktrees and branches, and logins shared between seats.
 
 - **Antigravity (`agy`) as a harness next to Claude Code**: its seats (`~/.gemini/antigravity-cli`,
   the `HOME` of running agys, `[[seat]] harness = "agy"`), live conversations and subagents,
@@ -23,6 +25,10 @@ release workflow takes a release's notes from its section here.
   AGENT card has a checkout line; PROJECTS shows the share of spend made in worktrees (IN WT);
   `g` groups by checkout; `report --by worktree`, `--by branch` and `--checkout worktrees|main`.
   The index is read again once (cache version 7) to pick up the branches.
+- **Jump beyond tmux**: `J` and `swarmy jump` reach a Claude Code in Zellij, kitty, WezTerm and
+  iTerm2 too (read from the process's environment, on Linux and macOS).
+- **Accounts per organization**: an account is the pair of user and organization, so one login
+  in two organizations keeps two weeks and two plans.
 - Accounts: the organization migration keeps parked organizations apart, finishes an
   interrupted re-attribution, and completes `session-owner` records that have no organization.
 

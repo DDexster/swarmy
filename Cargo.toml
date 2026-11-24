@@ -1,6 +1,6 @@
 [package]
 name = "swarmy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Viktor Turskyi"]
 description = "Mission control for Claude Code agents: live swarm view, API-equivalent spend, weekly-limit attribution by project, and a vault for OAuth logins"
