@@ -3,7 +3,9 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
-## Unreleased
+## v0.2.1
+
+Codex logins in the vault, and Codex 0.172's tool calls read as what they run.
 
 - **Codex logins in the vault**: save, add (`swarmy accounts add --harness codex`) and switch
   them like the others. OpenAI's refresh tokens are single-use, so a Codex login is in one seat
