@@ -309,3 +309,48 @@ fn the_tail_says_whether_a_turn_runs() {
     assert_eq!(s.text.as_deref(), Some("Fixed the test."));
     assert_eq!(last_message(&path).as_deref(), Some("Fixed the test."));
 }
+
+#[test]
+fn a_code_mode_script_is_named_after_the_tools_it_calls() {
+    // Codex 0.172 runs tools from a script, as one `exec` call (seen on a real rollout).
+    let script = "const r1 = await tools.exec_command({cmd:\"ls -la\",yield_time_ms:10000});\ntext(r1.output);\nconst r2 = await tools.exec_command({cmd:\"sleep 25 && wc -l notes.txt\",yield_time_ms:30000});\ntext(r2.output);";
+    assert_eq!(
+        code_mode(script),
+        Some((
+            "exec_command".to_string(),
+            "ls -la; sleep 25 && wc -l notes.txt".to_string()
+        ))
+    );
+    assert_eq!(
+        code_mode(
+            "await tools.exec_command({\"cmd\": \"echo \\\"hi\\\"\"}); await tools.view_image({path: \"a.png\"});"
+        ),
+        Some(("exec".to_string(), "echo \"hi\"".to_string()))
+    );
+    assert_eq!(code_mode("text('no tools here')"), None);
+
+    let mut lines = turn();
+    lines.push(line(
+        "2026-11-24T10:00:20Z",
+        "response_item",
+        json!({"type": "custom_tool_call", "name": "exec", "call_id": "call_9", "input": script}),
+    ));
+    lines.extend(response(
+        "2026-11-24T10:00:21Z",
+        usage(1_000, 0, 10, 0, 1_010),
+        json!({"input_tokens": 99_000, "total_tokens": 99_000}),
+    ));
+    let (events, ..) = parse_all(&lines);
+    let call = requests(&events)
+        .into_iter()
+        .flat_map(|r| r.tool_uses.iter())
+        .find(|t| t.id == format!("cdx:{SID}:call_9"))
+        .cloned()
+        .unwrap();
+    assert_eq!(call.name, "exec_command");
+    assert_eq!(
+        crate::core::tools::ToolClass::of(&call.name),
+        crate::core::tools::ToolClass::Shell
+    );
+    assert_eq!(call.summary, "ls -la; sleep 25 && wc -l notes.txt");
+}

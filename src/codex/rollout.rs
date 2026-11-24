@@ -309,6 +309,66 @@ fn summarize_tool(name: &str, args: &Value, input: Option<&str>) -> (String, Opt
     (summary, target)
 }
 
+/// A code-mode script (`const r = await tools.exec_command({cmd: "ls -la"}); …`): the tool it
+/// calls (`exec` when it calls several kinds) and its commands, `; `-joined (else the tools).
+/// `None` when it calls no tool.
+fn code_mode(script: &str) -> Option<(String, String)> {
+    let mut tools: Vec<String> = Vec::new();
+    for (i, _) in script.match_indices("tools.") {
+        let name: String = script[i + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() && !tools.contains(&name) {
+            tools.push(name);
+        }
+    }
+    if tools.is_empty() {
+        return None;
+    }
+    let mut cmds: Vec<String> = Vec::new();
+    for (i, _) in script.match_indices("cmd") {
+        let rest = script[i + 3..].trim_start_matches(['"', '\'']);
+        let Some(rest) = rest.trim_start().strip_prefix(':') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(q) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\'' | '`'))
+        else {
+            continue;
+        };
+        let mut cmd = String::new();
+        let mut esc = false;
+        for c in rest[1..].chars() {
+            match (esc, c) {
+                (true, c) => {
+                    cmd.push(c);
+                    esc = false;
+                }
+                (false, '\\') => esc = true,
+                (false, c) if c == q => break,
+                (false, c) => cmd.push(c),
+            }
+        }
+        if !cmd.is_empty() {
+            cmds.push(cmd);
+        }
+    }
+    let name = match tools.as_slice() {
+        [one] => one.clone(),
+        [] | [_, _, ..] => "exec".to_string(),
+    };
+    let summary = if cmds.is_empty() {
+        tools.join(", ")
+    } else {
+        cmds.join("; ")
+    };
+    Some((name, truncate(&summary, 120)))
+}
+
 /// Whether a tool's output says it failed: `{"success": false}`, or (older Codex) an output JSON
 /// whose `metadata.exit_code` is not 0.
 fn output_failed(out: Option<&Value>) -> bool {
@@ -482,7 +542,16 @@ fn response_item(
                     None,
                 ),
             };
-            let (summary, target) = summarize_tool(&name, &args, input);
+            // Code mode (Codex 0.172): one `exec` call runs a script that calls the tools; it is
+            // named after them and summed up by their commands.
+            let (name, code) = match (item, input.and_then(code_mode)) {
+                (Item::CustomToolCall, Some((n, s))) if name == "exec" => (n, Some(s)),
+                (_, Some(_) | None) => (name, None),
+            };
+            let (summary, target) = match code {
+                Some(s) => (s, None),
+                None => summarize_tool(&name, &args, input),
+            };
             // `apply_patch` names files relative to the turn's directory.
             let target = match (target, ctx.cwd.as_deref()) {
                 (Some(t), Some(cwd)) if Path::new(&t).is_relative() => {
