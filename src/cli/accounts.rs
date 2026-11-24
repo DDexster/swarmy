@@ -453,12 +453,7 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                         format!("not saved: swarmy accounts capture {}", s.label),
                         Tone::Warn,
                     ),
-                    (None, None)
-                        if matches!(
-                            vault::unavailable(h),
-                            Some(crate::errors::VaultError::Keychain)
-                        ) =>
-                    {
+                    (None, None) if vault::in_keychain(h) => {
                         Cell::tone("in the Keychain", Tone::Dim)
                     }
                     (None, None) => Cell::tone("(logged out)", Tone::Dim),

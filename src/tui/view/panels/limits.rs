@@ -161,9 +161,10 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         format!(
                             " {}",
                             fit(
-                                match crate::vault::unavailable(h) {
-                                    Some(crate::errors::VaultError::Keychain) => "in Keychain",
-                                    Some(_) | None => "·",
+                                if crate::vault::in_keychain(h) {
+                                    "in Keychain"
+                                } else {
+                                    "·"
                                 },
                                 login_w
                             )

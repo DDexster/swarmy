@@ -127,6 +127,12 @@ pub fn unavailable(harness: Harness) -> Option<VaultError> {
     unavailable_on(harness, std::env::consts::OS)
 }
 
+/// Whether `harness` keeps its login in the macOS Keychain here (so a seat that shows none is not
+/// logged out).
+pub fn in_keychain(harness: Harness) -> bool {
+    matches!(unavailable(harness), Some(VaultError::Keychain))
+}
+
 fn unavailable_on(harness: Harness, os: &str) -> Option<VaultError> {
     match (harness, os) {
         (Harness::Claude, "macos") => Some(VaultError::Keychain),
