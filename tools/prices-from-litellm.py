@@ -2,8 +2,8 @@
 """Compares swarmy's built-in prices with LiteLLM's price list (the list ccusage uses too).
 
 Run by a developer before a release; swarmy itself never goes online. Prints every built-in
-`claude-*` / `gemini-*` row whose price in force today differs from LiteLLM's, and the Gemini /
-Claude models LiteLLM knows that swarmy has no row for.
+`claude-*` / `gemini-*` / `gpt-*` row whose price in force today differs from LiteLLM's, and the
+Gemini and OpenAI GPT-5/6 models LiteLLM knows that swarmy has no row for.
 
     tools/prices-from-litellm.py            # fetch the list from GitHub
     tools/prices-from-litellm.py list.json  # or read a downloaded copy
@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 
 URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
-PRICING = Path(__file__).resolve().parent.parent / "src" / "core" / "pricing.rs"
+PRICING = Path(__file__).resolve().parent.parent / "src" / "core" / "pricing" / "builtin.rs"
 ROW = re.compile(
     r'\(\s*"([a-z0-9.*-]+)",\s*date\((\d+),\s*(\d+),\s*(\d+)\),\s*([\d.]+),\s*([\d.]+),\s*([\d.]+),'
 )
@@ -36,8 +36,9 @@ def per_mtok(entry, key):
 
 
 def litellm_rates(data, model):
-    """Input, output, cache read per MTok for `model` (Gemini API entry first)."""
-    for key in (f"gemini/{model}", model, f"anthropic/{model}"):
+    """Input, output, cache read per MTok for `model` (Gemini API entry first; OpenAI's entries
+    have no prefix)."""
+    for key in (f"gemini/{model}", model, f"anthropic/{model}", f"openai/{model}"):
         e = data.get(key)
         if e and e.get("input_cost_per_token") is not None:
             return key, (
@@ -70,13 +71,22 @@ def main(argv):
             differ += 1
             print(f"≠  {model:28} ours {ours} (from {day})  LiteLLM {key} {theirs}")
     known = {m.rstrip("*") for m in newest}
+    dated = re.compile(r"-\d{4}-\d{2}-\d{2}$")
     for key in sorted(data):
         name = key.split("/", 1)[1] if key.startswith("gemini/") else key
-        if (
-            key.startswith("gemini/gemini-")
-            and data[key].get("mode") in (None, "chat")
-            and not any(name.startswith(k) for k in known)
-        ):
+        gemini = key.startswith("gemini/gemini-")
+        # OpenAI's undated GPT-5 / GPT-6 chat and responses models (Codex runs them).
+        openai = (
+            re.match(r"gpt-[56]", key) is not None
+            and data[key].get("litellm_provider") == "openai"
+            and not dated.search(key)
+        )
+        # A Gemini row covers the previews of its model; an OpenAI row only its own id.
+        covered = any(
+            name.startswith(k) if gemini else name == k or (k + "*" in newest and name.startswith(k))
+            for k in known
+        )
+        if (gemini or openai) and data[key].get("mode") in (None, "chat", "responses") and not covered:
             print(f"+  {name:28} in LiteLLM only {litellm_rates(data, name)[1]}")
     print(f"{differ} built-in rows differ")
     return 1 if differ else 0

@@ -13,6 +13,9 @@ use super::ids::SeatId;
 use super::units::Usd;
 use super::usage::Usage;
 
+mod builtin;
+use builtin::{BUILTIN, LONG_CONTEXT, writes_at_input};
+
 /// USD per million tokens; `web_search` is USD per request.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rates {
@@ -169,285 +172,15 @@ pub struct PriceBook {
     entries: Vec<PriceEntry>,
 }
 
-#[expect(
-    clippy::panic,
-    reason = "evaluated at compile time for the built-in table: a bad date fails the build"
-)]
-const fn date(y: i32, m: u32, d: u32) -> NaiveDate {
-    match NaiveDate::from_ymd_opt(y, m, d) {
-        Some(x) => x,
-        None => panic!("invalid date in the built-in price table"),
-    }
-}
-
-/// Built-in prices, USD per MTok (anthropic first-party API rates; checked 2026-11-22 against the
-/// Claude API model table and Claude Code's own cache). Cache writes are 1.25x (5 min) and 2x
-/// (1 h) the input rate; cache reads vary by model. Web search is $10 per 1000 requests.
-///
-/// The date is the first day the price applies: the date of the model's first snapshot (the
-/// suffix of its dated id, a few days before the public launch), or its launch date, so no
-/// request of the model predates it. Rows marked (to verify) carry a safe lower bound instead of
-/// a checked launch date: the launch of the model they succeed (Opus 4.6, 2026-02-05, for the
-/// later Opus and every Fable and Mythos model, which share the Opus 4.7 tokenizer), or for
-/// Opus 5.5 the first day of its knowledge-cutoff month (June 2026). Too early only means the
-/// price covers days without requests; too late would leave requests unpriced.
-/// Columns: model, from, input, output, cache read, fast multiplier.
-type BuiltinRow = (&'static str, NaiveDate, f64, f64, f64, Option<f64>);
-const BUILTIN: &[BuiltinRow] = &[
-    // (to verify) launch dates: lower bounds, see above.
-    (
-        "claude-fable-5-2",
-        date(2026, 2, 5),
-        8.0,
-        40.0,
-        0.20,
-        Some(2.0),
-    ),
-    (
-        "claude-mythos-5-2",
-        date(2026, 2, 5),
-        8.0,
-        40.0,
-        0.20,
-        Some(2.0),
-    ),
-    ("claude-fable-5-1", date(2026, 2, 5), 10.0, 50.0, 0.25, None),
-    (
-        "claude-mythos-5-1",
-        date(2026, 2, 5),
-        10.0,
-        50.0,
-        0.25,
-        None,
-    ),
-    ("claude-fable-5", date(2026, 2, 5), 10.0, 50.0, 1.00, None),
-    ("claude-mythos-5", date(2026, 2, 5), 10.0, 50.0, 1.00, None),
-    (
-        "claude-opus-5-5",
-        date(2026, 6, 1),
-        4.0,
-        20.0,
-        0.20,
-        Some(2.0),
-    ),
-    (
-        "claude-opus-5",
-        date(2026, 2, 5),
-        5.0,
-        25.0,
-        0.50,
-        Some(2.0),
-    ),
-    (
-        "claude-opus-4-8",
-        date(2026, 2, 5),
-        5.0,
-        25.0,
-        0.50,
-        Some(2.0),
-    ),
-    ("claude-opus-4-7", date(2026, 2, 5), 5.0, 25.0, 0.50, None),
-    // Checked launch dates and snapshot dates from here on, unless marked.
-    ("claude-opus-4-6", date(2026, 2, 5), 5.0, 25.0, 0.50, None),
-    ("claude-opus-4-5", date(2025, 11, 1), 5.0, 25.0, 0.50, None),
-    ("claude-opus-4-1", date(2025, 8, 5), 15.0, 75.0, 1.50, None),
-    ("claude-opus-4", date(2025, 5, 14), 15.0, 75.0, 1.50, None),
-    // (to verify) Sonnet 5.5 and 5: lower bound = the Sonnet 4.6 launch.
-    (
-        "claude-sonnet-5-5",
-        date(2026, 2, 17),
-        2.0,
-        10.0,
-        0.10,
-        None,
-    ),
-    ("claude-sonnet-5", date(2026, 2, 17), 2.0, 10.0, 0.20, None),
-    (
-        "claude-sonnet-4-6",
-        date(2026, 2, 17),
-        3.0,
-        15.0,
-        0.30,
-        None,
-    ),
-    (
-        "claude-sonnet-4-5",
-        date(2025, 9, 29),
-        3.0,
-        15.0,
-        0.30,
-        None,
-    ),
-    ("claude-sonnet-4", date(2025, 5, 14), 3.0, 15.0, 0.30, None),
-    (
-        "claude-3-7-sonnet",
-        date(2025, 2, 19),
-        3.0,
-        15.0,
-        0.30,
-        None,
-    ),
-    (
-        "claude-3-5-sonnet",
-        date(2024, 6, 20),
-        3.0,
-        15.0,
-        0.30,
-        None,
-    ),
-    // (to verify) Haiku 5.5: lower bound = the Haiku 4.5 snapshot.
-    (
-        "claude-haiku-5-5",
-        date(2025, 10, 1),
-        0.10,
-        0.50,
-        0.01,
-        None,
-    ),
-    ("claude-haiku-4-5", date(2025, 10, 1), 1.0, 5.0, 0.10, None),
-    (
-        "claude-3-5-haiku",
-        date(2024, 10, 22),
-        0.80,
-        4.0,
-        0.08,
-        None,
-    ),
-    ("claude-3-haiku", date(2024, 3, 7), 0.25, 1.25, 0.03, None),
-    // Google Gemini API, paid tier, standard (USD per MTok), as listed on
-    // aistudio.google.com/docs/pricing and LiteLLM's `gemini/…` entries on 2026-11-24. The
-    // cache column is the cached-input price; Antigravity transcripts record no cache writes.
-    // Dates are each model's general availability, earlier where a preview ran first.
-    ("gemini-4-neon", date(2026, 11, 18), 3.00, 15.00, 0.15, None),
-    // Carbon and Argon: introductory price through 2026-11-30, doubled from 2026-12-01.
-    // (to verify) the preview start; the GA of Carbon was 2026-11-10.
-    (
-        "gemini-4-carbon",
-        date(2026, 9, 30),
-        2.00,
-        10.00,
-        0.10,
-        None,
-    ),
-    (
-        "gemini-4-carbon",
-        date(2026, 12, 1),
-        4.00,
-        20.00,
-        0.20,
-        None,
-    ),
-    ("gemini-4-argon", date(2026, 9, 30), 2.00, 10.00, 0.10, None),
-    ("gemini-4-argon", date(2026, 12, 1), 4.00, 20.00, 0.20, None),
-    (
-        "gemini-4-hydrogen",
-        date(2026, 11, 12),
-        1.50,
-        7.50,
-        0.075,
-        None,
-    ),
-    // (to verify) the 3.x release dates; the Flash prices double from 2027-01-01.
-    (
-        "gemini-3.8-flash",
-        date(2026, 1, 1),
-        0.75,
-        3.75,
-        0.075,
-        None,
-    ),
-    ("gemini-3.8-flash", date(2027, 1, 1), 1.50, 7.50, 0.15, None),
-    (
-        "gemini-3.7-flash",
-        date(2026, 1, 1),
-        0.75,
-        3.75,
-        0.075,
-        None,
-    ),
-    (
-        "gemini-3.6-flash",
-        date(2026, 1, 1),
-        0.75,
-        3.75,
-        0.075,
-        None,
-    ),
-    ("gemini-3.6-flash", date(2027, 1, 1), 1.50, 7.50, 0.15, None),
-    (
-        "gemini-3.5-flash-lite",
-        date(2026, 1, 1),
-        0.30,
-        2.50,
-        0.03,
-        None,
-    ),
-    ("gemini-3.5-flash", date(2026, 1, 1), 1.50, 9.00, 0.15, None),
-    ("gemini-3.1-pro*", date(2026, 1, 1), 2.00, 12.00, 0.20, None),
-    (
-        "gemini-3.1-flash-lite*",
-        date(2026, 1, 1),
-        0.25,
-        1.50,
-        0.025,
-        None,
-    ),
-    ("gemini-3-pro*", date(2025, 11, 18), 2.00, 12.00, 0.20, None),
-    (
-        "gemini-3-flash*",
-        date(2025, 12, 17),
-        0.50,
-        3.00,
-        0.05,
-        None,
-    ),
-    (
-        "gemini-2.5-pro",
-        date(2025, 3, 25),
-        1.25,
-        10.00,
-        0.125,
-        None,
-    ),
-    (
-        "gemini-2.5-flash-lite",
-        date(2025, 6, 17),
-        0.10,
-        0.40,
-        0.01,
-        None,
-    ),
-    (
-        "gemini-2.5-flash",
-        date(2025, 4, 17),
-        0.30,
-        2.50,
-        0.03,
-        None,
-    ),
-];
-
-/// Prices above a prompt size: (model as in `BUILTIN`, prompt tokens, input and output
-/// multipliers; cache reads scale with input).
-const LONG_CONTEXT: &[(&str, u64, f64, f64)] = &[
-    // Claude Haiku 5.5: $0.50 / $2.50 above 100K prompt tokens. Whether cache rates scale the
-    // same way is (to verify); assumed yes.
-    ("claude-haiku-5-5", 100_000, 5.0, 5.0),
-    // Gemini Pro above 200K: 2.5 Pro $2.50 / $15.00, 3.x Pro $4.00 / $18.00 (cache ×2).
-    ("gemini-2.5-pro", 200_000, 2.0, 1.5),
-    ("gemini-3.1-pro*", 200_000, 2.0, 1.5),
-    ("gemini-3-pro*", 200_000, 2.0, 1.5),
-];
-
 impl PriceBook {
     pub fn builtin() -> Self {
         let entries = BUILTIN
             .iter()
             .map(|&(model, from, input, output, cache_read, fast)| {
-                let is_gemini = model.starts_with("gemini-");
+                let flat = writes_at_input(model);
                 let over = RateOverrides {
-                    cache_write_5m: is_gemini.then_some(input),
-                    cache_write_1h: is_gemini.then_some(input),
+                    cache_write_5m: flat.then_some(input),
+                    cache_write_1h: flat.then_some(input),
                     cache_read: Some(cache_read),
                     fast_multiplier: fast,
                     ..Default::default()
@@ -1166,5 +899,59 @@ mod tests {
         let unknown = book.cost("gemini-9-unknown", d, &g3, false);
         assert!(!unknown.priced);
         assert_eq!(unknown.usd, Usd::ZERO);
+    }
+
+    #[test]
+    fn openai_builtin_prices_long_context_and_priority_by_hand() {
+        let book = PriceBook::builtin();
+        let d = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        // gpt-6-luna, Codex's default ($0.10 input, $0.01 cached, $0.125 cache write = 1.25x,
+        // $0.50 output per MTok). Prompt 100k + 10k + 150k = 260k, under 272k:
+        // 100k × 0.10 = $0.010; 10k × 0.125 = $0.00125; 150k × 0.01 = $0.0015;
+        // 20k × 0.50 = $0.010 -> $0.02275.
+        let normal = Usage {
+            input: 100_000,
+            cache_write_5m: 10_000,
+            cache_read: 150_000,
+            output: 20_000,
+            ..Default::default()
+        };
+        let p = book.cost_parts("gpt-6-luna", d, &normal, false).unwrap();
+        assert!(close(p.input, 0.010), "{p:?}");
+        assert!(close(p.cache_write, 0.00125), "{p:?}");
+        assert!(close(p.cache_read, 0.0015), "{p:?}");
+        assert!(close(p.output, 0.010), "{p:?}");
+        assert!(close(p.total(), 0.02275), "{p:?}");
+        // The priority tier (fast) doubles it: $0.0455.
+        let fast = book.cost("gpt-6-luna", d, &normal, true);
+        assert!(close(fast.usd.get(), 0.0455), "{fast:?}");
+
+        // Above 272k (200k + 100k = 300k): input and cached x2, output x1.5:
+        // 200k × 0.20 = $0.040; 100k × 0.02 = $0.002; 10k × 0.75 = $0.0075 -> $0.0495.
+        let long = Usage {
+            input: 200_000,
+            cache_read: 100_000,
+            output: 10_000,
+            ..Default::default()
+        };
+        let lp = book.cost_parts("gpt-6-luna", d, &long, false).unwrap();
+        assert!(close(lp.total(), 0.0495), "{lp:?}");
+
+        // gpt-5.1-codex: no cache-write premium before GPT-5.6, so writes cost the input rate.
+        // 100k × 1.25 = $0.125; 10k × 1.25 = $0.0125; 100k × 0.125 = $0.0125;
+        // 10k × 10.00 = $0.100 -> $0.25.
+        let u = Usage {
+            input: 100_000,
+            cache_write_5m: 10_000,
+            cache_read: 100_000,
+            output: 10_000,
+            ..Default::default()
+        };
+        let c = book.cost("gpt-5.1-codex", d, &u, false);
+        assert!(close(c.usd.get(), 0.25), "{c:?}");
+
+        // Before its snapshot (2026-09-22) gpt-6-luna has no price.
+        let before = NaiveDate::from_ymd_opt(2026, 9, 21).unwrap();
+        assert!(!book.cost("gpt-6-luna", before, &normal, false).priced);
     }
 }
