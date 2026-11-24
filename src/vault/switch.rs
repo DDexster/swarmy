@@ -28,7 +28,13 @@ impl VaultTx<'_> {
     /// vault and the seat never disagree about which grant is where (and [`VaultTx::sync`]
     /// repairs the same after a crash between the two writes).
     pub fn switch(&mut self, seat: &Seat, login_key: &str) -> anyhow::Result<SwitchReport> {
-        let target = self.find(login_key).cloned()?;
+        // A label names one login per harness: the seat's first, else whatever it names (a
+        // login of another harness is refused below, by name).
+        let target = match self.index.find_in(login_key, Some(seat.harness)) {
+            Ok(l) => l.clone(),
+            Err(crate::errors::VaultError::NoLogin(_)) => self.find(login_key).cloned()?,
+            Err(e) => return Err(e.into()),
+        };
         if target.harness != seat.harness {
             return Err(VaultError::WrongHarness {
                 login: target.label,

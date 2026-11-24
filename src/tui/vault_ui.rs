@@ -10,6 +10,7 @@ use crate::claude::seats::Seat;
 use crate::core::harness::Harness;
 use crate::vault::{Login, Vault};
 
+/// Seats are named by label, saved logins by id (a label names one login per harness).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputAction {
     Capture(String),
@@ -48,7 +49,7 @@ pub enum PickFor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Picker {
     pub what: PickFor,
-    /// Login labels (for a seat) or seat labels (for a login), best first.
+    /// Login ids (for a seat) or seat labels (for a login), best first.
     pub items: Vec<String>,
     pub sel: usize,
 }
@@ -80,6 +81,28 @@ impl App {
 
     fn seat_named(&self, label: &str) -> Option<&Seat> {
         self.seats.iter().find(|s| s.label == label)
+    }
+
+    /// The saved login with this id.
+    pub fn login_by_id(&self, id: &str) -> Option<&Login> {
+        self.vault.logins.iter().find(|l| l.id == id)
+    }
+
+    /// The label of the saved login `id` (the id itself when it is gone).
+    pub fn login_label(&self, id: &str) -> String {
+        self.login_by_id(id)
+            .map_or_else(|| id.to_string(), |l| l.label.clone())
+    }
+
+    /// The id of the saved login `key` (an id, a label or an email) that fits `seat`'s harness.
+    fn login_for_seat(&self, seat: &str, key: &str) -> Option<String> {
+        let h = self.seat_named(seat).map(|s| s.harness);
+        self.vault
+            .logins
+            .iter()
+            .filter(|l| h.is_none_or(|h| l.harness == h))
+            .find(|l| l.id == key || l.label == key || l.email.as_deref() == Some(key))
+            .map(|l| l.id.clone())
     }
 
     pub fn vault_reload(&mut self) {
@@ -134,7 +157,7 @@ impl App {
             .filter(|l| l.harness == s.harness && !l.is_in(&s.id))
             .collect();
         v.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
-        v.into_iter().map(|l| l.label.clone()).collect()
+        v.into_iter().map(|l| l.id.clone()).collect()
     }
 
     /// The login `S` puts into `seat`: the most limit left among the candidates, not of the
@@ -146,13 +169,8 @@ impl App {
             .iter()
             .find(|s| s.label == seat)
             .and_then(|s| s.account.clone());
-        self.candidates_for(seat).into_iter().find(|label| {
-            let acct = self
-                .vault
-                .logins
-                .iter()
-                .find(|l| &l.label == label)
-                .and_then(|l| l.account_uuid.clone());
+        self.candidates_for(seat).into_iter().find(|id| {
+            let acct = self.login_by_id(id).and_then(|l| l.account_uuid.clone());
             current.is_none() || acct != current
         })
     }
@@ -161,10 +179,7 @@ impl App {
     /// picker).
     pub fn seats_for(&self, login: &str) -> Vec<String> {
         let h = self
-            .vault
-            .logins
-            .iter()
-            .find(|l| l.label == login)
+            .login_by_id(login)
             .map_or(Harness::Claude, |l| l.harness);
         self.seats
             .iter()
@@ -177,9 +192,21 @@ impl App {
         self.limits_rows().get(self.cur(Panel::Limits)).cloned()
     }
 
-    /// Asks for confirmation (always naming what is saved first), then switches.
+    /// Asks for confirmation (always naming what is saved first), then switches. `login` is an
+    /// id, or a label or email typed in `:switch`.
     pub fn request_switch(&mut self, seat: String, login: String) {
         self.vault.picker = None;
+        let Some(login) = self.login_for_seat(&seat, &login) else {
+            let h = self
+                .seat_named(&seat)
+                .map_or("this harness", |s| s.harness.display_name());
+            self.toast(
+                format!("no saved {h} login '{login}' for seat '{seat}'"),
+                Tone::Warn,
+            );
+            return;
+        };
+        let label = self.login_label(&login);
         let live = self.live_in(&seat);
         let current = self.analytics.seats.iter().find(|s| s.label == seat);
         let keeps = match current {
@@ -206,10 +233,7 @@ impl App {
             ),
         };
         let others: Vec<String> = self
-            .vault
-            .logins
-            .iter()
-            .find(|l| l.label == login)
+            .login_by_id(&login)
             .map(|l| {
                 l.mounted
                     .iter()
@@ -223,13 +247,13 @@ impl App {
             String::new()
         } else {
             format!(
-                "\n\n'{login}' stays in seat {} too: both seats use one login (and one limit).",
+                "\n\n'{label}' stays in seat {} too: both seats use one login (and one limit).",
                 others.join(", ")
             )
         };
         self.vault.modal = Some(Modal::Confirm {
             text: format!(
-                "Put '{login}' into seat '{seat}'?\n\n{keeps}{shared}{running}\n\n[y] switch   [n] cancel"
+                "Put the saved login '{label}' into seat '{seat}'?\n\n{keeps}{shared}{running}\n\n[y] switch   [n] cancel"
             ),
             action: ConfirmAction::Switch { seat, login },
         });
@@ -422,35 +446,38 @@ impl App {
                 });
             }
             KeyCode::Char('r') => {
-                let label = match self.selected_row() {
-                    Some(LimitsRow::Login(l)) => Some(l),
+                let id = match self.selected_row() {
+                    Some(LimitsRow::Login(id)) => Some(id),
                     Some(LimitsRow::Seat(s)) => self
                         .analytics
                         .seats
                         .iter()
                         .find(|x| x.label == s)
-                        .and_then(|x| x.login.clone()),
+                        .and_then(|x| x.login.clone())
+                        .and_then(|l| self.login_for_seat(&s, &l)),
                     None => None,
                 };
-                if let Some(l) = label {
+                if let Some(id) = id {
+                    let l = self.login_label(&id);
                     self.vault.modal = Some(Modal::Input {
-                        title: format!("Rename '{l}' to"),
-                        value: l.clone(),
-                        action: InputAction::Rename(l),
+                        title: format!("Rename the saved login '{l}' to"),
+                        value: l,
+                        action: InputAction::Rename(id),
                     });
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
-                if let Some(LimitsRow::Login(label)) = self.selected_row() {
+                if let Some(LimitsRow::Login(id)) = self.selected_row() {
+                    let label = self.login_label(&id);
                     self.vault.modal = Some(Modal::Confirm {
                         text: format!(
                             "Forget the saved login '{label}'?\n\nIts tokens are deleted from the vault.\n\n[y] forget   [n] cancel"
                         ),
-                        action: ConfirmAction::Remove(label),
+                        action: ConfirmAction::Remove(id),
                     });
                 } else {
                     self.toast(
-                        "select a saved login (below the seats) to forget it",
+                        "select a saved login (under SAVED LOGIN) to forget it",
                         Tone::Info,
                     );
                 }

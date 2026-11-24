@@ -284,6 +284,11 @@ impl Vault {
         self.index.find(key)
     }
 
+    /// [`find`](Self::find) among the logins of `harness` (a label names one login per harness).
+    pub fn find_in(&self, key: &str, harness: Option<Harness>) -> Result<&Login, VaultError> {
+        self.index.find_in(key, harness)
+    }
+
     pub fn store_name(&self) -> &'static str {
         store::STORE_NAME
     }
@@ -558,11 +563,11 @@ impl<'a> VaultTx<'a> {
         // An existing login keeps its label unless one is given; a new one gets a free one.
         let new_label = match (&label, &existing) {
             (Label::Given(l), id) => {
-                self.index.check_label(l, id.as_deref())?;
+                self.index.check_label(l, id.as_deref(), secret.harness())?;
                 Some(l.to_string())
             }
             (Label::Default(_), Some(_)) => None,
-            (Label::Default(base), None) => Some(self.index.unique_label(base)),
+            (Label::Default(base), None) => Some(self.index.unique_label(base, secret.harness())),
         };
         let id = match existing {
             Some(id) => {
@@ -655,8 +660,8 @@ impl<'a> VaultTx<'a> {
     }
 
     pub fn rename(&mut self, key: &str, new_label: &str) -> anyhow::Result<()> {
-        let id = self.find(key).map(|l| l.id.clone())?;
-        self.index.check_label(new_label, Some(&id))?;
+        let (id, harness) = self.find(key).map(|l| (l.id.clone(), l.harness))?;
+        self.index.check_label(new_label, Some(&id), harness)?;
         if let Some(l) = self.index.find_mut(&id) {
             l.label = new_label.to_string();
         }

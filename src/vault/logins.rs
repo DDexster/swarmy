@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Login, store};
 use crate::claude::seats::{Seat, SeatId};
+use crate::core::harness::Harness;
 use crate::errors::VaultError;
 
 /// The format of `logins.json`: 4 gives each login its `harness` and a list of seats in
@@ -144,12 +145,23 @@ impl Index {
     }
 
     /// The login `key` names: its label, its id or its email. A key that names two logins
-    /// (one's label is another's email, two logins of one email) is an error that lists them,
-    /// never a guess (review L3).
+    /// (one's label is another's email, two logins of one email, one label in two harnesses)
+    /// is an error that lists them, never a guess (review L3).
     pub(super) fn find(&self, key: &str) -> Result<&Login, VaultError> {
+        self.find_in(key, None)
+    }
+
+    /// [`find`](Self::find) among the logins of `harness` only, when given: a label names one
+    /// login per harness.
+    pub(super) fn find_in(
+        &self,
+        key: &str,
+        harness: Option<Harness>,
+    ) -> Result<&Login, VaultError> {
         let hits: Vec<&Login> = self
             .logins
             .iter()
+            .filter(|l| harness.is_none_or(|h| l.harness == h))
             .filter(|l| l.label == key || l.id == key || l.email.as_deref() == Some(key))
             .collect();
         match hits.as_slice() {
@@ -157,7 +169,10 @@ impl Index {
             [] => Err(VaultError::NoLogin(key.to_string())),
             many => Err(VaultError::AmbiguousLogin {
                 key: key.to_string(),
-                logins: many.iter().map(|l| l.label.clone()).collect(),
+                logins: many
+                    .iter()
+                    .map(|l| format!("{} ({})", l.label, l.harness.display_name()))
+                    .collect(),
             }),
         }
     }
@@ -173,26 +188,42 @@ impl Index {
             .map(|l| l.label.clone())
     }
 
-    /// The one place that decides whether `label` may name the login `id` (`None`: a new one).
-    pub(super) fn check_label(&self, label: &str, id: Option<&str>) -> anyhow::Result<()> {
+    /// The one place that decides whether `label` may name the login `id` (`None`: a new one) of
+    /// `harness`. Labels are unique per harness: `sam` may name a Claude Code login and an
+    /// Antigravity one.
+    pub(super) fn check_label(
+        &self,
+        label: &str,
+        id: Option<&str>,
+        harness: Harness,
+    ) -> anyhow::Result<()> {
         if label.trim().is_empty() {
             return Err(VaultError::LabelEmpty.into());
         }
         if self
             .logins
             .iter()
-            .any(|l| l.label == label && Some(l.id.as_str()) != id)
+            .any(|l| l.harness == harness && l.label == label && Some(l.id.as_str()) != id)
         {
-            return Err(VaultError::LabelTaken(label.to_string()).into());
+            return Err(VaultError::LabelTaken {
+                label: label.to_string(),
+                harness: harness.display_name().to_string(),
+            }
+            .into());
         }
         Ok(())
     }
 
-    /// `base`, or `base-2`, `base-3`… whichever no login has.
-    pub(super) fn unique_label(&self, base: &str) -> String {
+    /// `base`, or `base-2`, `base-3`… whichever no login of `harness` has.
+    pub(super) fn unique_label(&self, base: &str, harness: Harness) -> String {
+        let taken = |l: &str| {
+            self.logins
+                .iter()
+                .any(|x| x.harness == harness && x.label == l)
+        };
         let mut label = base.to_string();
         let mut n = 2;
-        while self.logins.iter().any(|l| l.label == label) {
+        while taken(&label) {
             label = format!("{base}-{n}");
             n += 1;
         }
@@ -204,8 +235,12 @@ impl Index {
         let mut renamed = Vec::new();
         for i in 0..self.logins.len() {
             let label = self.logins[i].label.clone();
-            if self.logins[..i].iter().any(|l| l.label == label) {
-                let new = self.unique_label(&label);
+            let h = self.logins[i].harness;
+            if self.logins[..i]
+                .iter()
+                .any(|l| l.harness == h && l.label == label)
+            {
+                let new = self.unique_label(&label, h);
                 self.logins[i].label = new.clone();
                 renamed.push((label, new));
             }

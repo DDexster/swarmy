@@ -209,7 +209,9 @@ pub struct ShotKey {
 /// selected).
 #[derive(Debug, Clone)]
 pub enum LimitsRow {
+    /// A seat, by label.
     Seat(String),
+    /// A saved login, by id (a label names one login per harness).
     Login(String),
 }
 
@@ -517,11 +519,7 @@ impl App {
                 .filter(|l| l.harness == h)
                 .collect();
             logins.sort_by(|a, b| self.login_pressure(a).total_cmp(&self.login_pressure(b)));
-            rows.extend(
-                logins
-                    .into_iter()
-                    .map(|l| LimitsRow::Login(l.label.clone())),
-            );
+            rows.extend(logins.into_iter().map(|l| LimitsRow::Login(l.id.clone())));
         }
         rows
     }
@@ -534,11 +532,11 @@ impl App {
                 .iter()
                 .find(|s| &s.label == label)
                 .map_or(Harness::Claude, |s| s.harness),
-            LimitsRow::Login(label) => self
+            LimitsRow::Login(id) => self
                 .vault
                 .logins
                 .iter()
-                .find(|l| &l.label == label)
+                .find(|l| &l.id == id)
                 .map_or(Harness::Claude, |l| l.harness),
         }
     }

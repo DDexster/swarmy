@@ -336,7 +336,7 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         row(
             "login",
             th.fg,
-            "an OAuth sign-in; saved Claude Code logins live in the vault",
+            "an OAuth sign-in; a saved login (⚿) lives in the vault and fits its own client's seats",
         ),
         row(
             "account",

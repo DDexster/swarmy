@@ -77,9 +77,12 @@ What swarmy adds:
   account's weekly limit went by project, and when it runs out at the current pace.
 - **Several accounts.** Every config dir is found on its own; a vault moves OAuth logins between
   them without losing a token.
-- **Hands off.** No network, no telemetry, no hooks or wrappers around the agents, and no
-  automation that types into them. It only reads what Claude Code and Antigravity already write to
-  disk, so nothing changes in how you run them.
+- **Local only.** One binary on your machine: no server, no account to sign up for, no cloud
+  relay, no telemetry, no network calls at all. Your transcripts, spend and logins never leave
+  the machine.
+- **Hands off.** No hooks or wrappers around the agents, and no automation that types into them.
+  It only reads what Claude Code and Antigravity already write to disk, so nothing changes in how
+  you run them.
 
 | | swarmy | launchers (herdr, claude-squad, …) | usage counters (ccusage, …) |
 |---|---|---|---|
@@ -89,6 +92,7 @@ What swarmy adds:
 | cost at API prices | live and in reports | no | in reports |
 | weekly limit per account and project | yes | no | partly (5-hour blocks) |
 | several accounts and config dirs | yes, with a login vault | no | merged or separate |
+| servers, accounts, network | none | varies (remote and cloud options) | none |
 
 What the others do better: a launcher runs the work (sessions that survive a reboot, worktrees on
 demand, remote machines), and ccusage covers far more agent CLIs. `J` jumps into tmux, Zellij,
@@ -279,13 +283,24 @@ How Anthropic meters limits is not public, so the shares and projections are est
 
 ![picking a saved login for a seat](docs/img/vault-picker.png)
 
-When one account's week runs out, put another account's login into the seat and carry on; switch
-back after the reset. In the dashboard: `Enter` on a seat lists the saved logins, the one with
-the most limit left first; `S` puts that one in directly.
+Two words keep it straight:
+
+- a **seat** is a config dir a client runs in (`~/.claude`, `~/.claude-work`,
+  `~/.gemini/antigravity-cli`): it holds one login at a time;
+- a **saved login** (⚿) is a sign-in the vault keeps. It fits the seats of its own client only (a
+  Claude Code login never goes into an Antigravity seat) and may be in several seats at once.
+
+LIMITS · SEATS shows both, per client: a table of seats with the login in each, then a table of
+saved logins with the seats each is in (or *free*). When one account's week runs out, put another
+account's login into the seat and carry on; switch back after the reset. `Enter` on a seat lists
+the saved logins that fit it, the one with the most limit left first; `S` puts that one in
+directly. `Enter` on a saved login picks the seats for it.
 
 ```sh
+swarmy accounts                               # seats and saved logins, per client
 swarmy accounts capture work --label alice    # save the login of seat "work"
 swarmy accounts add --label bob               # log into another account in a scratch seat, save it
+swarmy accounts add --harness agy --label bob # the same for Antigravity (labels are per client)
 swarmy accounts switch work bob               # put bob into seat "work"
 swarmy accounts switch work alice             # and back
 swarmy accounts import backup.json --label carol
@@ -302,8 +317,8 @@ What keeps it safe:
 - **One transaction at a time.** Every change to the vault holds an OS lock and re-reads the
   vault under it, so a dashboard and a command running at once never lose each other's logins.
   The vault's own files are backed up before each change (the last 30).
-- **No surprises.** A switch refuses while Claude Code runs in that seat (`--force` to insist),
-  and one login is never put into two seats (`--share` to insist).
+- **No surprises.** A switch refuses while Claude Code or agy runs in that seat (`--force` to
+  insist), and a login only ever goes into seats of its own client.
 - **It follows Claude Code.** When Claude Code refreshes a seat's access token, the saved copy
   takes it; a new `/login` is shown as *not saved* instead of overwriting the saved one.
 

@@ -1383,3 +1383,55 @@ fn v3_logins_read_with_one_seat_and_claude_harness() -> anyhow::Result<()> {
     assert!(login(&v, "b")?.mounted.is_empty());
     Ok(())
 }
+
+#[test]
+fn a_label_names_one_login_per_harness() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let claude = seat(t.path(), "work")?;
+    write_seat(&claude, "rt-sam", "acc-sam")?;
+    let agy = agy_seat(t.path(), "agy")?;
+    let agy_other = agy_seat(t.path(), "agy-2")?;
+    write_agy(&agy, "ya-sam", "sam@example.com")?;
+    write_agy(&agy_other, "ya-team", "team@example.com")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&claude, Some("sam")))?;
+    // The same label for a login of another harness: fine.
+    v.edit(|tx| tx.capture(&agy, Some("sam")))?;
+    // Twice in one harness: refused, and the message names the harness.
+    let err = v
+        .edit(|tx| tx.capture(&agy_other, Some("sam")))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("Antigravity login labelled 'sam' already exists"),
+        "{err}"
+    );
+    // A bare label is ambiguous; with the harness it names one.
+    let err = v.find("sam").unwrap_err().to_string();
+    assert!(
+        err.contains("sam (Claude Code)") && err.contains("sam (Antigravity)"),
+        "{err}"
+    );
+    let agy_sam = v
+        .find_in("sam", Some(crate::core::harness::Harness::Agy))?
+        .clone();
+    assert_eq!(agy_sam.account_uuid.as_deref(), Some("agy:sam@example.com"));
+    // A switch by label takes the seat's harness.
+    v.edit(|tx| tx.switch(&agy_other, "sam"))?;
+    assert_eq!(
+        read_json(&agy_other.credentials_file())?["token"]["refresh_token"],
+        "ya-sam"
+    );
+    // A new login named after its seat gets a free label within its harness only.
+    let claude2 = seat(t.path(), "agy")?;
+    write_seat(&claude2, "rt-other", "acc-other")?;
+    v.edit(|tx| tx.capture(&claude2, None))?;
+    let named: Vec<String> = v
+        .logins()
+        .iter()
+        .filter(|l| l.harness == crate::core::harness::Harness::Claude)
+        .map(|l| l.label.clone())
+        .collect();
+    assert!(named.contains(&"agy".to_string()), "{named:?}");
+    Ok(())
+}

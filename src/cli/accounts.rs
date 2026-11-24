@@ -9,6 +9,7 @@ use clap::{Args, Subcommand};
 use crate::claude::credentials;
 use crate::claude::registry;
 use crate::claude::seats::Seat;
+use crate::core::harness::Harness;
 use crate::core::limits::WindowKind;
 use crate::limits::{AccountReport, all_reports};
 use crate::ui::fmt;
@@ -57,15 +58,22 @@ pub enum AccountsCmd {
         #[arg(long, value_enum, default_value_t = crate::core::harness::Harness::Claude)]
         harness: crate::core::harness::Harness,
     },
+    /// Rename a saved login (labels are unique per harness).
     Rename {
         login: String,
         new_label: String,
+        /// The harness of the login, when its label names logins of two harnesses.
+        #[arg(long, value_enum)]
+        harness: Option<Harness>,
     },
     /// Forget a saved login.
     Rm {
         login: String,
         #[arg(long)]
         force: bool,
+        /// The harness of the login, when its label names logins of two harnesses.
+        #[arg(long, value_enum)]
+        harness: Option<Harness>,
     },
 }
 
@@ -95,7 +103,7 @@ fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
         })?;
     if !found.harness.supports_vault() {
         bail!(
-            "seat '{}' uses {} (the login vault supports Claude Code seats only)",
+            "seat '{}' uses {}, whose logins the vault does not keep",
             found.label,
             found.harness.display_name()
         );
@@ -305,13 +313,23 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             }
             result
         }
-        AccountsCmd::Rename { login, new_label } => {
-            v.edit(|tx| tx.rename(&login, &new_label))?;
+        AccountsCmd::Rename {
+            login,
+            new_label,
+            harness,
+        } => {
+            let id = v.find_in(&login, harness)?.id.clone();
+            v.edit(|tx| tx.rename(&id, &new_label))?;
             println!("{} renamed to '{new_label}'", p.paint("[ OK ]", Tone::Good));
             Ok(())
         }
-        AccountsCmd::Rm { login, force } => {
-            let l = v.edit(|tx| tx.remove(&login, force))?;
+        AccountsCmd::Rm {
+            login,
+            force,
+            harness,
+        } => {
+            let id = v.find_in(&login, harness)?.id.clone();
+            let l = v.edit(|tx| tx.remove(&id, force))?;
             println!("{} forgot '{}'", p.paint("[ OK ]", Tone::Good), l.label);
             Ok(())
         }
@@ -319,38 +337,14 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
 }
 
 fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
-    let claude = vault_seats(ctx);
-    let states = v.edit(|tx| tx.seat_states(&claude))?;
+    let vault_seats = vault_seats(ctx);
+    let states = v.edit(|tx| tx.seat_states(&vault_seats))?;
     let (idx, _) = ctx.index()?;
     let reports = all_reports(ctx, &idx)?;
     let p = &ctx.painter;
-    println!(
-        "{} {}",
-        p.paint("SEATS", Tone::Header),
-        p.paint(
-            "· Claude Code config dirs and the login each uses",
-            Tone::Dim
-        )
-    );
-    let mut t = Table::new(&[
-        ("SEAT", Align::Left),
-        ("LOGIN", Align::Left),
-        ("ACCOUNT", Align::Left),
-        ("WEEK", Align::Left),
-        ("RESETS", Align::Left),
-        ("LIVE", Align::Right),
-    ]);
-    for (s, si) in ctx
-        .seats
-        .iter()
-        .zip(&ctx.seat_info)
-        .filter(|(s, _)| s.harness.supports_vault())
-    {
-        let st = states.get(&s.id).cloned().unwrap_or_default();
-        let acct = si.account.as_ref().map(|a| a.id().to_string());
-        let w = weekly(&reports, acct.as_deref());
-        let (week, tone, resets) = match w {
-            Some((u, end, reset)) => (
+    let week_cell = |acct: Option<&str>| match weekly(&reports, acct) {
+        Some((u, end, reset)) => (
+            Cell::tone(
                 format!(
                     "{} {}{}",
                     fmt::gauge(u / 100.0, 10),
@@ -358,144 +352,242 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                     if reset { " (reset)" } else { "" }
                 ),
                 Tone::of_utilization(u),
-                end.with_timezone(&Local).format("%a %H:%M").to_string(),
             ),
-            None => ("-".into(), Tone::Dim, String::new()),
-        };
-        t.row(vec![
-            Cell::tone(&s.label, Tone::Bold),
-            match (&st.saved_as, &st.fingerprint) {
-                (Some(l), _) => {
-                    let email = v
-                        .logins()
-                        .iter()
-                        .find(|x| &x.label == l)
-                        .and_then(|x| x.email.as_deref());
+            Cell::tone(
+                end.with_timezone(&Local).format("%a %H:%M").to_string(),
+                Tone::Dim,
+            ),
+            Some(u),
+        ),
+        None => (Cell::tone("-", Tone::Dim), Cell::new(""), None),
+    };
+    // The saved login with the most limit left that no seat uses: the one to switch to.
+    let mut best: Option<(f64, String, Harness)> = None;
+    let mut first = true;
+    for h in Harness::ALL {
+        let seats: Vec<(&Seat, &crate::index::SeatInfo)> = ctx
+            .seats
+            .iter()
+            .zip(&ctx.seat_info)
+            .filter(|(s, _)| s.harness == h && s.harness.supports_vault())
+            .collect();
+        let logins: Vec<&vault::Login> = v.logins().iter().filter(|l| l.harness == h).collect();
+        if seats.is_empty() && logins.is_empty() {
+            continue;
+        }
+        if !first {
+            println!();
+        }
+        first = false;
+        let quota = h.supports_limits();
+        println!(
+            "{} {}",
+            p.paint(&h.display_name().to_uppercase(), Tone::Header),
+            p.paint(
+                &format!(
+                    "· {} seat{} · {} saved login{}{}",
+                    seats.len(),
+                    if seats.len() == 1 { "" } else { "s" },
+                    logins.len(),
+                    if logins.len() == 1 { "" } else { "s" },
+                    if quota { "" } else { " · no local quota" }
+                ),
+                Tone::Dim
+            )
+        );
+        // Seats: where the harness runs, and the login each holds now.
+        println!(
+            "{}",
+            p.paint(
+                &format!(
+                    "  seats · the config dirs {} runs in, and the login in each",
+                    h.display_name()
+                ),
+                Tone::Dim
+            )
+        );
+        let mut cols = vec![
+            ("SEAT", Align::Left),
+            ("DIR", Align::Left),
+            ("LOGIN IN IT", Align::Left),
+            ("ACCOUNT", Align::Left),
+        ];
+        if quota {
+            cols.extend([("WEEK", Align::Left), ("RESETS", Align::Left)]);
+        }
+        cols.push(("LIVE", Align::Right));
+        let mut t = Table::new(&cols);
+        for (s, si) in &seats {
+            let st = states.get(&s.id).cloned().unwrap_or_default();
+            let acct = si.account.as_ref().map(|a| a.id().to_string());
+            let mut row = vec![
+                Cell::tone(&s.label, Tone::Bold),
+                Cell::tone(ctx.show_path(&s.dir.to_string_lossy()), Tone::Dim),
+                match (&st.saved_as, &st.fingerprint) {
+                    (Some(l), _) => {
+                        let email = logins
+                            .iter()
+                            .find(|x| &x.label == l)
+                            .and_then(|x| x.email.as_deref());
+                        Cell::tone(
+                            format!("⚿ {}", mask::login_label(l, email, ctx.mask)),
+                            Tone::Good,
+                        )
+                    }
+                    (None, Some(_)) => Cell::tone(
+                        format!("not saved: swarmy accounts capture {}", s.label),
+                        Tone::Warn,
+                    ),
+                    (None, None) => Cell::tone("(logged out)", Tone::Dim),
+                },
+                match (&st.unverified_since, acct.as_deref()) {
+                    (Some(t), _) => Cell::tone(
+                        format!(
+                            "? new login {} (open {} there to confirm)",
+                            t.with_timezone(&Local).format("%d %b %H:%M"),
+                            h.display_name()
+                        ),
+                        Tone::Warn,
+                    ),
+                    (None, Some(a)) => Cell::new(ctx.account_name(a)),
+                    (None, None) => Cell::tone("-", Tone::Dim),
+                },
+            ];
+            if quota {
+                let (week, resets, _) = week_cell(acct.as_deref());
+                row.extend([week, resets]);
+            }
+            row.push(Cell::new(live_in(ctx, s).to_string()));
+            t.row(row);
+        }
+        if seats.is_empty() {
+            println!("{}", p.paint("    none found", Tone::Dim));
+        } else {
+            println!("{}", indent(&t.render(p)));
+        }
+        // Saved logins: what the vault keeps for this harness, and which seats use each.
+        println!(
+            "{}",
+            p.paint(
+                &format!(
+                    "  saved logins · in the vault, each fits {} seats only",
+                    h.display_name()
+                ),
+                Tone::Dim
+            )
+        );
+        if logins.is_empty() {
+            println!(
+                "{}",
+                p.paint(
+                    &format!(
+                        "    none yet: swarmy accounts capture <seat> saves a seat's login, \
+                         swarmy accounts add --harness {} --label <name> a new one",
+                        h.key()
+                    ),
+                    Tone::Dim
+                )
+            );
+            continue;
+        }
+        let mut cols = vec![
+            ("LOGIN", Align::Left),
+            ("EMAIL", Align::Left),
+            ("IN SEATS", Align::Left),
+        ];
+        if quota {
+            cols.push(("WEEK", Align::Left));
+        }
+        cols.extend([("LOGIN EXPIRES", Align::Left), ("GRANT", Align::Left)]);
+        let mut t = Table::new(&cols);
+        for l in logins {
+            let label = mask::login_label(&l.label, l.email.as_deref(), ctx.mask);
+            let mut row = vec![
+                Cell::tone(format!("⚿ {label}"), Tone::Bold),
+                Cell::new(mask::email(
+                    l.email.as_deref().unwrap_or_default(),
+                    ctx.mask,
+                )),
+                if l.mounted.is_empty() {
+                    Cell::tone("- (free)", Tone::Dim)
+                } else {
                     Cell::tone(
-                        format!("{} ✓", mask::login_label(l, email, ctx.mask)),
+                        l.mounted
+                            .iter()
+                            .map(|s| ctx.seat_label(s))
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         Tone::Good,
                     )
+                },
+            ];
+            if quota {
+                let (week, _, used) = week_cell(l.account_uuid.as_deref());
+                if let Some(u) = used
+                    && u < 100.0
+                    && l.mounted.is_empty()
+                    && best.as_ref().is_none_or(|(b, ..)| u < *b)
+                {
+                    best = Some((u, label.clone(), h));
                 }
-                (None, Some(_)) => Cell::tone("not saved", Tone::Warn),
-                (None, None) => Cell::tone("-", Tone::Dim),
-            },
-            match (&st.unverified_since, acct.as_deref()) {
-                (Some(t), _) => Cell::tone(
+                row.push(week);
+            }
+            let expires = l.meta.refresh_expires_at.map(|t| {
+                let left = t - ctx.now;
+                Cell::tone(
                     format!(
-                        "? new login {} (open Claude Code there to confirm)",
-                        t.with_timezone(&Local).format("%d %b %H:%M")
+                        "{} (in {})",
+                        t.with_timezone(&Local).format("%b %d"),
+                        fmt::duration(left)
                     ),
-                    Tone::Warn,
-                ),
-                (None, Some(a)) => Cell::new(ctx.account_name(a)),
-                (None, None) => Cell::tone("(logged out)", Tone::Dim),
-            },
-            Cell::tone(week, tone),
-            Cell::tone(resets, Tone::Dim),
-            Cell::new(live_in(ctx, s).to_string()),
-        ]);
+                    if left.num_days() < 7 {
+                        Tone::Warn
+                    } else {
+                        Tone::Dim
+                    },
+                )
+            });
+            row.push(expires.unwrap_or_else(|| Cell::tone("-", Tone::Dim)));
+            row.push(Cell::tone(
+                crate::core::ids::short(&l.meta.fingerprint).to_string(),
+                Tone::Dim,
+            ));
+            t.row(row);
+        }
+        println!("{}", indent(&t.render(p)));
     }
-    println!("{}", t.render(p));
     println!();
     println!(
-        "{} {}",
-        p.paint("VAULT", Tone::Header),
+        "{}",
         p.paint(
             &format!(
-                "· {} · {}",
+                "vault: {} · {}",
                 v.store_name(),
                 ctx.show_path(&ctx.dirs.vault_dir().to_string_lossy())
             ),
             Tone::Dim
         )
     );
-    if v.logins().is_empty() {
+    if let Some((u, label, h)) = best {
         println!(
-            "  {}",
+            "{}",
             p.paint(
-                "empty — save the current logins with `swarmy accounts capture <seat>`",
-                Tone::Dim
+                &format!(
+                    "tip: '{label}' is free and has the most limit left ({} used): swarmy accounts switch <{} seat> {label}",
+                    fmt::pct(u),
+                    h.display_name()
+                ),
+                Tone::Accent
             )
         );
-        return Ok(());
-    }
-    let mut t = Table::new(&[
-        ("LOGIN", Align::Left),
-        ("EMAIL", Align::Left),
-        ("IN SEAT", Align::Left),
-        ("WEEK", Align::Left),
-        ("LOGIN EXPIRES", Align::Left),
-        ("GRANT", Align::Left),
-    ]);
-    let mut best: Option<(f64, String)> = None;
-    for l in v.logins() {
-        let w = weekly(&reports, l.account_uuid.as_deref());
-        let week = match w {
-            Some((u, _, reset)) => {
-                if l.mounted.is_empty() && best.as_ref().is_none_or(|(b, _)| u < *b) {
-                    best = Some((u, mask::login_label(&l.label, l.email.as_deref(), ctx.mask)));
-                }
-                Cell::tone(
-                    format!(
-                        "{} {}{}",
-                        fmt::gauge(u / 100.0, 10),
-                        fmt::pct(u),
-                        if reset { " (reset)" } else { "" }
-                    ),
-                    Tone::of_utilization(u),
-                )
-            }
-            None => Cell::tone("unknown", Tone::Dim),
-        };
-        let expires = l.meta.refresh_expires_at.map(|t| {
-            let left = t - ctx.now;
-            let s = format!(
-                "{} (in {})",
-                t.with_timezone(&Local).format("%b %d"),
-                fmt::duration(left)
-            );
-            Cell::tone(
-                s,
-                if left.num_days() < 7 {
-                    Tone::Warn
-                } else {
-                    Tone::Dim
-                },
-            )
-        });
-        t.row(vec![
-            Cell::tone(
-                mask::login_label(&l.label, l.email.as_deref(), ctx.mask),
-                Tone::Bold,
-            ),
-            Cell::new(mask::email(
-                l.email.as_deref().unwrap_or_default(),
-                ctx.mask,
-            )),
-            if l.mounted.is_empty() {
-                Cell::tone("-", Tone::Dim)
-            } else {
-                Cell::tone(
-                    l.mounted
-                        .iter()
-                        .map(|s| ctx.seat_label(s))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    Tone::Good,
-                )
-            },
-            week,
-            expires.unwrap_or_else(|| Cell::tone("-", Tone::Dim)),
-            Cell::tone(
-                crate::core::ids::short(&l.meta.fingerprint).to_string(),
-                Tone::Dim,
-            ),
-        ]);
-    }
-    println!("{}", t.render(p));
-    if let Some((u, label)) = best {
-        println!();
-        println!("{}", p.paint(&format!("tip: '{label}' has the most limit left ({} used): swarmy accounts switch <seat> {label}", fmt::pct(u)), Tone::Accent));
     }
     Ok(())
+}
+
+/// A table under a sub-heading.
+fn indent(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

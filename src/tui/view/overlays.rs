@@ -40,7 +40,10 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
     let th = &app.theme;
     let title = match &p.what {
         PickFor::Seat(s) => format!("put a saved login into seat '{s}' · most limit left first"),
-        PickFor::Login(l) => format!("put login '{l}' into a seat (it may be in several)"),
+        PickFor::Login(l) => format!(
+            "put the saved login '{}' into a seat (it may be in several)",
+            app.login_label(l)
+        ),
     };
     let r = centered(area, 108, p.items.len() as u16 + 6);
     f.render_widget(Clear, r);
@@ -51,7 +54,13 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
     let mut lines = vec![Line::from(Span::styled(
         format!(
             "  {} {} {} {} {}",
-            fit("LOGIN / SEAT", 20),
+            fit(
+                match &p.what {
+                    PickFor::Seat(_) => "SAVED LOGIN",
+                    PickFor::Login(_) => "SEAT",
+                },
+                20
+            ),
             fit("ACCOUNT", 22),
             fit("5-HOUR", 13),
             fit("WEEK", 13),
@@ -61,12 +70,7 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
     ))];
     for (i, item) in p.items.iter().enumerate() {
         let account = match &p.what {
-            PickFor::Seat(_) => app
-                .vault
-                .logins
-                .iter()
-                .find(|l| &l.label == item)
-                .and_then(|l| l.account_uuid.clone()),
+            PickFor::Seat(_) => app.login_by_id(item).and_then(|l| l.account_uuid.clone()),
             PickFor::Login(_) => app
                 .analytics
                 .seats
@@ -97,10 +101,7 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
             }
         };
         let expires = app
-            .vault
-            .logins
-            .iter()
-            .find(|l| &l.label == item)
+            .login_by_id(item)
             .and_then(|l| l.meta.refresh_expires_at)
             .map(|t| format!(" · exp. {}", fmt::duration(t - now)))
             .unwrap_or_default();
@@ -109,7 +110,7 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
             PickFor::Seat(s) => (item.as_str(), s.as_str()),
             PickFor::Login(l) => (l.as_str(), item.as_str()),
         };
-        let l = app.vault.logins.iter().find(|x| x.label == login);
+        let l = app.login_by_id(login);
         let seat_id = app
             .analytics
             .seats
@@ -145,7 +146,16 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
         };
         let mut sp = vec![
             Span::styled(if i == p.sel { "▸ " } else { "  " }, th.bold(th.accent)),
-            Span::styled(fit(item, 20), th.bold(th.fg)),
+            Span::styled(
+                fit(
+                    &match &p.what {
+                        PickFor::Seat(_) => format!("⚿ {}", mask_name(app, &app.login_label(item))),
+                        PickFor::Login(_) => item.clone(),
+                    },
+                    20,
+                ),
+                th.bold(th.fg),
+            ),
             Span::styled(format!(" {}", fit(&acct, 22)), Style::new().fg(th.dim)),
             Span::raw(" "),
         ];

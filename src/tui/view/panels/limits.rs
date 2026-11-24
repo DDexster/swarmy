@@ -36,11 +36,14 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     let th = app.theme;
     let rows = app.limits_rows();
     let width = inner.width as usize;
-    // Narrow panels drop the account column (the seat and login usually say enough).
+    // Narrow panels drop the account column (the seat and login usually say enough), and the
+    // seat's dir unless the panel is wide.
     let acct_w = if inner.width < 120 { 0usize } else { 18 };
-    let (mark_w, name_w, login_w, reset_w) = (2usize, 13usize, 15usize, 9usize);
+    let dir_w = if inner.width >= 150 { 22usize } else { 0 };
+    let (mark_w, name_w, login_w, reset_w) = (2usize, 16usize, 17usize, 9usize);
     let fixed = mark_w
         + name_w
+        + if dir_w > 0 { dir_w + 1 } else { 0 }
         + 1
         + login_w
         + if acct_w > 0 { acct_w + 1 } else { 0 }
@@ -60,28 +63,46 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     let gauges = if has_five { 2 } else { 1 };
     let g = ((width.saturating_sub(fixed + info_min)) / gauges).clamp(6, 24);
     let info_w = width.saturating_sub(fixed + gauges * g);
-    let mut lines = vec![Line::from(Span::styled(
-        format!(
-            "{}{} {} {}{}{} {} {}",
-            " ".repeat(mark_w),
-            fit("SEAT", name_w),
-            fit("LOGIN", login_w),
-            if acct_w > 0 {
-                format!("{} ", fit("ACCOUNT", acct_w))
-            } else {
-                String::new()
-            },
-            if has_five {
-                format!("{} ", fit("5-HOUR", g + 5))
-            } else {
-                String::new()
-            },
-            fit("WEEK USED", g + 5),
-            fit("RESETS IN", reset_w),
-            "STATUS"
-        ),
-        faint(app),
-    ))];
+    // Seats and saved logins are two tables per harness, each under its own column names: a
+    // seat is where the harness runs (a config dir), a saved login is what the vault keeps.
+    let head_w = name_w + if dir_w > 0 { dir_w + 1 } else { 0 };
+    let header = |first: &str, dir: &str, second: &str, quota: bool| {
+        let first = if dir_w > 0 && !dir.is_empty() {
+            format!("{} {}", fit(first, name_w), fit(dir, dir_w))
+        } else {
+            first.to_string()
+        };
+        let tail = if quota {
+            format!(
+                "{}{} {} STATUS",
+                if has_five {
+                    format!("{} ", fit("5-HOUR", g + 5))
+                } else {
+                    String::new()
+                },
+                fit("WEEK USED", g + 5),
+                fit("RESETS IN", reset_w),
+            )
+        } else {
+            "SPEND · PLAN".to_string()
+        };
+        Line::from(Span::styled(
+            format!(
+                "{}{} {} {}{}",
+                " ".repeat(mark_w),
+                fit(&first, head_w),
+                fit(second, login_w),
+                if acct_w > 0 {
+                    format!("{} ", fit("ACCOUNT", acct_w))
+                } else {
+                    String::new()
+                },
+                tail
+            ),
+            faint(app),
+        ))
+    };
+    let mut lines: Vec<Line> = Vec::new();
     let cur = app.cur(Panel::Limits);
     let focused = app.focus == Panel::Limits;
     let now = Utc::now();
@@ -99,21 +120,15 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             if sections {
                 lines.push(section_head(app, h, &rows));
             }
+            if let LimitsRow::Seat(_) = r {
+                lines.push(header("SEAT", "DIR", "LOGIN IN IT", h.supports_limits()));
+            }
         }
         if let LimitsRow::Login(_) = r
             && first_login
         {
             first_login = false;
-            if !sections {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(" SAVED LOGINS ", th.heading()),
-                    Span::styled(
-                        " · in the vault · where each is · Enter puts one into a seat (one may be in several)",
-                        faint(app),
-                    ),
-                ]));
-            }
+            lines.push(header("SAVED LOGIN", "", "IN SEATS", h.supports_limits()));
         }
         let mut sp: Vec<Span> = vec![Span::styled(
             if sel { "▸ " } else { "  " },
@@ -125,15 +140,24 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 let state = s.map(|x| x.state.clone()).unwrap_or_default();
                 let login = s.and_then(|x| x.login.clone());
                 sp.push(Span::styled(fit(label, name_w), th.bold(th.fg)));
+                if dir_w > 0 {
+                    sp.push(Span::styled(
+                        format!(" {}", fit(&seat_dir(app, label), dir_w)),
+                        Style::new().fg(th.fade(th.dir, 0.3)),
+                    ));
+                }
                 sp.push(match (&login, &state.fingerprint) {
                     (Some(l), _) => Span::styled(
-                        format!(" {}", fit(&format!("{l} ✓"), login_w)),
+                        format!(" {}", fit(&format!("⚿ {}", mask_name(app, l)), login_w)),
                         Style::new().fg(th.good),
                     ),
-                    (None, Some(_)) => {
-                        Span::styled(format!(" {}", fit("not saved", login_w)), th.bold(th.warn))
+                    (None, Some(_)) => Span::styled(
+                        format!(" {}", fit("not saved · c", login_w)),
+                        th.bold(th.warn),
+                    ),
+                    (None, None) => {
+                        Span::styled(format!(" {}", fit("(logged out)", login_w)), dim(app))
                     }
-                    (None, None) => Span::styled(format!(" {}", fit("-", login_w)), dim(app)),
                 });
                 let acct = s.and_then(|x| x.account.clone());
                 let name = match (&state.unverified_since, &acct) {
@@ -158,9 +182,10 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 }
                 (acct, false)
             }
-            LimitsRow::Login(label) => {
-                let l = app.vault.logins.iter().find(|x| &x.label == label);
-                // Where the login is, in the SEAT column: the seats that hold it, or free.
+            LimitsRow::Login(id) => {
+                let l = app.vault.logins.iter().find(|x| &x.id == id);
+                let label = l.map(|x| x.label.clone()).unwrap_or_default();
+                // The seats that hold it, or free.
                 let seats: Vec<String> = l
                     .map(|x| {
                         x.mounted
@@ -173,12 +198,15 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 let (where_, wc) = if seats.is_empty() {
                     ("free".to_string(), th.faint)
                 } else {
-                    (format!("→ {}", seats.join(", ")), th.dim)
+                    (seats.join(", "), th.good)
                 };
-                sp.push(Span::styled(fit(&where_, name_w), Style::new().fg(wc)));
                 sp.push(Span::styled(
-                    format!(" {}", fit(&format!("⚿ {label}"), login_w)),
-                    Style::new().fg(th.fg),
+                    fit(&format!("⚿ {}", mask_name(app, &label)), head_w),
+                    th.bold(th.fg),
+                ));
+                sp.push(Span::styled(
+                    format!(" {}", fit(&where_, login_w)),
+                    Style::new().fg(wc),
                 ));
                 let acct = l.and_then(|x| x.account_uuid.clone());
                 let name = acct
@@ -247,11 +275,11 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         )
                     })
                     .unwrap_or_default(),
-                LimitsRow::Login(label) => app
+                LimitsRow::Login(id) => app
                     .vault
                     .logins
                     .iter()
-                    .find(|x| &x.label == label)
+                    .find(|x| &x.id == id)
                     .and_then(|x| x.plan.clone().or_else(|| x.meta.subscription_type.clone()))
                     .unwrap_or_default(),
             };
@@ -316,8 +344,8 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                 };
                 (parts.join(" · "), colour)
             }
-            LimitsRow::Login(label) => {
-                let l = app.vault.logins.iter().find(|x| &x.label == label);
+            LimitsRow::Login(id) => {
+                let l = app.vault.logins.iter().find(|x| &x.id == id);
                 let read = weekly
                     .map(|w| {
                         format!(
@@ -351,7 +379,7 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
     }
     if focused && (lines.len() as u16) < inner.height {
         lines.push(Line::from(Span::styled(
-            "  ↑↓ select · Enter switch · S best login here · c save · a add · r rename · d forget · R re-read",
+            "  Enter: seat → pick a saved login · saved login → pick seats · S best · c save the seat's login · a add · r rename · d forget",
             faint(app),
         )));
     }
@@ -396,7 +424,7 @@ fn section_head(app: &App, h: Harness, rows: &[LimitsRow]) -> Line<'static> {
     };
     let (seats, logins) = (of(true), of(false));
     let mut what = format!(
-        " · {seats} seat{} · {logins} login{}",
+        " · {seats} seat{} · {logins} saved login{}",
         if seats == 1 { "" } else { "s" },
         if logins == 1 { "" } else { "s" }
     );
@@ -704,4 +732,28 @@ fn limit_curve(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(range, faint(app)));
     }
     put(f, legend, vec![Line::from(spans)]);
+}
+
+/// A seat's dir as shown: `~/…`, only its name when masking.
+fn seat_dir(app: &App, label: &str) -> String {
+    let Some(s) = app.seats.iter().find(|s| s.label == label) else {
+        return String::new();
+    };
+    let name = s
+        .dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if app.mask {
+        return name;
+    }
+    // The demo's made-up seats live in its data dir; shown where real ones would be.
+    if s.found_by.contains(&"demo") {
+        return format!("~/{name}");
+    }
+    let home = directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf());
+    match home.and_then(|h| s.dir.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
+        Some(rest) => format!("~/{}", rest.display()),
+        None => s.dir.display().to_string(),
+    }
 }

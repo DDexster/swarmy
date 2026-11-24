@@ -284,23 +284,25 @@ fn draw_panel_now(f: &mut Frame, app: &mut App, p: Panel, area: Rect, big: bool)
     }
 }
 
-/// Rows the LIMITS · SEATS table needs: borders, header, one per seat and saved login, section
-/// headings and a hint.
+/// Rows the LIMITS · SEATS table needs: borders, one per seat and saved login, per harness a
+/// header for its seats and one for its saved logins (and its plate, with several harnesses),
+/// and a hint.
 fn limits_height(app: &App) -> u16 {
+    use super::app::LimitsRow;
     let rows = app.limits_rows();
-    // One heading per harness section, or the one SAVED LOGINS heading.
-    let headings = if app.limits_sections() {
-        rows.iter()
-            .map(|r| app.row_harness(r))
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-    } else {
-        usize::from(
-            rows.iter()
-                .any(|r| matches!(r, super::app::LimitsRow::Login(_))),
-        )
-    };
-    (rows.len() + headings) as u16 + 4
+    let mut heads = 0usize;
+    let mut last: Option<(crate::core::harness::Harness, bool)> = None;
+    for r in &rows {
+        let h = app.row_harness(r);
+        let seat = matches!(r, LimitsRow::Seat(_));
+        if last.is_none_or(|(lh, _)| lh != h) {
+            heads += usize::from(app.limits_sections()) + 1;
+        } else if last.is_some_and(|(_, ls)| ls && !seat) {
+            heads += 1;
+        }
+        last = Some((h, seat));
+    }
+    (rows.len() + heads) as u16 + 3
 }
 
 /// Everything at once (from about 250×55).

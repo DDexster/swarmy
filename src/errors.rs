@@ -19,8 +19,8 @@ pub enum VaultError {
     NoLogin(String),
     #[error("'{key}' names several logins: {}; use the label", .logins.join(", "))]
     AmbiguousLogin { key: String, logins: Vec<String> },
-    #[error("a login labelled '{0}' already exists")]
-    LabelTaken(String),
+    #[error("a {harness} login labelled '{label}' already exists")]
+    LabelTaken { label: String, harness: String },
     #[error("a label is needed")]
     LabelEmpty,
     #[error("login '{login}' is a {login_harness} login; seat '{seat}' runs {seat_harness}")]
@@ -120,7 +120,7 @@ impl Coded for VaultError {
             VaultError::NewerFormat(_) => "vault-newer",
             VaultError::NoLogin(_) => "vault-no-login",
             VaultError::AmbiguousLogin { .. } => "vault-ambiguous-login",
-            VaultError::LabelTaken(_) => "vault-label-taken",
+            VaultError::LabelTaken { .. } => "vault-label-taken",
             VaultError::LabelEmpty => "vault-label-empty",
             VaultError::WrongHarness { .. } => "vault-wrong-harness",
             VaultError::InUse { .. } => "vault-in-use",
@@ -225,7 +225,11 @@ mod tests {
                 logins: vec![],
             }
             .code(),
-            VaultError::LabelTaken(String::new()).code(),
+            VaultError::LabelTaken {
+                label: String::new(),
+                harness: String::new(),
+            }
+            .code(),
             VaultError::LabelEmpty.code(),
             VaultError::WrongHarness {
                 login: String::new(),
