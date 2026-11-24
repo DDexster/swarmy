@@ -9,7 +9,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 
 - **English only**: UI text, docs, code, commits.
 - **Offline and read-only.** No network calls, no telemetry. The harnesses' directories (Claude
-  Code, Antigravity) are only read; the single write is an explicit vault switch (`src/vault`),
+  Code, Antigravity, Codex) are only read; the single write is an explicit vault switch (`src/vault`),
   which saves the seat's current login first, backs up the seat's files, writes atomically,
   merges only `oauthAccount` into `.claude.json` as it is right before the write, and keeps
   `mcpOAuth` (Claude Code); for an agy seat it replaces `antigravity-oauth-token` whole. A login
@@ -63,13 +63,13 @@ logins. Users run it in a spare terminal, mostly on laptops.
     `App::t`/`animating` makes its panel drawn every frame. `--mask` blanks words in one pass
     per row (`mask_words`).
   - The guard: `tools/perf.sh` (and `tools/perf.sh --mask`) runs a release build on
-    `swarmy demo --wall` (three Claude Code seats and one agy seat, ten days of ~12,600 requests a
+    `swarmy demo --wall` (three Claude Code seats, one agy seat and one Codex home, ten days of ~12,600 requests a
     day, ~18 agents at work)
     in a 326×81 tmux window and fails above 2.0 (2.3 with `--mask`) CPU-seconds per minute.
     Run it before merging anything that touches the worker, the index reads or the view. CPU
     time still moves by 10–15% with the machine's load (SMT siblings): near the budget, run it
     again on a quieter machine before concluding.
-- Prices are versioned data (`src/core/pricing.rs`, overridable by Claude Code's cache and
+- Prices are versioned data (`src/core/pricing.rs`, the built-in table in `pricing/builtin.rs`, overridable by Claude Code's cache and
   `config.toml`), never ad-hoc constants. Built-in prices carry their model's date; each version
   of Claude Code's cached prices applies from the day the index first saw it; an override derives
   what it leaves out from the entry it overrides (`Rates::derive`). Money numbers in tests are
@@ -118,6 +118,8 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/lib.rs`, `src/main.rs` | the library holds everything; the binary only parses arguments and calls `cli::run` |
 | `src/core/` | pure domain: usage, pricing, periods, limits math, storage rules (raw window, growth, projection; no I/O) |
 | `src/agy/` | readers of Google Antigravity's files: seat discovery, `brain/<cid>/…/transcript.jsonl`, conversation metadata (SQLite reads in `index/agy_summaries.rs`, cached by file stamp), live conversations from `presence/*.lock` (Linux: `/proc/locks`, no lock of ours), the token file (`credentials.rs`) and its account |
+| `src/codex/` | readers of OpenAI Codex's files: home discovery, rollouts (`rollout.rs`: the state before an offset kept per file, replayed once when missing), thread names and finding a thread's rollout (`meta.rs`), open threads from `thread-writer-locks/*.lock` (`live.rs`), the account of `auth.json` (`account.rs`) |
+| `src/fsutil/locks.rs` | which lock files of a dir another process holds (Linux: `/proc/locks`, with the holder's pid; elsewhere a shared-lock probe), for agy and Codex |
 | `src/core/harness.rs`, `src/core/login.rs` | the harnesses and what each supports; a login's secret and non-secret facts per harness (pure) |
 | `src/claude/` | readers of Claude Code's files: seats discovery, transcripts, registry, `.claude.json`, credentials, processes, projects |
 | `src/index/` | SQLite index (incremental by inode/offset, offsets checked again inside an immediate transaction), schema (in-place `CACHE_STEPS`), queries; `write.rs`: one file's records into the batch transaction; `insights.rs`: efficiency figures (tools, commands, waits, cache, agent types, fleet, conflicts); `prices.rs`: dating Claude Code's prices, repricing; `archive.rs`: rollup columns declared once (`KEYS`, `SUMS`), read plans (a span inside the raw window reads `requests` with the old SQL; one reaching `rolled_until` reads the union with the rollups); `archive_scenarios.rs`: the proof that rolled-up spend reads the same everywhere; `compact.rs`: the compactor (raw rows older than `keep_raw_days` into the rollups, one transaction per 6-hour chunk; giving space back, the one-time `VACUUM`), proved in `compact_scenarios.rs`; `projects.rs`: the cwd → project table, recomputed over raw and rolled-up cwds, never downgraded; `storage.rs`: the index's size, daily samples, last compaction (doctor, SYSTEM); `marks.rs`: read marks, the one rule that keeps a file read again after a compaction from counting rolled-up records twice; `scenarios.rs`: scenario tests on synthetic seats; `live.rs`: typed reads for `live` (the connection is private: SQL stays in `index/`) |
@@ -129,7 +131,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
 | `src/cli/` | commands: report, models, limits, accounts, doctor, prices, compact |
 | `src/tui/` | dashboard: UI loop (`mod.rs`), worker thread (`worker.rs`) on the cadences of `jobs.rs`, analytics passes (`analytics.rs`), state (`app/mod.rs`) and keys (`app/keys.rs`), what needs attention and what gets logged (`alerts.rs`: pure, tested), vault in the LIMITS · SEATS panel (`vault_ui.rs`), boot animation, themes |
 | `src/tui/view/` | drawing: layouts wall / column / tabs, header, footer (`mod.rs`); dialogs and toast (`overlays.rs`); help and legend (`help.rs`); panels that fill any rect (`panels/`, one file per panel, shared helpers in `panels/mod.rs`); primitives (`kit.rs`) |
-| `src/demo.rs` | made-up world for `swarmy demo` and README media |
+| `src/demo.rs` | made-up world for `swarmy demo` and README media (`demo/agy.rs`, `demo/codex.rs`: those harnesses' seats) |
 | `tools/render_frames.py` | renders recorded frames to PNG/GIF |
 | `tools/record-readme.sh` | regenerates `docs/img/*` |
 | `tools/prices-from-litellm.py` | compares the built-in prices with LiteLLM's list (run by hand; swarmy stays offline) |
@@ -204,6 +206,38 @@ logins. Users run it in a spare terminal, mostly on laptops.
 - The login is the whole `antigravity-oauth-token` (`token.refresh_token`, `token.expiry`,
   `auth_method`, `id_token_email`); agy skips saving a refreshed token when the file changed
   under it, so a vault switch is not undone by a running agy.
+
+## Codex format notes (verified on Codex CLI 0.172.0)
+
+- Home `~/.codex`, or `CODEX_HOME`. Threads in
+  `sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDTHH-MM-SS>-<thread uuid>.jsonl`, names in
+  `session_index.jsonl` (`{id, thread_name, updated_at}`), login in `auth.json`.
+- A rollout line is `{timestamp, type, payload}`: `session_meta` (first line: `id`, `cwd`, `git`
+  with `branch`, `cli_version`, `creator_user_id`, `creator_account_id`), `turn_context` (`model`,
+  `cwd`, effort in `collaboration_mode.settings.reasoning_effort`), `response_item` (`message`,
+  `additional_tools`, …), `event_msg` (`task_started`, `task_complete` with `duration_ms`,
+  `thread_settings_applied`, `item_completed` whose `item.type` `UserMessage` is a prompt,
+  `token_count`), `token_usage_record`, `world_state` (the whole context: skipped).
+- Usage is per response: `token_usage_record.usage` (with `response_id` and the thread's running
+  `thread_token_usage`), then a `token_count` with the same numbers (`info.last_token_usage`,
+  `info.total_token_usage`). `input_tokens` includes `cached_input_tokens`; `output_tokens`
+  includes `reasoning_output_tokens` (`last_usage_includes_reasoning: true`). A response is named
+  by the thread's running total (`cdx:<thread>:<total>`) so both lines are one request. The model
+  is only on the `turn_context` before: `codex::rollout` keeps each file's state at the end of a
+  read and replays the file up to an offset it has no state for.
+- `token_count.rate_limits` gives `primary`/`secondary` `{used_percent, window_minutes,
+  resets_at}`, `plan_type`; seen: one 43,200-minute (30-day) primary window on a `go` plan, no
+  secondary. Not read yet: `core::limits` knows 5-hour and 7-day windows only.
+- An open thread: Codex's `codex app-server` (a child of the `codex` the user runs) holds
+  `FLOCK WRITE` on `thread-writer-locks/<thread>.lock` (`.coordination.lock` is not a thread).
+  No process keeps the rollout open between writes.
+- `auth.json`: `auth_mode` (`chatgpt`), `OPENAI_API_KEY`, `tokens` (`id_token`, `access_token`,
+  `refresh_token`, `account_id`, …), `last_refresh`. The `id_token` claims name the account
+  (`https://api.openai.com/auth`: `chatgpt_user_id` = `session_meta.creator_user_id`,
+  `chatgpt_account_id` = `creator_account_id` = `tokens.account_id`, `chatgpt_plan_type`): an
+  account is `cdx:<user>/<workspace>`. The vault keeps no Codex logins yet.
+- Rollouts of 2025 versions have no envelope (a header `{id, timestamp, instructions, git}`, then
+  bare items and `{"record_type": "state"}`), no timestamps and no tokens: counted as `legacy`.
 
 ## Commands
 

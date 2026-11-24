@@ -1,6 +1,6 @@
 # swarmy
 
-**Mission control for Claude Code (and Antigravity) agents, in your terminal.**
+**Mission control for Claude Code (and Antigravity and Codex) agents, in your terminal.**
 
 [![CI](https://github.com/koorchik/swarmy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/koorchik/swarmy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/koorchik/swarmy?sort=semver)](https://github.com/koorchik/swarmy/releases/latest)
@@ -36,9 +36,10 @@ worktrees) and put swarmy in a spare terminal next to them.
 - **Worktrees and branches.** Each session shows the checkout it works in (`shop/fix-1` for a git
   worktree) and its branch; `⇄2` warns when two live sessions edit the same checkout. Spend per
   worktree and per branch, and how much of each project's work ran in worktrees.
-- **Google Antigravity too.** `agy` seats, conversations and subagents sit in the same tree,
-  panels and reports as Claude Code's, Gemini models priced at Google's list prices; `--harness`
-  and `--by harness` tell them apart.
+- **Google Antigravity and OpenAI Codex too.** `agy` seats, conversations and subagents, and
+  Codex homes and threads, sit in the same tree, panels and reports as Claude Code's; Gemini and
+  GPT models priced at Google's and OpenAI's list prices; one project for a repo whichever agent
+  worked on it; `--harness` and `--by harness` tell them apart.
 - **A status line inside Claude Code.** Who needs you in your other sessions, this session's
   agents, the exact week used and when it runs out.
 - **A vault for several accounts.** Save each config dir's login, put another account's login in
@@ -70,8 +71,8 @@ them and works alongside either.
 
 What swarmy adds:
 
-- **One live view of every agent, subagents included,** across all your Claude Code config dirs
-  and Antigravity, whoever started them: a launcher sees the panes it owns, not the twenty
+- **One live view of every agent, subagents included,** across all your Claude Code config dirs,
+  Antigravity and Codex, whoever started them: a launcher sees the panes it owns, not the twenty
   subagents working inside one session.
 - **Money and limits next to the agents.** What each agent and session costs as it runs, where each
   account's weekly limit went by project, and when it runs out at the current pace.
@@ -81,8 +82,8 @@ What swarmy adds:
   relay, no telemetry, no network calls at all. Your transcripts, spend and logins never leave
   the machine.
 - **Hands off.** No hooks or wrappers around the agents, and no automation that types into them.
-  It only reads what Claude Code and Antigravity already write to disk, so nothing changes in how
-  you run them.
+  It only reads what Claude Code, Antigravity and Codex already write to disk, so nothing changes
+  in how you run them.
 
 | | swarmy | launchers (herdr, claude-squad, …) | usage counters (ccusage, …) |
 |---|---|---|---|

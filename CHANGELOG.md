@@ -3,6 +3,21 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+- **OpenAI Codex as a third harness**: its homes (`~/.codex`, `~/.codex-*`, the `CODEX_HOME` of
+  running `codex` processes, `[[seat]] harness = "codex"`), threads read from their rollouts
+  (each response once, though Codex writes its usage twice), tool calls, prompts, thread names
+  and the account a thread runs under; one project per repo whichever harness worked on it;
+  `--harness codex`, `--by harness`, `cdx` in SWARM, MODELS and BURN. Open threads are live in
+  SWARM (thinking, a tool, idle), found by the lock Codex holds on each open thread.
+- **OpenAI prices** (GPT-6 Luna, Sol, Astra; 6.1, 6.2; GPT-5.6 Terra, Luna, Sol; 5.5 back to
+  GPT-5 and the Codex models) as dated built-in rows, with the 272K long-context rule and the
+  priority tier; `tools/prices-from-litellm.py` compares them too. The built-in table moved to
+  `src/core/pricing/builtin.rs`.
+- Codex seats show their spend in LIMITS · SEATS (no local quota is read yet) and are not kept in
+  the vault. The index's facts move to version 5 (the seats table learns the new harness).
+
 ## v0.2.0
 
 Antigravity next to Claude Code, worktrees and branches, and logins shared between seats.
