@@ -1,8 +1,8 @@
 //! Live session detection for Google Antigravity CLI (`agy`).
 //!
 //! Every running `agy` instance holds an exclusive OS lock on
-//! `<seat>/presence/<conversation_id>.lock`. Checking `File::try_lock_shared()` on a read-only
-//! handle detects live conversations without ever modifying any file.
+//! `<seat>/presence/<conversation_id>.lock`; `fsutil::locks` says which are held without ever
+//! modifying any file.
 //!
 //! On Linux, inspecting `/proc/<pid>/fd` and `/proc/<pid>/environ` for `agy` processes maps each
 //! locked conversation to its exact PID, working directory and `TMUX_PANE` (for `J` / `swarmy jump`
@@ -10,9 +10,7 @@
 //! never scan `/proc`.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, TryLockError};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 
@@ -31,18 +29,6 @@ pub struct AgyProcInfo {
     pub pane: Option<crate::core::pane::Pane>,
 }
 
-/// A lock file of `presence/`: its conversation id and, on Unix, the (device, inode) that
-/// `/proc/locks` names it by.
-#[derive(Debug, Clone)]
-struct LockFile {
-    cid: String,
-    #[cfg_attr(
-        not(target_os = "linux"),
-        allow(dead_code, reason = "only Linux names locks by (device, inode)")
-    )]
-    id: Option<(u64, u64)>,
-}
-
 /// Per-seat cache keeping per-second `agy` live detection inside the battery budget:
 /// - `presence/` is listed again only when its mtime changes;
 /// - on Linux, which lock files are held comes from one read of `/proc/locks` (no lock of ours
@@ -52,7 +38,7 @@ struct LockFile {
 ///   second.
 #[derive(Debug, Default)]
 pub struct AgyLiveCache {
-    presence_dirs: HashMap<PathBuf, (Option<SystemTime>, Vec<LockFile>)>,
+    presence_dirs: crate::fsutil::locks::LockDirs,
     by_conv: HashMap<String, AgyProcInfo>,
     /// The locked conversations the last `/proc` scan was made for, per seat dir.
     scanned_for: HashMap<PathBuf, Vec<String>>,
@@ -61,18 +47,7 @@ pub struct AgyLiveCache {
 impl AgyLiveCache {
     /// Conversation IDs whose `presence/<cid>.lock` is currently locked by a running `agy`.
     pub fn locked_conversations(&mut self, seat_dir: &Path) -> Vec<String> {
-        let dir = seat_dir.join("presence");
-        let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
-        let files = match self.presence_dirs.get(&dir) {
-            Some((prev, list)) if *prev == mtime && mtime.is_some() => list.clone(),
-            Some(_) | None => {
-                let list = list_lock_files(&dir);
-                self.presence_dirs
-                    .insert(dir.clone(), (mtime, list.clone()));
-                list
-            }
-        };
-        held(&dir, &files)
+        self.presence_dirs.held(&seat_dir.join("presence"))
     }
 
     /// PIDs currently cached for live `agy` conversations (for `ProcTable::for_pids`).
@@ -110,118 +85,7 @@ impl AgyLiveCache {
 
 /// Stateless one-shot helper for CLI commands (`doctor`, `jump`).
 pub fn locked_conversations_once(seat_dir: &Path) -> Vec<String> {
-    let dir = seat_dir.join("presence");
-    held(&dir, &list_lock_files(&dir))
-}
-
-fn list_lock_files(presence_dir: &Path) -> Vec<LockFile> {
-    let Ok(rd) = std::fs::read_dir(presence_dir) else {
-        return Vec::new();
-    };
-    let mut out: Vec<LockFile> = rd
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            let cid = name.strip_suffix(".lock")?.to_string();
-            Some(LockFile {
-                cid,
-                id: file_id(&e.path()),
-            })
-        })
-        .collect();
-    out.sort_by(|a, b| a.cid.cmp(&b.cid));
-    out
-}
-
-#[cfg(unix)]
-fn file_id(p: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(_p: &Path) -> Option<(u64, u64)> {
-    None
-}
-
-/// The conversations whose lock file someone holds.
-fn held(presence_dir: &Path, files: &[LockFile]) -> Vec<String> {
-    #[cfg(target_os = "linux")]
-    if let Some(locks) = proc_locks() {
-        return files
-            .iter()
-            .filter(|f| {
-                f.id.is_some_and(|(dev, ino)| locks.contains(&(dev_parts(dev), ino)))
-            })
-            .map(|f| f.cid.clone())
-            .collect();
-    }
-    files
-        .iter()
-        .filter(|f| is_locked(&presence_dir.join(format!("{}.lock", f.cid))))
-        .map(|f| f.cid.clone())
-        .collect()
-}
-
-/// Linux's split of a `st_dev` into (major, minor), as `/proc/locks` prints them.
-#[cfg(target_os = "linux")]
-fn dev_parts(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    (major, minor)
-}
-
-/// Every lock in `/proc/locks` as ((major, minor), inode); `None` when it cannot be read.
-#[cfg(target_os = "linux")]
-fn proc_locks() -> Option<HashSet<((u64, u64), u64)>> {
-    parse_proc_locks(&std::fs::read_to_string("/proc/locks").ok()?)
-}
-
-/// Lines look like `90: FLOCK  ADVISORY  WRITE 1060823 103:02:60181261 0 EOF` (major and
-/// minor in hex); a blocked waiter (`-> FLOCK …`) holds nothing.
-#[cfg(any(target_os = "linux", test))]
-fn parse_proc_locks(text: &str) -> Option<HashSet<((u64, u64), u64)>> {
-    let mut out = HashSet::new();
-    for line in text.lines() {
-        let mut f = line.split_whitespace();
-        let (Some(_), Some(kind)) = (f.next(), f.next()) else {
-            continue;
-        };
-        if kind == "->" {
-            continue;
-        }
-        let Some(dev_ino) = f.nth(3) else { continue };
-        let mut parts = dev_ino.split(':');
-        let (Some(maj), Some(min), Some(ino)) = (parts.next(), parts.next(), parts.next()) else {
-            continue;
-        };
-        let (Ok(maj), Ok(min), Ok(ino)) = (
-            u64::from_str_radix(maj, 16),
-            u64::from_str_radix(min, 16),
-            ino.parse::<u64>(),
-        ) else {
-            continue;
-        };
-        out.insert(((maj, min), ino));
-    }
-    Some(out)
-}
-
-/// True when another process holds an exclusive lock on `path` (the probe where `/proc/locks`
-/// is not there). Uses a read-only file handle and `File::try_lock_shared()` so swarmy never
-/// opens `agy` files for writing.
-pub fn is_locked(path: &Path) -> bool {
-    let Ok(f) = File::open(path) else {
-        return false;
-    };
-    match f.try_lock_shared() {
-        Ok(()) => {
-            let _ = f.unlock();
-            false
-        }
-        Err(TryLockError::WouldBlock) => true,
-        Err(TryLockError::Error(_)) => false,
-    }
+    crate::fsutil::locks::held_once(&seat_dir.join("presence"))
 }
 
 /// Builds normalized [`LiveSession`]s from locked conversations, their `conversation_summaries`
@@ -373,26 +237,6 @@ fn scan_agy_procs(_seat_dir: &Path) -> HashMap<String, AgyProcInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn reads_held_locks_from_proc_locks() {
-        let text = "1: POSIX  ADVISORY  WRITE 3178 103:02:59507537 0 0\n\
-                    90: FLOCK  ADVISORY  WRITE 1060823 103:02:60181261 0 EOF\n\
-                    90: -> FLOCK  ADVISORY  WRITE 1060999 103:02:77 0 EOF\n";
-        let locks = parse_proc_locks(text).unwrap();
-        assert!(locks.contains(&((0x103, 2), 60181261)));
-        assert!(locks.contains(&((0x103, 2), 59507537)));
-        assert!(!locks.contains(&((0x103, 2), 77)), "a waiter holds nothing");
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn splits_a_linux_device_number() {
-        // makedev(259, 2) = 0x10302
-        assert_eq!(dev_parts(0x10302), (259, 2));
-        // makedev(8, 1) = 0x801
-        assert_eq!(dev_parts(0x801), (8, 1));
-    }
 
     #[test]
     fn detects_locked_vs_unlocked_presence_files() {

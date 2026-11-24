@@ -3,6 +3,8 @@
 //! it, so every write has the same guarantee: a crash leaves the old file or the new one, never
 //! half of one, and two writers (two threads, two processes) never share a temp file.
 
+pub mod locks;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};

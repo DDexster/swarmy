@@ -2,6 +2,7 @@
 
 pub mod harness;
 pub mod ids;
+pub mod jwt;
 pub mod limits;
 pub mod login;
 pub mod models;
