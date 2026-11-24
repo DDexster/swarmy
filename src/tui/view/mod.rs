@@ -302,7 +302,17 @@ fn limits_height(app: &App) -> u16 {
         }
         last = Some((h, seat));
     }
-    (rows.len() + heads) as u16 + 3
+    // A note under the seats of a harness whose logins cannot be kept here.
+    let notes = crate::core::harness::Harness::ALL
+        .iter()
+        .filter(|h| {
+            crate::vault::unavailable(**h).is_some()
+                && rows
+                    .iter()
+                    .any(|r| matches!(r, LimitsRow::Seat(_)) && app.row_harness(r) == **h)
+        })
+        .count();
+    (rows.len() + heads + notes) as u16 + 3
 }
 
 /// Everything at once (from about 250×55).

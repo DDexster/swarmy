@@ -101,6 +101,9 @@ fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
                     .join(", ")
             )
         })?;
+    if let Some(e) = vault::unavailable(found.harness) {
+        return Err(e.into());
+    }
     if !found.harness.supports_vault() {
         bail!(
             "seat '{}' uses {}, whose logins the vault does not keep",
@@ -271,6 +274,10 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
             Ok(())
         }
         AccountsCmd::Add { label, harness } => {
+            // Said before the sign-in, not after it.
+            if let Some(e) = vault::unavailable(harness) {
+                return Err(e.into());
+            }
             let scratch = ctx
                 .dirs
                 .vault_dir()
@@ -438,6 +445,9 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                         format!("not saved: swarmy accounts capture {}", s.label),
                         Tone::Warn,
                     ),
+                    (None, None) if vault::unavailable(h).is_some() => {
+                        Cell::tone("in the Keychain", Tone::Dim)
+                    }
                     (None, None) => Cell::tone("(logged out)", Tone::Dim),
                 },
                 match (&st.unverified_since, acct.as_deref()) {
@@ -466,6 +476,10 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
             println!("{}", indent(&t.render(p)));
         }
         // Saved logins: what the vault keeps for this harness, and which seats use each.
+        if let Some(e) = vault::unavailable(h) {
+            println!("{}", p.paint(&format!("  saved logins · {e}"), Tone::Dim));
+            continue;
+        }
         println!(
             "{}",
             p.paint(

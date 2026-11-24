@@ -19,6 +19,7 @@ use serde_json::{Map, Value, json};
 
 use crate::app::context::Ctx;
 use crate::claude::seats::Seat;
+use crate::core::harness::Harness;
 use crate::ui::style::Tone;
 
 #[derive(Args, Debug, Clone)]
@@ -324,6 +325,17 @@ pub fn run(ctx: &Ctx, a: &SetupArgs) -> anyhow::Result<()> {
     }
 
     // 2. Saved logins.
+    // Claude Code on macOS keeps its login in the Keychain: say so instead of offering nothing.
+    if !a.remove
+        && !a.no_vault
+        && ctx.seats.iter().any(|s| s.harness == Harness::Claude)
+        && let Some(e) = crate::vault::unavailable(Harness::Claude)
+    {
+        println!(
+            "{}",
+            ctx.painter.paint(&format!("Saved logins: {e}."), Tone::Dim)
+        );
+    }
     if !a.remove && !a.no_vault {
         let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
         let vault_seats: Vec<Seat> = ctx

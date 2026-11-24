@@ -120,6 +120,32 @@ pub struct SeatLogin {
     pub account: Option<config_json::Account>,
 }
 
+/// Why the vault cannot keep `harness`'s logins on this machine, when that is known up front
+/// (Claude Code on macOS keeps them in the Keychain), so the dashboard and the commands say so
+/// before anything is tried instead of after a login was made.
+pub fn unavailable(harness: Harness) -> Option<VaultError> {
+    unavailable_on(harness, std::env::consts::OS)
+}
+
+fn unavailable_on(harness: Harness, os: &str) -> Option<VaultError> {
+    match (harness, os) {
+        (Harness::Claude, "macos") => Some(VaultError::Keychain),
+        (Harness::Claude | Harness::Agy, _) => None,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn claude_logins_are_unavailable_on_macos_only() {
+    assert!(matches!(
+        unavailable_on(Harness::Claude, "macos"),
+        Some(VaultError::Keychain)
+    ));
+    assert!(unavailable_on(Harness::Claude, "linux").is_none());
+    assert!(unavailable_on(Harness::Claude, "windows").is_none());
+    assert!(unavailable_on(Harness::Agy, "macos").is_none());
+}
+
 pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
     let path = seat.credentials_file();
     let text = match std::fs::read_to_string(&path) {

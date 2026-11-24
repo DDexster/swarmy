@@ -155,6 +155,10 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         format!(" {}", fit("not saved · c", login_w)),
                         th.bold(th.warn),
                     ),
+                    // Not readable here (Claude Code on macOS: the Keychain), not logged out.
+                    (None, None) if crate::vault::unavailable(h).is_some() => {
+                        Span::styled(format!(" {}", fit("in Keychain", login_w)), dim(app))
+                    }
                     (None, None) => {
                         Span::styled(format!(" {}", fit("(logged out)", login_w)), dim(app))
                     }
@@ -376,6 +380,23 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
             line = line.style(Style::new().bg(th.sel));
         }
         lines.push(line);
+        // After a harness's seats, where its logins cannot be kept here: why, instead of an
+        // empty saved-logins table.
+        let next_is_seat_here = rows
+            .get(i + 1)
+            .is_some_and(|n| matches!(n, LimitsRow::Seat(_)) && app.row_harness(n) == h);
+        if matches!(r, LimitsRow::Seat(_))
+            && !next_is_seat_here
+            && let Some(e) = crate::vault::unavailable(h)
+        {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    fit(&format!("saved logins: {e}"), width.saturating_sub(2))
+                ),
+                faint(app),
+            )));
+        }
     }
     if focused && (lines.len() as u16) < inner.height {
         lines.push(Line::from(Span::styled(

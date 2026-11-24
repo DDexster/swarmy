@@ -36,7 +36,9 @@ pub enum VaultError {
     InUse { login: String, seat: String },
     #[error("the secret of '{0}' is missing from the vault")]
     MissingSecret(String),
-    #[error("on macOS Claude Code keeps the login in the Keychain; the vault cannot read it yet")]
+    #[error(
+        "on macOS Claude Code keeps its login in the Keychain, so swarmy cannot save or switch Claude Code logins there yet (the dashboard, limits and reports work as usual)"
+    )]
     Keychain,
     #[error("{0} keeps its login in the OS keyring here; the vault cannot read it")]
     Keyring(String),

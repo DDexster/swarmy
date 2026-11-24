@@ -188,6 +188,18 @@ impl App {
             .collect()
     }
 
+    /// Says why the vault cannot work with `h`'s logins here (Claude Code on macOS), before
+    /// anything is tried; true when it cannot.
+    fn vault_blocked(&mut self, h: Harness) -> bool {
+        match crate::vault::unavailable(h) {
+            Some(e) => {
+                self.toast(e.to_string(), Tone::Warn);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn selected_row(&self) -> Option<LimitsRow> {
         self.limits_rows().get(self.cur(Panel::Limits)).cloned()
     }
@@ -371,6 +383,18 @@ impl App {
         }
         let rows = self.limits_rows();
         let cur = self.cur(Panel::Limits).min(rows.len().saturating_sub(1));
+        // Keys that read or write a seat's login, refused up front where the vault cannot.
+        let row_h = self.selected_row().map(|r| self.row_harness(&r));
+        let touches_login = matches!(
+            k.code,
+            KeyCode::Enter | KeyCode::Char('S') | KeyCode::Char('c')
+        );
+        if touches_login
+            && let Some(h) = row_h
+            && self.vault_blocked(h)
+        {
+            return true;
+        }
         match k.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.cursor
@@ -435,6 +459,9 @@ impl App {
                 let h = self
                     .selected_row()
                     .map_or(Harness::Claude, |r| self.row_harness(&r));
+                if self.vault_blocked(h) {
+                    return true;
+                }
                 let (program, hint) = crate::vault::new_login_recipe(h);
                 self.vault.modal = Some(Modal::Input {
                     title: format!(
