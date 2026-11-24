@@ -36,6 +36,10 @@ pub struct AgyProcInfo {
 #[derive(Debug, Clone)]
 struct LockFile {
     cid: String,
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(dead_code, reason = "only Linux names locks by (device, inode)")
+    )]
     id: Option<(u64, u64)>,
 }
 
