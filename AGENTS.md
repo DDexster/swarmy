@@ -12,8 +12,12 @@ logins. Users run it in a spare terminal, mostly on laptops.
   Code, Antigravity, Codex) are only read; the single write is an explicit vault switch (`src/vault`),
   which saves the seat's current login first, backs up the seat's files, writes atomically,
   merges only `oauthAccount` into `.claude.json` as it is right before the write, and keeps
-  `mcpOAuth` (Claude Code); for an agy seat it replaces `antigravity-oauth-token` whole. A login
-  belongs to one harness and may be in several seats of it (`Login::mounted`). Every vault change goes through
+  `mcpOAuth` (Claude Code); for an agy seat it replaces `antigravity-oauth-token` whole, for a
+  Codex seat `auth.json` whole. A login belongs to one harness and may be in several seats of it
+  (`Login::mounted`) — except Codex (`Harness::shares_logins`): OpenAI's refresh tokens are
+  single-use, so a Codex login is in one seat only and putting it into another moves it
+  (`VaultTx::switch_moving`: the seats swap, or the one it leaves keeps no login), never while
+  Codex runs in either seat. Every vault change goes through
   `Vault::edit` (OS lock, re-read under it, backup, atomic writes); never write vault files elsewhere.
   A switch is all or nothing for the seat (`vault/switch.rs`): `.credentials.json` is replaced only
   while it holds what was saved (`store::replace_if_unchanged`), `.claude.json` through
@@ -235,7 +239,16 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `refresh_token`, `account_id`, …), `last_refresh`. The `id_token` claims name the account
   (`https://api.openai.com/auth`: `chatgpt_user_id` = `session_meta.creator_user_id`,
   `chatgpt_account_id` = `creator_account_id` = `tokens.account_id`, `chatgpt_plan_type`): an
-  account is `cdx:<user>/<workspace>`. The vault keeps no Codex logins yet.
+  account is `cdx:<user>/<workspace>`. The access token lives 10 days. Refresh tokens are
+  single-use: Codex says "your refresh token was already used. Please log out and sign in again"
+  (in its binary), so the vault keeps a Codex login in one seat and follows each refresh there
+  (`vault::seats::is_rotation`); the whole file is the login (`codex::credentials`).
+- Code mode (0.172): the model writes a short script that calls tools
+  (`await tools.exec_command({cmd: "ls -la"})`), run as one `custom_tool_call` named `exec`; the
+  commands it ran come later as `item_completed` items of type `CommandExecution` (`command`,
+  `parsed_cmd`, `exit_code`, `duration`). swarmy counts the script as one call, named after the
+  tool it calls (`exec_command`, a shell) and summed up by its commands (`codex::rollout::code_mode`);
+  the `CommandExecution` items are not counted again.
 - Rollouts of 2025 versions have no envelope (a header `{id, timestamp, instructions, git}`, then
   bare items and `{"record_type": "state"}`), no timestamps and no tokens: counted as `legacy`.
 

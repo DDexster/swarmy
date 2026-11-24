@@ -82,6 +82,15 @@ impl Harness {
     /// Whether the login vault (`src/vault`) can save and switch logins for seats of this harness.
     pub fn supports_vault(self) -> bool {
         match self {
+            Harness::Claude | Harness::Agy | Harness::Codex => true,
+        }
+    }
+
+    /// Whether one saved login may be in several seats of this harness at once. Codex's refresh
+    /// tokens are single-use (OpenAI refuses one used before), so two seats would sign each other
+    /// out.
+    pub fn shares_logins(self) -> bool {
+        match self {
             Harness::Claude | Harness::Agy => true,
             Harness::Codex => false,
         }

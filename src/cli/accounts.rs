@@ -216,6 +216,30 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
         } => {
             let s = seat(ctx, &key)?;
             let live = live_in(ctx, s);
+            // A running Codex refreshes the login it loaded and may write it back over the new
+            // one; that refresh also spends the refresh token the vault saved. Never forced, in
+            // this seat or in the one a Codex login moves out of.
+            if s.harness == crate::core::harness::Harness::Codex {
+                // An unknown login is refused by the switch itself, with its own message.
+                let holders: Vec<&Seat> = match v.find_in(&login, Some(s.harness)) {
+                    Ok(l) => ctx
+                        .seats
+                        .iter()
+                        .filter(|o| l.is_in(&o.id) && o.id != s.id)
+                        .collect(),
+                    Err(_) => Vec::new(),
+                };
+                for o in std::iter::once(s).chain(holders) {
+                    let n = live_in(ctx, o);
+                    if n > 0 {
+                        bail!(
+                            "Codex is running in seat '{}' ({n} thread(s)). It keeps the login it loaded, and a refresh \
+                             of it would undo the switch (OpenAI refresh tokens are single-use). Quit Codex there first.",
+                            o.label
+                        );
+                    }
+                }
+            }
             if live > 0 && !force {
                 let how = match s.harness {
                     crate::core::harness::Harness::Claude => {
@@ -225,7 +249,7 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                     crate::core::harness::Harness::Agy => {
                         "A running agy keeps the login it loaded until it restarts (it does not write its old token back)."
                     }
-                    // Refused by the vault (`VaultError::Unsupported`) before anything is read.
+                    // Refused above, whatever --force says.
                     crate::core::harness::Harness::Codex => "",
                 };
                 bail!(
@@ -234,7 +258,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                     s.label
                 );
             }
-            let rep = v.edit(|tx| tx.switch(s, &login))?;
+            let seats = vault_seats(ctx);
+            let rep = v.edit(|tx| tx.switch_moving(s, &login, &seats))?;
             if rep.unchanged {
                 println!(
                     "{} seat '{}' already uses '{}'",
@@ -261,6 +286,20 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                             rep.shared_with.join(", ")
                         ),
                         Tone::Dim
+                    )
+                );
+            }
+            for (o, now) in &rep.moved {
+                println!(
+                    "{}",
+                    p.paint(
+                        &format!(
+                            "  '{}' moved out of seat '{o}' (one seat only), which now has {}",
+                            rep.to,
+                            now.as_deref()
+                                .map_or("no login".to_string(), |l| format!("'{l}'"))
+                        ),
+                        Tone::Accent
                     )
                 );
             }

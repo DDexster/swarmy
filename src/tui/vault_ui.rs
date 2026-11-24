@@ -219,6 +219,31 @@ impl App {
             return;
         };
         let label = self.login_label(&login);
+        // Codex: nothing may run in this seat, nor in the one the login moves out of.
+        if harness_of_seat(self, &seat) == Some(Harness::Codex) {
+            let holders: Vec<String> = self
+                .login_by_id(&login)
+                .map(|l| {
+                    self.seats
+                        .iter()
+                        .filter(|s| l.is_in(&s.id) && s.label != seat)
+                        .map(|s| s.label.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(busy) = std::iter::once(seat.clone())
+                .chain(holders)
+                .find(|s| self.live_in(s) > 0)
+            {
+                self.toast(
+                    format!(
+                        "Codex is running in seat '{busy}': quit it first (it would write its old login back; OpenAI refresh tokens are single-use)"
+                    ),
+                    Tone::Warn,
+                );
+                return;
+            }
+        }
         let live = self.live_in(&seat);
         let current = self.analytics.seats.iter().find(|s| s.label == seat);
         let keeps = match current {
@@ -243,7 +268,7 @@ impl App {
             (_, Harness::Agy) => format!(
                 "\n\nagy runs there ({live} session{plural}): it keeps its current login until restarted (it does not write the old one back)."
             ),
-            // The vault keeps no Codex logins: no switch is offered there.
+            // Refused before the dialog (above): a running Codex would write its old login back.
             (_, Harness::Codex) => String::new(),
         };
         let others: Vec<String> = self
@@ -257,13 +282,18 @@ impl App {
                     .collect()
             })
             .unwrap_or_default();
-        let shared = if others.is_empty() {
-            String::new()
-        } else {
-            format!(
+        let shared = match (others.is_empty(), harness.shares_logins()) {
+            (true, _) => String::new(),
+            (false, true) => format!(
                 "\n\n'{label}' stays in seat {} too: both seats use one login (and one limit).",
                 others.join(", ")
-            )
+            ),
+            // A Codex login moves: its refresh token is single-use.
+            (false, false) => format!(
+                "\n\n'{label}' moves out of seat {} (a {} login can be in one seat only): that seat takes this seat's login, or none.",
+                others.join(", "),
+                harness.display_name()
+            ),
         };
         self.vault.modal = Some(Modal::Confirm {
             text: format!(
@@ -282,7 +312,7 @@ impl App {
                     .iter()
                     .find(|s| s.label == seat)
                     .ok_or_else(|| anyhow::anyhow!("no seat '{seat}'"))?;
-                tx.switch(s, login)
+                tx.switch_moving(s, login, &vault_seats)
             })
         });
         match res {
@@ -315,6 +345,17 @@ impl App {
                 } else {
                     format!(" (also in {})", r.shared_with.join(", "))
                 };
+                for (o, now) in &r.moved {
+                    self.log_event(
+                        "⚿",
+                        format!(
+                            "seat {o} → {} ('{}' moved out: one seat only)",
+                            now.as_deref().unwrap_or("no login"),
+                            r.to
+                        ),
+                        Tone::Accent,
+                    );
+                }
                 self.toast(
                     format!("seat '{}' now uses '{}'{also}", r.seat, r.to),
                     Tone::Good,
@@ -648,4 +689,12 @@ impl App {
         self.vault_reload();
         self.request_analytics();
     }
+}
+
+/// The harness of the seat labelled `seat`.
+fn harness_of_seat(app: &App, seat: &str) -> Option<Harness> {
+    app.seats
+        .iter()
+        .find(|s| s.label == seat)
+        .map(|s| s.harness)
 }

@@ -28,8 +28,8 @@ impl VaultTx<'_> {
         let account = s.account.as_ref().map(|a| a.id().to_string());
         let prev = self.index.seats.get(&seat.id).cloned();
         let unverified_since = match &prev {
-            // An agy token file names its own account: nothing to confirm.
-            _ if seat.harness == Harness::Agy => None,
+            // An agy token file and Codex's auth.json name their own account: nothing to confirm.
+            _ if matches!(seat.harness, Harness::Agy | Harness::Codex) => None,
             // First sight: a refresh token issued after the profile was read is a newer login;
             // a file written after the profile with an access token already expired at that time
             // was copied in (Claude Code only writes fresh tokens).

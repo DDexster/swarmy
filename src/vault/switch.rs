@@ -28,13 +28,102 @@ impl VaultTx<'_> {
     /// vault and the seat never disagree about which grant is where (and [`VaultTx::sync`]
     /// repairs the same after a crash between the two writes).
     pub fn switch(&mut self, seat: &Seat, login_key: &str) -> anyhow::Result<SwitchReport> {
-        // A label names one login per harness: the seat's first, else whatever it names (a
-        // login of another harness is refused below, by name).
-        let target = match self.index.find_in(login_key, Some(seat.harness)) {
-            Ok(l) => l.clone(),
-            Err(crate::errors::VaultError::NoLogin(_)) => self.find(login_key).cloned()?,
-            Err(e) => return Err(e.into()),
+        self.switch_in(seat, login_key, false)
+    }
+
+    /// The login `login_key` names for `seat`: a label names one login per harness, the seat's
+    /// first, else whatever it names (a login of another harness is refused by the switch).
+    fn target_for(&self, seat: &Seat, login_key: &str) -> anyhow::Result<Login> {
+        match self.index.find_in(login_key, Some(seat.harness)) {
+            Ok(l) => Ok(l.clone()),
+            Err(VaultError::NoLogin(_)) => Ok(self.find(login_key).cloned()?),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// [`switch`](Self::switch), where a login that cannot be in two seats (Codex) and is in
+    /// another of `seats` moves instead of being refused: that seat takes the login `seat` held
+    /// (the two swap), or is left without one when `seat` held none (its copy stays saved). The
+    /// other seat's copy is saved first: it is the newest (Codex refreshes in place). Nothing may
+    /// run in either seat (the callers check).
+    pub fn switch_moving(
+        &mut self,
+        seat: &Seat,
+        login_key: &str,
+        seats: &[Seat],
+    ) -> anyhow::Result<SwitchReport> {
+        let target = self.target_for(seat, login_key)?;
+        let others: Vec<Seat> = seats
+            .iter()
+            .filter(|s| s.id != seat.id && target.is_in(&s.id))
+            .cloned()
+            .collect();
+        let all_at_hand = target
+            .mounted
+            .iter()
+            .all(|m| *m == seat.id || others.iter().any(|o| &o.id == m));
+        if seat.harness.shares_logins() || others.is_empty() || !all_at_hand {
+            return self.switch(seat, login_key);
+        }
+        // The seat's own login, saved first: it goes to the other seat.
+        self.sync(std::slice::from_ref(seat))?;
+        let (prev, saved_now) = match read_seat(seat)?.secret {
+            Some(sec) => {
+                let fp = sec.meta().fingerprint;
+                let known = self.index.logins.iter().any(|l| l.meta.fingerprint == fp);
+                (self.capture(seat, None)?, !known)
+            }
+            None => (None, false),
         };
+        self.sync(&others)?;
+        let mut rep = self.switch_in(seat, &target.id, true)?;
+        if saved_now {
+            rep.auto_saved = prev.as_deref().and_then(|p| self.index.label_of(p));
+        }
+        for (i, o) in others.iter().enumerate() {
+            match prev.as_deref().filter(|p| *p != target.id && i == 0) {
+                Some(p) => {
+                    self.switch_in(o, p, true)?;
+                    rep.moved.push((o.label.clone(), self.index.label_of(p)));
+                }
+                None => {
+                    self.clear_seat(o)?;
+                    rep.moved.push((o.label.clone(), None));
+                }
+            }
+        }
+        rep.shared_with.clear();
+        Ok(rep)
+    }
+
+    /// Takes the login out of `seat` (after a backup): its copy is in the vault already.
+    fn clear_seat(&mut self, seat: &Seat) -> anyhow::Result<()> {
+        let path = seat.credentials_file();
+        let text = store::read_optional(&path)?;
+        let bdir = self.seat_backups(seat)?;
+        let name = match path.file_name() {
+            Some(n) => n.to_string_lossy().into_owned(),
+            None => "login".to_string(),
+        };
+        store::backup(&bdir, &[(name.as_str(), text.as_deref())], SEAT_BACKUPS)?;
+        if !store::replace_if_unchanged(&path, text.as_deref(), None)? {
+            return Err(VaultError::SeatBusy(path).into());
+        }
+        for l in &mut self.index.logins {
+            l.mounted.retain(|m| *m != seat.id);
+        }
+        self.index.seats.remove(&seat.id);
+        self.journal(&format!("clear seat={}", seat.label));
+        Ok(())
+    }
+
+    fn switch_in(
+        &mut self,
+        seat: &Seat,
+        login_key: &str,
+        moving: bool,
+    ) -> anyhow::Result<SwitchReport> {
+        let target = self.target_for(seat, login_key)?;
         if let Some(e) = super::unavailable(seat.harness) {
             return Err(e.into());
         }
@@ -53,6 +142,14 @@ impl VaultTx<'_> {
             .filter(|m| **m != seat.id)
             .map(|m| self.index.seat_name(m))
             .collect();
+        if !seat.harness.shares_logins() && !shared_with.is_empty() && !moving {
+            return Err(VaultError::OneSeatOnly {
+                login: target.label,
+                harness: seat.harness.display_name().into(),
+                seats: shared_with.join(", "),
+            }
+            .into());
+        }
         let secret = self
             .secret(&target.id)
             .ok_or_else(|| VaultError::MissingSecret(target.label.clone()))?;
@@ -92,6 +189,7 @@ impl VaultTx<'_> {
                     backup: None,
                     unchanged: true,
                     shared_with,
+                    moved: Vec::new(),
                 });
             }
             self.save()?;
@@ -112,9 +210,11 @@ impl VaultTx<'_> {
                     &[(crate::agy::credentials::TOKEN_FILE, cred_text.as_deref())],
                     SEAT_BACKUPS,
                 )?,
-                Harness::Codex => {
-                    return Err(VaultError::Unsupported(seat.harness.display_name().into()).into());
-                }
+                Harness::Codex => store::backup(
+                    &bdir,
+                    &[(crate::codex::credentials::AUTH_FILE, cred_text.as_deref())],
+                    SEAT_BACKUPS,
+                )?,
             }
 
             #[cfg(test)]
@@ -124,9 +224,7 @@ impl VaultTx<'_> {
             let new_creds = match seat.harness {
                 Harness::Claude => credentials::with_login(cred_text.as_deref(), &secret)?,
                 Harness::Agy => crate::agy::credentials::with_login(&secret)?,
-                Harness::Codex => {
-                    return Err(VaultError::Unsupported(seat.harness.display_name().into()).into());
-                }
+                Harness::Codex => crate::codex::credentials::with_login(&secret)?,
             };
             if !store::replace_if_unchanged(
                 &seat.credentials_file(),
@@ -165,7 +263,8 @@ impl VaultTx<'_> {
             let now = chrono::Utc::now();
             // An agy token file names its own account.
             let known_profile = target.account_uuid.is_some()
-                && (seat.harness == Harness::Agy || target.oauth_account.is_some());
+                && (matches!(seat.harness, Harness::Agy | Harness::Codex)
+                    || target.oauth_account.is_some());
             self.index.seats.insert(
                 seat.id.clone(),
                 super::logins::SeatSeen {
@@ -191,6 +290,7 @@ impl VaultTx<'_> {
                 backup: Some(bdir),
                 unchanged: false,
                 shared_with,
+                moved: Vec::new(),
             });
         }
         Err(VaultError::SeatBusy(seat.credentials_file()).into())
@@ -272,4 +372,7 @@ pub struct SwitchReport {
     pub unchanged: bool,
     /// Other seats that hold the same login.
     pub shared_with: Vec<String>,
+    /// Seats a login that cannot be shared moved out of, and the login each holds now (the one
+    /// the switched seat held; none when it held none).
+    pub moved: Vec<(String, Option<String>)>,
 }

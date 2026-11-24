@@ -3,6 +3,16 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
+## Unreleased
+
+- **Codex logins in the vault**: save, add (`swarmy accounts add --harness codex`) and switch
+  them like the others. OpenAI's refresh tokens are single-use, so a Codex login is in one seat
+  only: putting it into another seat moves it (the two seats swap their logins, or the one it
+  leaves keeps none, its copy saved), and never while Codex runs in either seat. The vault follows
+  each refresh Codex makes in the seat.
+- Codex 0.172's code mode: a script that runs tools is counted as one call named after the tool
+  it calls (`exec_command`) with its commands as the summary, not as `exec` with the script.
+
 ## v0.2.0
 
 Three clients side by side (Claude Code, Antigravity, Codex), worktrees and branches, a clearer

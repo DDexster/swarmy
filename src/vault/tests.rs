@@ -1435,3 +1435,107 @@ fn a_label_names_one_login_per_harness() -> anyhow::Result<()> {
     assert!(named.contains(&"agy".to_string()), "{named:?}");
     Ok(())
 }
+
+fn codex_seat(root: &Path, label: &str) -> anyhow::Result<Seat> {
+    let dir = root.join(format!(".codex-{label}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(Seat::codex(label, dir))
+}
+
+/// A Codex `auth.json`: a ChatGPT login of `user` in workspace `ws`, its access token fresh.
+fn write_codex(s: &Seat, refresh: &str, user: &str, ws: &str) -> anyhow::Result<()> {
+    use crate::core::jwt::b64url;
+    let jwt = |claims: Value| {
+        format!(
+            "{}.{}.sig",
+            b64url(b"{}"),
+            b64url(claims.to_string().as_bytes())
+        )
+    };
+    let exp = (chrono::Utc::now() + chrono::Duration::days(10)).timestamp();
+    let v = json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": jwt(json!({"email": format!("{user}@example.com"),
+                "https://api.openai.com/auth": {"chatgpt_user_id": user, "chatgpt_account_id": ws,
+                                                "chatgpt_plan_type": "plus"}})),
+            "access_token": jwt(json!({"exp": exp})),
+            "refresh_token": refresh,
+            "account_id": ws
+        },
+        "last_refresh": "2026-11-24T10:00:00Z"
+    });
+    std::fs::write(s.credentials_file(), v.to_string())?;
+    Ok(())
+}
+
+fn codex_refresh(s: &Seat) -> anyhow::Result<Value> {
+    Ok(read_json(&s.credentials_file())?["tokens"]["refresh_token"].clone())
+}
+
+#[test]
+fn codex_logins_are_switched_followed_and_kept_to_one_seat() -> anyhow::Result<()> {
+    let t = tempfile::tempdir()?;
+    let main = codex_seat(t.path(), "codex")?;
+    let other = codex_seat(t.path(), "codex-work")?;
+    write_codex(&main, "rt-sam-1", "user-sam", "ws-1")?;
+    write_codex(&other, "rt-team-1", "user-team", "ws-2")?;
+    let mut v = Vault::open(&t.path().join("vault"))?;
+    v.edit(|tx| tx.capture(&main, Some("sam")))?;
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.harness, crate::core::harness::Harness::Codex);
+    assert!(sam.account_uuid.is_some());
+    assert_eq!(
+        sam.plan
+            .as_deref()
+            .or(sam.meta.subscription_type.as_deref()),
+        Some("plus")
+    );
+
+    // Codex refreshed in the seat: a new refresh token of the same account. The saved login
+    // follows it (the old one is spent), and stays in the seat.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_codex(&main, "rt-sam-2", "user-sam", "ws-1")?;
+    let states = v.edit(|tx| tx.seat_states(std::slice::from_ref(&main)))?;
+    assert_eq!(states[&main.id].saved_as.as_deref(), Some("sam"));
+    assert_eq!(
+        secret_of(&v, &sam.id)?["tokens"]["refresh_token"],
+        "rt-sam-2"
+    );
+
+    // One seat only: sam is in `codex`, so `codex-work` cannot take it too.
+    let err = v
+        .edit(|tx| tx.switch(&other, "sam"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("one seat only"), "{err}");
+    assert_eq!(codex_refresh(&other)?, "rt-team-1", "nothing was written");
+
+    // Moving it instead: the two seats swap their logins; each seat's copy is saved first.
+    let seats = [main.clone(), other.clone()];
+    let rep = v.edit(|tx| tx.switch_moving(&other, "sam", &seats))?;
+    assert_eq!(rep.to, "sam");
+    assert_eq!(
+        rep.auto_saved.as_deref(),
+        Some("codex-work"),
+        "the team login was not saved yet"
+    );
+    assert_eq!(
+        rep.moved,
+        vec![("codex".to_string(), Some("codex-work".to_string()))]
+    );
+    assert_eq!(codex_refresh(&other)?, "rt-sam-2", "sam's newest token");
+    assert_eq!(codex_refresh(&main)?, "rt-team-1");
+    let sam = login(&v, "sam")?.clone();
+    assert_eq!(sam.mounted, vec![other.id.clone()], "one seat only");
+    // And with nothing to give back: the seat it leaves is left without a login (saved).
+    let empty = codex_seat(t.path(), "codex-empty")?;
+    let seats = [main.clone(), other.clone(), empty.clone()];
+    let rep = v.edit(|tx| tx.switch_moving(&empty, "sam", &seats))?;
+    assert_eq!(rep.moved, vec![("codex-work".to_string(), None)]);
+    assert!(!other.credentials_file().exists());
+    assert_eq!(codex_refresh(&empty)?, "rt-sam-2");
+    assert_eq!(login(&v, "sam")?.mounted, vec![empty.id.clone()]);
+    Ok(())
+}

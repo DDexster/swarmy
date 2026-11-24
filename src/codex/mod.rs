@@ -4,6 +4,7 @@
 //! Offline and read-only, like the other readers. Tokens are never logged.
 
 pub mod account;
+pub mod credentials;
 pub mod discovery;
 pub mod live;
 pub mod meta;

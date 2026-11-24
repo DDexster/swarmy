@@ -300,7 +300,7 @@ How Anthropic meters limits is not public, so the shares and projections are est
 Two words keep it straight:
 
 - a **seat** is a config dir a client runs in (`~/.claude`, `~/.claude-work`,
-  `~/.gemini/antigravity-cli`): it holds one login at a time;
+  `~/.gemini/antigravity-cli`, `~/.codex`): it holds one login at a time;
 - a **saved login** (⚿) is a sign-in the vault keeps. It fits the seats of its own client only (a
   Claude Code login never goes into an Antigravity seat) and may be in several seats at once.
 
@@ -315,6 +315,7 @@ swarmy accounts                               # seats and saved logins, per clie
 swarmy accounts capture work --label alice    # save the login of seat "work"
 swarmy accounts add --label bob               # log into another account in a scratch seat, save it
 swarmy accounts add --harness agy --label bob # the same for Antigravity (labels are per client)
+swarmy accounts add --harness codex --label bob # and for Codex
 swarmy accounts switch work bob               # put bob into seat "work"
 swarmy accounts switch work alice             # and back
 swarmy accounts import backup.json --label carol
@@ -333,6 +334,10 @@ What keeps it safe:
   The vault's own files are backed up before each change (the last 30).
 - **No surprises.** A switch refuses while Claude Code or agy runs in that seat (`--force` to
   insist), and a login only ever goes into seats of its own client.
+- **Codex logins stay in one seat.** OpenAI's refresh tokens are single-use, so two seats sharing
+  one would sign each other out. Putting a Codex login into another seat moves it: the two seats
+  swap their logins (or the one it leaves is left without one, its copy saved). Never while Codex
+  runs in either seat.
 - **It follows Claude Code.** When Claude Code refreshes a seat's access token, the saved copy
   takes it; a new `/login` is shown as *not saved* instead of overwriting the saved one.
 

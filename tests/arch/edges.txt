@@ -118,6 +118,8 @@ tui -> vault
 ui -> core
 # Antigravity logins: the token file's format and the account it names (agy::credentials).
 vault -> agy
+# Codex logins: auth.json's format and the account its id token names (codex::credentials, account).
+vault -> codex
 vault -> claude
 # Seats that cannot be read and a journal that cannot be written go to the debug channel.
 # A login belongs to one harness (core::harness); its secret and meta (core::login).

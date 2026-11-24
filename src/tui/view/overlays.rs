@@ -130,10 +130,14 @@ pub(super) fn picker(f: &mut Frame, app: &App, area: Rect) {
                             .collect()
                     })
                     .unwrap_or_default();
-                if others.is_empty() {
-                    String::new()
-                } else {
-                    format!(" · also in {}", others.join(", "))
+                match (
+                    others.is_empty(),
+                    l.is_none_or(|x| x.harness.shares_logins()),
+                ) {
+                    (true, _) => String::new(),
+                    (false, true) => format!(" · also in {}", others.join(", ")),
+                    // One seat only (Codex): it moves out of the other seat.
+                    (false, false) => format!(" · moves from {}", others.join(", ")),
                 }
             }
             PickFor::Login(_) => {

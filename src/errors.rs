@@ -45,6 +45,14 @@ pub enum VaultError {
     #[error("the vault does not keep {0} logins")]
     Unsupported(String),
     #[error(
+        "'{login}' is in seat {seats} already: a {harness} login can be in one seat only (its refresh token is single-use, so two seats would sign each other out); put another login into that seat first"
+    )]
+    OneSeatOnly {
+        login: String,
+        harness: String,
+        seats: String,
+    },
+    #[error(
         "{} kept changing while swarmy tried to write it (Claude Code is writing it); nothing was overwritten, try again",
         .0.display()
     )]
@@ -132,6 +140,7 @@ impl Coded for VaultError {
             VaultError::Keychain => "vault-keychain",
             VaultError::Keyring(_) => "vault-keyring",
             VaultError::Unsupported(_) => "vault-unsupported",
+            VaultError::OneSeatOnly { .. } => "vault-one-seat-only",
             VaultError::SeatBusy(_) => "vault-seat-busy",
             VaultError::SwitchIncomplete { .. } => "vault-switch-incomplete",
         }
@@ -251,6 +260,12 @@ mod tests {
             VaultError::MissingSecret(String::new()).code(),
             VaultError::Keychain.code(),
             VaultError::Keyring(String::new()).code(),
+            VaultError::OneSeatOnly {
+                login: String::new(),
+                harness: String::new(),
+                seats: String::new(),
+            }
+            .code(),
             VaultError::SeatBusy(PathBuf::new()).code(),
             VaultError::SwitchIncomplete {
                 seat: String::new(),
