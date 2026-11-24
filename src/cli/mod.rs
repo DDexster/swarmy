@@ -241,6 +241,19 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
                     ..Default::default()
                 };
                 v.edit(|tx| tx.put(&spare, Some(serde_json::json!({"accountUuid": "acc-demo-spare", "emailAddress": "alex+spare@example.com"})), Some(&acct), Some("alex-spare"), None))?;
+                // A second Google login for the agy seat.
+                let team = crate::claude::credentials::Secret::of(
+                    crate::core::harness::Harness::Agy,
+                    serde_json::json!({"token": {"access_token": "demo-agy-access-team", "refresh_token": "demo-agy-refresh-team",
+                                                 "expiry": (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()},
+                                       "auth_method": "consumer", "id_token_email": "alex.team@example.com"}),
+                );
+                let team_acct = crate::agy::account::account_of(team.expose());
+                v.edit(|tx| tx.put(&team, None, team_acct.as_ref(), Some("alex-g-team"), None))?;
+                // On the wall, one login serves two seats.
+                if wall && let Some(lab) = ctx.seats.iter().find(|s| s.label == "lab") {
+                    v.edit(|tx| tx.switch(lab, "alex-work"))?;
+                }
             }
             // Account names come from the saved logins just made.
             ctx.check_unconfirmed();

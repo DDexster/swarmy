@@ -308,6 +308,11 @@ impl Ctx {
         let mut seat_info = Vec::new();
         let mut caches = Vec::new();
         for s in &seats {
+            if s.harness != Harness::Claude {
+                let mut problems = Vec::new();
+                seat_info.push(seat_info_of(s, &dirs.data, &mut problems).0);
+                continue;
+            }
             let cj = config_json::read_seat_file(&s.claude_json)?;
             if let Some(costs) = cj.model_costs {
                 caches.push((s.id.clone(), costs));

@@ -1,6 +1,6 @@
 # swarmy
 
-**Mission control for Claude Code agents, in your terminal.**
+**Mission control for Claude Code (and Antigravity) agents, in your terminal.**
 
 [![CI](https://github.com/koorchik/swarmy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/koorchik/swarmy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/koorchik/swarmy?sort=semver)](https://github.com/koorchik/swarmy/releases/latest)
@@ -29,10 +29,14 @@ your weekly limit went and when it runs out.
   moved between config dirs are followed.
 - **Spend at API prices.** By project, account, model, effort, agent type, session, agent and day,
   with trends against the previous period, the model mix, cache hits and thinking.
+- **Google Antigravity too.** `agy` seats, conversations and subagents sit in the same tree,
+  panels and reports as Claude Code's, Gemini models priced at Google's list prices; `--harness`
+  and `--by harness` tell them apart.
 - **A status line inside Claude Code.** Who needs you in your other sessions, this session's
   agents, the exact week used and when it runs out.
 - **A vault for several accounts.** Save each config dir's login, put another account's login in
-  when a limit runs out, and switch back. A switch never loses a token.
+  when a limit runs out, and switch back; one login can serve several seats, and agy's Google
+  logins switch the same way. A switch never loses a token.
 - **Offline, read-only, light.** No network, no telemetry. It reads what Claude Code already
   writes. About 2 CPU-seconds a minute with 20 live agents on a 4K terminal. One static binary
   with SQLite built in.

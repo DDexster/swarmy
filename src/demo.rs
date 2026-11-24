@@ -239,13 +239,16 @@ pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
             ..Seat::new(s.label, dir.clone(), dir.join(".claude.json"), false)
         });
     }
+    let seat_dirs: Vec<PathBuf> = seats.iter().map(|s| s.dir.clone()).collect();
+    let agy = agy_seat(root, now)?;
+    let agy_dir = agy.dir.clone();
+    seats.push(agy);
     let stop = Arc::new(AtomicBool::new(false));
     let st = stop.clone();
-    let seat_dirs: Vec<PathBuf> = seats.iter().map(|s| s.dir.clone()).collect();
     // Named, so `tools/perf.sh` can leave the writer out of the dashboard's CPU time.
     std::thread::Builder::new()
         .name("demo-writer".into())
-        .spawn(move || live(seat_dirs, st, load))?;
+        .spawn(move || live(seat_dirs, agy_dir, st, load))?;
     Ok(Demo {
         root: root.to_path_buf(),
         seats,
@@ -424,8 +427,18 @@ fn wall_history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
 }
 
 /// Keeps the demo agents working until stopped.
-fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>, load: Load) {
+fn live(seat_dirs: Vec<PathBuf>, agy_dir: PathBuf, stop: Arc<AtomicBool>, load: Load) {
     let wall = load == Load::Wall;
+    // The running agy conversation: its presence lock held as long as the demo runs.
+    let _agy_presence = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(agy_dir.join("presence").join(format!("{AGY_LIVE}.lock")))
+        .and_then(|f| f.lock().map(|()| f));
+    let agy_live = agy_transcript(&agy_dir, AGY_LIVE);
+    let mut agy_step: u64 = 100;
     let pid = std::process::id();
     let start = proc_start_ticks(pid);
     let now = Utc::now();
@@ -571,6 +584,12 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>, load: Load) {
                 append(&p, &[v, tool_result(now, &tid)]);
             }
         }
+        // The agy conversation takes a step now and then.
+        if tick.is_multiple_of(4) {
+            let (p, g) = agy_planner(3_000_000 + tick, agy_step, now, "gemini-4-neon-high", tick);
+            append(&agy_live, &[p, g]);
+            agy_step += 2;
+        }
         // Finished agents.
         agents.retain(|a| {
             if a.steps_left == 0 && a.open_tool.is_none() {
@@ -600,6 +619,128 @@ fn live(seat_dirs: Vec<PathBuf>, stop: Arc<AtomicBool>, load: Load) {
         tick += 1;
         std::thread::sleep(std::time::Duration::from_millis(700));
     }
+}
+
+/// The demo's running Antigravity conversation.
+const AGY_LIVE: &str = "7f3e2a10-demo-agy-api-guide";
+
+/// What agy's demo steps call (tool, argument, value).
+const AGY_TOOLS: &[(&str, &str, &str)] = &[
+    (
+        "view_file",
+        "AbsolutePath",
+        "/home/dev/work/docs-site/guide/api.md",
+    ),
+    ("grep_search", "Query", "rate limit"),
+    (
+        "replace_file_content",
+        "TargetFile",
+        "/home/dev/work/docs-site/guide/api.md",
+    ),
+    ("run_command", "CommandLine", "npm run build:docs"),
+];
+
+fn agy_transcript(seat_dir: &Path, cid: &str) -> PathBuf {
+    seat_dir
+        .join("brain")
+        .join(cid)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl")
+}
+
+/// One agy model step with a tool call, and the tool's result right after it.
+fn agy_planner(
+    seed: u64,
+    step: u64,
+    t: DateTime<Utc>,
+    model: &str,
+    tool: u64,
+) -> (serde_json::Value, serde_json::Value) {
+    let (name, key, val) = AGY_TOOLS[(tool as usize) % AGY_TOOLS.len()];
+    let done = t + Duration::seconds(2 + (seed % 5) as i64);
+    (
+        json!({"step_index": step, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE",
+               "created_at": ts(t), "model": model, "input_tokens": 2_000 + rnd(seed, 1) % 9_000,
+               "cache_read_tokens": 40_000 + rnd(seed, 2) % 160_000,
+               "output_tokens": 150 + rnd(seed, 3) % 1_400, "content": "", "thinking": "…",
+               "tool_calls": [{"name": name, "args": {key: val}}]}),
+        json!({"step_index": step + 1, "source": "MODEL", "type": "GENERIC", "status": "DONE",
+               "created_at": ts(done), "content": format!("Completed At: {}\nok", ts(done))}),
+    )
+}
+
+/// The demo's Antigravity seat: a Google login, two weeks of Gemini conversations (the JSON
+/// metadata agy keeps next to its database), and the one that is running.
+fn agy_seat(root: &Path, now: DateTime<Utc>) -> anyhow::Result<Seat> {
+    let dir = root.join(".gemini-agy");
+    for d in ["brain", "presence", "cache"] {
+        std::fs::create_dir_all(dir.join(d))?;
+    }
+    std::fs::write(
+        dir.join("antigravity-oauth-token"),
+        json!({"token": {"access_token": "demo-agy-access", "token_type": "Bearer",
+                         "refresh_token": "demo-agy-refresh", "expiry": ts(now + Duration::hours(1)),
+                         "expires_in": 3599},
+               "auth_method": "consumer", "id_token_email": "alex.demo@example.com"})
+        .to_string(),
+    )?;
+    let mut convs = serde_json::Map::new();
+    let titles = [
+        "Rewrite the API guide",
+        "Fix broken doc links",
+        "Summarize refund flow",
+        "Tidy pipeline configs",
+        "Add search to docs",
+    ];
+    for k in 0..10u64 {
+        let (cid, project, title) = if k == 0 {
+            (AGY_LIVE.to_string(), "docs-site", titles[0])
+        } else {
+            (
+                format!("{:08x}-demo-agy-{k}", 0x5eed_0000 + k),
+                PROJECTS[(k as usize) % PROJECTS.len()],
+                titles[(k as usize) % titles.len()],
+            )
+        };
+        let start = if k == 0 {
+            now - Duration::minutes(25)
+        } else {
+            now - Duration::days(k as i64) - Duration::hours((k * 5 % 9) as i64)
+        };
+        // Older conversations ran Gemini 3.1 Pro; the last few days Gemini 4 Neon.
+        let model = if k < 5 {
+            "gemini-4-neon-high"
+        } else {
+            "gemini-3.1-pro-preview-high"
+        };
+        let mut lines = vec![
+            json!({"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT",
+            "status": "DONE", "created_at": ts(start), "content": format!("<USER_REQUEST>\n{title}\n</USER_REQUEST>")}),
+        ];
+        let mut t = start;
+        for i in 0..(6 + k % 5) {
+            t += Duration::seconds(40 + (rnd(k, i) % 80) as i64);
+            let (p, g) = agy_planner(7_000_000 + k * 100 + i, 1 + 2 * i, t, model, k + i);
+            lines.extend([p, g]);
+        }
+        append(&agy_transcript(&dir, &cid), &lines);
+        convs.insert(
+            cid.clone(),
+            json!({"summary": {"ID": cid, "Title": title,
+                               "WorkspaceURIs": [format!("file://{}", cwd(project))],
+                               "UpdatedAt": ts(t)}}),
+        );
+    }
+    std::fs::write(
+        dir.join("cache").join("conversation_metadata.json"),
+        json!({"conversations": convs}).to_string(),
+    )?;
+    std::fs::write(dir.join("presence").join(format!("{AGY_LIVE}.lock")), "")?;
+    Ok(Seat {
+        found_by: vec!["demo"],
+        ..Seat::agy("agy", dir)
+    })
 }
 
 fn write_registry(
