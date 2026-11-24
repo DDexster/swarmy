@@ -19,7 +19,7 @@ use crate::ui::style::{ColorChoice, Painter};
 #[command(
     name = "swarmy",
     version,
-    about = "Mission control for AI coding agents (Claude Code, Antigravity): live swarm, API-equivalent spend, weekly-limit attribution, login vault",
+    about = "Real-time analytics dashboard for coding agents (Claude Code, Antigravity, Codex): live swarm, history, API-equivalent spend, weekly limits, login vault",
     long_about = None,
     after_help = "Run without a command for the live dashboard. Data never leaves this machine."
 )]

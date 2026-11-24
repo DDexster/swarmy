@@ -3,7 +3,7 @@ name = "swarmy"
 version = "0.2.0"
 edition = "2024"
 authors = ["Viktor Turskyi"]
-description = "Mission control for Claude Code agents: live swarm view, API-equivalent spend, weekly-limit attribution by project, and a vault for OAuth logins"
+description = "Real-time analytics dashboard for coding agents (Claude Code, Antigravity, Codex): live swarm, history, API-equivalent spend, weekly limits, and a vault for OAuth logins"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/koorchik/swarmy"
@@ -87,7 +87,7 @@ assets = [
 
 [package.metadata.generate-rpm]
 license = "MIT OR Apache-2.0"
-summary = "Mission control for Claude Code agents"
+summary = "Real-time analytics dashboard for coding agents"
 auto-req = "no"
 assets = [
     { source = "target/release/swarmy", dest = "/usr/bin/swarmy", mode = "755" },

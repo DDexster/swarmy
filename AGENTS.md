@@ -1,6 +1,6 @@
 # AGENTS.md — swarmy
 
-Mission control for Claude Code agents: a Rust CLI + TUI that reads what Claude Code writes to disk
+A real-time analytics dashboard for coding agents (Claude Code, Antigravity, Codex): a Rust CLI + TUI that reads what they write to disk
 (transcripts, session registry, `.claude.json`) across several config dirs, shows the live agent
 swarm, API-equivalent spend, weekly-limit attribution per project, and keeps a vault of OAuth
 logins. Users run it in a spare terminal, mostly on laptops.

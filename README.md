@@ -1,15 +1,24 @@
 # swarmy
 
-**Mission control for Claude Code (and Antigravity and Codex) agents, in your terminal.**
+**A real-time analytics dashboard for your coding agents: Claude Code, Antigravity and Codex,
+together, in your terminal.**
 
 [![CI](https://github.com/koorchik/swarmy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/koorchik/swarmy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/koorchik/swarmy?sort=semver)](https://github.com/koorchik/swarmy/releases/latest)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows%20%7C%20Raspberry%20Pi-lightgrey)](#platforms)
 
-You run several Claude Code sessions, each with a crowd of subagents. swarmy shows every one of
-them live on one screen, tells you the moment one needs you and takes you there, and shows where
-your weekly limit went and when it runs out.
+You run several coding agents at once, each with a crowd of subagents, maybe from more than one
+client. swarmy puts all of them on one screen and keeps the numbers behind them:
+
+- **Live.** Every agent and subagent of every session, whichever client runs it: what it does
+  right now, what it costs, and the moment one needs you (with a key that takes you there).
+- **History.** Every request is kept in a local index and outlives the clients' own 30-day
+  transcript retention: days, weeks and months to compare, rolled up so it stays small.
+- **Analytics across clients, together.** Spend at API prices, weekly limits, models, projects,
+  worktrees, agent types, tools and waiting time, for Claude Code, Antigravity and Codex in the
+  same tables: one repository is one project whichever client worked on it, and every number can
+  be split by client when you want to compare them.
 
 swarmy is an observer, not a launcher: it never starts, prompts or controls an agent. Keep running
 your agents the way you do now (plain terminals, tmux, [herdr](#how-it-compares), claude-squad,
@@ -36,17 +45,17 @@ worktrees) and put swarmy in a spare terminal next to them.
 - **Worktrees and branches.** Each session shows the checkout it works in (`shop/fix-1` for a git
   worktree) and its branch; `⇄2` warns when two live sessions edit the same checkout. Spend per
   worktree and per branch, and how much of each project's work ran in worktrees.
-- **Google Antigravity and OpenAI Codex too.** `agy` seats, conversations and subagents, and
-  Codex homes and threads, sit in the same tree, panels and reports as Claude Code's; Gemini and
-  GPT models priced at Google's and OpenAI's list prices; one project for a repo whichever agent
-  worked on it; `--harness` and `--by harness` tell them apart.
+- **Three clients, one picture.** Claude Code, Google Antigravity (`agy`) and OpenAI Codex sit in
+  the same tree, panels and reports; Claude, Gemini and GPT models priced at their makers' list
+  prices; PROJECTS shows which clients worked on each repository (`cc+agy+cdx`), MODELS which
+  client ran each model, BURN today's split; `--harness` and `--by harness` compare them.
 - **A status line inside Claude Code.** Who needs you in your other sessions, this session's
   agents, the exact week used and when it runs out.
 - **A vault for several accounts.** Save each config dir's login, put another account's login in
   when a limit runs out, and switch back; one login can serve several seats, and agy's Google
   logins switch the same way. A switch never loses a token.
-- **Offline, read-only, light.** No network, no telemetry. It reads what Claude Code already
-  writes. About 2 CPU-seconds a minute with 20 live agents on a 4K terminal. One static binary
+- **Offline, read-only, light.** No network, no telemetry. It reads what the clients already
+  write. About 2 CPU-seconds a minute with 20 live agents on a 4K terminal. One static binary
   with SQLite built in.
 
 <p align="center">
@@ -74,6 +83,9 @@ What swarmy adds:
 - **One live view of every agent, subagents included,** across all your Claude Code config dirs,
   Antigravity and Codex, whoever started them: a launcher sees the panes it owns, not the twenty
   subagents working inside one session.
+- **History and analytics across clients.** Claude Code, Antigravity and Codex in one index
+  that keeps every request for good (rolled up), so a repository's work from all three clients
+  adds up in one place and can be compared day by day, model by model, client by client.
 - **Money and limits next to the agents.** What each agent and session costs as it runs, where each
   account's weekly limit went by project, and when it runs out at the current pace.
 - **Several accounts.** Every config dir is found on its own; a vault moves OAuth logins between
@@ -88,6 +100,7 @@ What swarmy adds:
 | | swarmy | launchers (herdr, claude-squad, …) | usage counters (ccusage, …) |
 |---|---|---|---|
 | starts, prompts, keeps agents | no | yes | no |
+| several clients in one view and history | yes (Claude Code, Antigravity, Codex) | many CLIs, live only | ccusage: many CLIs, reports |
 | worktree per agent | shows them | creates them | no |
 | live state of every agent | yes, with subagents | yes, per pane | no |
 | cost at API prices | live and in reports | no | in reports |

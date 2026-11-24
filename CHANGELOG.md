@@ -3,49 +3,58 @@
 All notable changes to swarmy. Versions follow [Semantic Versioning](https://semver.org/); the
 release workflow takes a release's notes from its section here.
 
-## Unreleased
-
-- **OpenAI Codex as a third harness**: its homes (`~/.codex`, `~/.codex-*`, the `CODEX_HOME` of
-  running `codex` processes, `[[seat]] harness = "codex"`), threads read from their rollouts
-  (each response once, though Codex writes its usage twice), tool calls, prompts, thread names
-  and the account a thread runs under; one project per repo whichever harness worked on it;
-  `--harness codex`, `--by harness`, `cdx` in SWARM, MODELS and BURN. Open threads are live in
-  SWARM (thinking, a tool, idle), found by the lock Codex holds on each open thread.
-- **OpenAI prices** (GPT-6 Luna, Sol, Astra; 6.1, 6.2; GPT-5.6 Terra, Luna, Sol; 5.5 back to
-  GPT-5 and the Codex models) as dated built-in rows, with the 272K long-context rule and the
-  priority tier; `tools/prices-from-litellm.py` compares them too. The built-in table moved to
-  `src/core/pricing/builtin.rs`.
-- Codex seats show their spend in LIMITS · SEATS (no local quota is read yet) and are not kept in
-  the vault. The index's facts move to version 5 (the seats table learns the new harness).
-
 ## v0.2.0
 
-Antigravity next to Claude Code, worktrees and branches, and logins shared between seats.
+Three clients side by side (Claude Code, Antigravity, Codex), worktrees and branches, a clearer
+vault, and Homebrew.
 
-- **Antigravity (`agy`) as a harness next to Claude Code**: its seats (`~/.gemini/antigravity-cli`,
-  the `HOME` of running agys, `[[seat]] harness = "agy"`), live conversations and subagents,
-  spend, tools and projects in every panel and command; `--harness` and `--by harness`.
-- **Gemini prices** (Gemini 4 Neon, Carbon, Argon, Hydrogen; 3.x; 2.5) as dated built-in rows,
-  including the Carbon/Argon change on 2026-12-01; `tools/prices-from-litellm.py` compares the
+**Clients**
+
+- **Antigravity (`agy`) next to Claude Code**: its seats (`~/.gemini/antigravity-cli`, the `HOME`
+  of running agys, `[[seat]] harness = "agy"`), live conversations and subagents, spend, tools
+  and projects in every panel and command.
+- **OpenAI Codex as a third client**: its homes (`~/.codex`, `~/.codex-*`, the `CODEX_HOME` of
+  running `codex` processes, `[[seat]] harness = "codex"`), threads read from their rollouts
+  (each response once, though Codex writes its usage twice), tool calls, prompts, thread names
+  and the account a thread runs under; open threads are live in SWARM (thinking, a tool, idle).
+  Codex seats show their spend in LIMITS · SEATS (no local quota is read yet); its logins are not
+  kept in the vault yet.
+- One project per repository whichever client worked on it: PROJECTS shows which did (`cc+agy`);
+  MODELS shows which client ran a model; BURN splits today's spend per client; `--harness` and
+  `--by harness` everywhere.
+- **Prices**: Gemini (4 Neon, Carbon, Argon, Hydrogen; 3.x; 2.5, including the Carbon/Argon
+  change on 2026-12-01) and OpenAI (GPT-6 and 5.x, the Codex models, the 272K long-context rule
+  and the priority tier) as dated built-in rows; `tools/prices-from-litellm.py` compares the
   built-in rows with LiteLLM's list.
-- **Logins in several seats**: a saved login stays listed after it goes into a seat and can go
-  into more seats; the seat's own login is still saved first. `--share` is gone (no longer
-  needed).
-- **Vault for Antigravity**: save, add (`swarmy accounts add --harness agy`) and switch Google
-  logins between agy seats; a login only goes into seats of its harness.
-- LIMITS · SEATS groups seats and logins per harness; MODELS shows which harness ran a model;
-  BURN splits today's spend per harness.
-- **Worktrees and branches**: SWARM names a session's checkout (`shop/fix-1` for a linked git
-  worktree), its branch, and `⇄N` when several live sessions work in the same checkout; the
-  AGENT card has a checkout line; PROJECTS shows the share of spend made in worktrees (IN WT);
-  `g` groups by checkout; `report --by worktree`, `--by branch` and `--checkout worktrees|main`.
-  The index is read again once (cache version 7) to pick up the branches.
+
+**Worktrees and branches**
+
+- SWARM names a session's checkout (`shop/fix-1` for a linked git worktree), its branch, and
+  `⇄N` when several live sessions work in the same checkout; the AGENT card has a checkout line;
+  PROJECTS shows the share of spend made in worktrees (IN WT); `g` groups by checkout;
+  `report --by worktree`, `--by branch` and `--checkout worktrees|main`.
+
+**Vault**
+
+- LIMITS · SEATS shows, per client, a table of seats (dir, the login in each) and a table of
+  saved logins (the seats each is in, or free); `swarmy accounts` the same.
+- A saved login stays listed after it goes into a seat and can go into more seats; the seat's own
+  login is still saved first. `--share` is gone.
+- Antigravity logins are saved, added (`swarmy accounts add --harness agy`) and switched like
+  Claude Code's; a login only goes into seats of its own client; labels are unique per client.
+- macOS: the dashboard and the commands say up front that Claude Code logins cannot be switched
+  there (Claude Code keeps them in the Keychain) instead of failing after a try.
+
+**Elsewhere**
+
 - **Jump beyond tmux**: `J` and `swarmy jump` reach a Claude Code in Zellij, kitty, WezTerm and
   iTerm2 too (read from the process's environment, on Linux and macOS).
 - **Accounts per organization**: an account is the pair of user and organization, so one login
-  in two organizations keeps two weeks and two plans.
-- Accounts: the organization migration keeps parked organizations apart, finishes an
-  interrupted re-attribution, and completes `session-owner` records that have no organization.
+  in two organizations keeps two weeks and two plans; the migration keeps parked organizations
+  apart and finishes an interrupted re-attribution.
+- **Homebrew**: `brew install koorchik/tap/swarmy` (macOS universal binary, Linux x86_64 and
+  aarch64).
+- The index is read again once on the first start (cache version 7, facts version 5).
 
 ## v0.1.0
 

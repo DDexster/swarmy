@@ -48,16 +48,6 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
         0
     };
     // Which harnesses worked on each project (`cc+agy`), with more than one.
-    let har_w = if app
-        .analytics
-        .projects
-        .iter()
-        .any(|p| !p.by_harness.is_empty())
-    {
-        8usize
-    } else {
-        0
-    };
     let har_of = |p: &crate::tui::ProjectRow| -> String {
         p.by_harness
             .iter()
@@ -66,6 +56,14 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             .collect::<Vec<_>>()
             .join("+")
     };
+    let har_w = app
+        .analytics
+        .projects
+        .iter()
+        .map(|p| w(&har_of(p)))
+        .max()
+        .filter(|n| *n > 0)
+        .map_or(0, |n| n.max(3) + 1);
     let fixed = name_w + har_w + live_w + hour_w + today_w + per_w + 6 + share_w + wt_w + pts_w + 7;
     let bar_w = width.saturating_sub(fixed).min(40);
     let total: f64 = app
