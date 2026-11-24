@@ -314,6 +314,129 @@ const BUILTIN: &[BuiltinRow] = &[
         None,
     ),
     ("claude-3-haiku", date(2024, 3, 7), 0.25, 1.25, 0.03, None),
+    // Google Gemini API, paid tier, standard (USD per MTok), as listed on
+    // aistudio.google.com/docs/pricing and LiteLLM's `gemini/…` entries on 2026-11-24. The
+    // cache column is the cached-input price; Antigravity transcripts record no cache writes.
+    // Dates are each model's general availability, earlier where a preview ran first.
+    ("gemini-4-neon", date(2026, 11, 18), 3.00, 15.00, 0.15, None),
+    // Carbon and Argon: introductory price through 2026-11-30, doubled from 2026-12-01.
+    // (to verify) the preview start; the GA of Carbon was 2026-11-10.
+    (
+        "gemini-4-carbon",
+        date(2026, 9, 30),
+        2.00,
+        10.00,
+        0.10,
+        None,
+    ),
+    (
+        "gemini-4-carbon",
+        date(2026, 12, 1),
+        4.00,
+        20.00,
+        0.20,
+        None,
+    ),
+    ("gemini-4-argon", date(2026, 9, 30), 2.00, 10.00, 0.10, None),
+    ("gemini-4-argon", date(2026, 12, 1), 4.00, 20.00, 0.20, None),
+    (
+        "gemini-4-hydrogen",
+        date(2026, 11, 12),
+        1.50,
+        7.50,
+        0.075,
+        None,
+    ),
+    // (to verify) the 3.x release dates; the Flash prices double from 2027-01-01.
+    (
+        "gemini-3.8-flash",
+        date(2026, 1, 1),
+        0.75,
+        3.75,
+        0.075,
+        None,
+    ),
+    ("gemini-3.8-flash", date(2027, 1, 1), 1.50, 7.50, 0.15, None),
+    (
+        "gemini-3.7-flash",
+        date(2026, 1, 1),
+        0.75,
+        3.75,
+        0.075,
+        None,
+    ),
+    (
+        "gemini-3.6-flash",
+        date(2026, 1, 1),
+        0.75,
+        3.75,
+        0.075,
+        None,
+    ),
+    ("gemini-3.6-flash", date(2027, 1, 1), 1.50, 7.50, 0.15, None),
+    (
+        "gemini-3.5-flash-lite",
+        date(2026, 1, 1),
+        0.30,
+        2.50,
+        0.03,
+        None,
+    ),
+    ("gemini-3.5-flash", date(2026, 1, 1), 1.50, 9.00, 0.15, None),
+    ("gemini-3.1-pro*", date(2026, 1, 1), 2.00, 12.00, 0.20, None),
+    (
+        "gemini-3.1-flash-lite*",
+        date(2026, 1, 1),
+        0.25,
+        1.50,
+        0.025,
+        None,
+    ),
+    ("gemini-3-pro*", date(2025, 11, 18), 2.00, 12.00, 0.20, None),
+    (
+        "gemini-3-flash*",
+        date(2025, 12, 17),
+        0.50,
+        3.00,
+        0.05,
+        None,
+    ),
+    (
+        "gemini-2.5-pro",
+        date(2025, 3, 25),
+        1.25,
+        10.00,
+        0.125,
+        None,
+    ),
+    (
+        "gemini-2.5-flash-lite",
+        date(2025, 6, 17),
+        0.10,
+        0.40,
+        0.01,
+        None,
+    ),
+    (
+        "gemini-2.5-flash",
+        date(2025, 4, 17),
+        0.30,
+        2.50,
+        0.03,
+        None,
+    ),
+];
+
+/// Prices above a prompt size: (model as in `BUILTIN`, prompt tokens, input and output
+/// multipliers; cache reads scale with input).
+const LONG_CONTEXT: &[(&str, u64, f64, f64)] = &[
+    // Claude Haiku 5.5: $0.50 / $2.50 above 100K prompt tokens. Whether cache rates scale the
+    // same way is (to verify); assumed yes.
+    ("claude-haiku-5-5", 100_000, 5.0, 5.0),
+    // Gemini Pro above 200K: 2.5 Pro $2.50 / $15.00, 3.x Pro $4.00 / $18.00 (cache ×2).
+    ("gemini-2.5-pro", 200_000, 2.0, 1.5),
+    ("gemini-3.1-pro*", 200_000, 2.0, 1.5),
+    ("gemini-3-pro*", 200_000, 2.0, 1.5),
 ];
 
 impl PriceBook {
@@ -321,19 +444,22 @@ impl PriceBook {
         let entries = BUILTIN
             .iter()
             .map(|&(model, from, input, output, cache_read, fast)| {
+                let is_gemini = model.starts_with("gemini-");
                 let over = RateOverrides {
+                    cache_write_5m: is_gemini.then_some(input),
+                    cache_write_1h: is_gemini.then_some(input),
                     cache_read: Some(cache_read),
                     fast_multiplier: fast,
                     ..Default::default()
                 };
                 let mut rates = Rates::derive(input, output, &over, None);
-                // Claude Haiku 5.5: $0.50 / $2.50 above 100K prompt tokens. Whether cache
-                // rates scale the same way is (to verify); assumed yes.
-                rates.long_context = (model == "claude-haiku-5-5").then_some(LongContext {
-                    threshold: 100_000,
-                    input_multiplier: 5.0,
-                    output_multiplier: 5.0,
-                });
+                rates.long_context = LONG_CONTEXT.iter().find(|(m, ..)| *m == model).map(
+                    |&(_, threshold, input_multiplier, output_multiplier)| LongContext {
+                        threshold,
+                        input_multiplier,
+                        output_multiplier,
+                    },
+                );
                 PriceEntry {
                     model: model.to_string(),
                     from: Some(from),
@@ -954,5 +1080,91 @@ mod tests {
             book.cost_parts("claude-unknown-9", day(), &Usage::default(), false),
             Some(CostParts::default())
         );
+    }
+
+    #[test]
+    fn gemini_builtin_prices_and_long_context_by_hand() {
+        let book = PriceBook::builtin();
+        let d = NaiveDate::from_ymd_opt(2026, 11, 24).unwrap();
+        // gemini-2.5-pro (≤ 200k prompt): $1.25 input, $0.125 cached, $10.00 output per MTok.
+        // 100k input = $0.125; 80k cached = $0.010; 20k output = $0.200 -> $0.335.
+        // Cache saved: 80k × ($1.25 - $0.125) / 1M = $0.090.
+        let normal = Usage {
+            input: 100_000,
+            cache_read: 80_000,
+            output: 20_000,
+            ..Default::default()
+        };
+        let p = book
+            .cost_parts("gemini-2.5-pro", d, &normal, false)
+            .unwrap();
+        assert!(close(p.input, 0.125), "{p:?}");
+        assert!(close(p.cache_read, 0.010), "{p:?}");
+        assert!(close(p.output, 0.200), "{p:?}");
+        assert!(close(p.total(), 0.335), "{p:?}");
+        assert!(close(p.cache_saved, 0.090), "{p:?}");
+
+        // gemini-2.5-pro (> 200k prompt: 150k + 100k = 250k): input ×2 ($2.50), cached ×2
+        // ($0.25), output ×1.5 ($15.00).
+        // 150k × 2.50 = $0.375; 100k × 0.25 = $0.025; 20k × 15.00 = $0.300 -> $0.700.
+        let long = Usage {
+            input: 150_000,
+            cache_read: 100_000,
+            output: 20_000,
+            ..Default::default()
+        };
+        let lp = book.cost_parts("gemini-2.5-pro", d, &long, false).unwrap();
+        assert!(close(lp.input, 0.375), "{lp:?}");
+        assert!(close(lp.cache_read, 0.025), "{lp:?}");
+        assert!(close(lp.output, 0.300), "{lp:?}");
+        assert!(close(lp.total(), 0.700), "{lp:?}");
+
+        // A preview id matches its pattern (gemini-3-pro-preview -> $2 / $0.20 / $12).
+        // 50k input = $0.10; 50k cached = $0.01; 10k output = $0.12 -> $0.23.
+        let g3 = Usage {
+            input: 50_000,
+            cache_read: 50_000,
+            output: 10_000,
+            ..Default::default()
+        };
+        let c3 = book.cost("gemini-3-pro-preview", d, &g3, false);
+        assert!(c3.priced);
+        assert!(close(c3.usd.get(), 0.23), "{c3:?}");
+
+        // gemini-4-neon, what Antigravity runs ($3.00 / $0.15 cached / $15.00):
+        // 10k input = $0.030; 100k cached = $0.015; 2k output = $0.030 -> $0.075.
+        let neon = Usage {
+            input: 10_000,
+            cache_read: 100_000,
+            output: 2_000,
+            ..Default::default()
+        };
+        let cn = book.cost("gemini-4-neon", d, &neon, false);
+        assert!(cn.priced);
+        assert!(close(cn.usd.get(), 0.075), "{cn:?}");
+
+        // gemini-4-carbon doubles on 2026-12-01: 100k input + 10k output
+        // through 2026-11-30: 100k × $2 = $0.20 + 10k × $10 = $0.10 -> $0.30;
+        // from 2026-12-01:    100k × $4 = $0.40 + 10k × $20 = $0.20 -> $0.60.
+        let u = Usage {
+            input: 100_000,
+            output: 10_000,
+            ..Default::default()
+        };
+        let nov30 = NaiveDate::from_ymd_opt(2026, 11, 30).unwrap();
+        let dec1 = NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+        assert!(close(
+            book.cost("gemini-4-carbon", nov30, &u, false).usd.get(),
+            0.30
+        ));
+        assert!(close(
+            book.cost("gemini-4-carbon", dec1, &u, false).usd.get(),
+            0.60
+        ));
+
+        // A model with no list price stays unpriced, never guessed.
+        let unknown = book.cost("gemini-9-unknown", d, &g3, false);
+        assert!(!unknown.priced);
+        assert_eq!(unknown.usd, Usd::ZERO);
     }
 }
