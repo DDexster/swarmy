@@ -41,7 +41,7 @@ pub const CACHE_VERSION: &str = "7";
 const DIMENSIONS_SINCE: u32 = 6;
 
 /// Version of the fact tables; each step up has a migration in `migrate_facts`.
-pub const FACTS_VERSION: u32 = 4;
+pub const FACTS_VERSION: u32 = 5;
 
 /// Read from the transcripts row by row: dropped and read again when `CACHE_VERSION` changes.
 pub const RAW_TABLES: &[&str] = &[
@@ -773,8 +773,31 @@ fn migrate_facts(conn: &Connection) -> anyhow::Result<()> {
             harness_kinds()
         ))?;
     }
+    // 4 → 5: the `CHECK` on `seats.harness` lists every harness (Codex came after it was made).
+    // SQLite cannot change a CHECK: the table is made anew and its rows copied.
+    if version < 5 && !seats_name_every_harness(conn)? {
+        conn.execute_batch("ALTER TABLE seats RENAME TO seats_v4;")?;
+        conn.execute_batch(&facts_sql())?;
+        conn.execute_batch(
+            "INSERT INTO seats(seat, label, dir, harness, seen_at)
+               SELECT seat, label, dir, harness, seen_at FROM seats_v4;
+             DROP TABLE seats_v4;",
+        )?;
+    }
     set_meta(conn, "facts_version", &FACTS_VERSION.to_string())?;
     Ok(())
+}
+
+/// Whether the `CHECK` of `seats.harness` allows every harness of `Harness::TAGS`.
+fn seats_name_every_harness(conn: &Connection) -> rusqlite::Result<bool> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'seats'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(Harness::TAGS
+        .iter()
+        .all(|t| sql.contains(&format!("'{t}'"))))
 }
 
 #[cfg(test)]
@@ -962,6 +985,37 @@ mod tests {
             .is_err()
         );
         // Second open is a no-op.
+        assert!(!migrate(&c).unwrap());
+    }
+
+    #[test]
+    fn facts_version_4_lets_seats_be_codex_and_keeps_them() {
+        let c = Connection::open_in_memory().unwrap();
+        migrate(&c).unwrap();
+        // A version 4 index: its CHECK knew claude and agy only.
+        c.execute_batch(
+            "DROP TABLE seats;
+             CREATE TABLE seats (seat TEXT PRIMARY KEY, label TEXT NOT NULL, dir TEXT,
+               harness TEXT NOT NULL DEFAULT 'claude' CHECK (harness IN ('claude', 'agy')),
+               seen_at INTEGER NOT NULL);
+             INSERT INTO seats VALUES ('0123456789abcdef', 'work', '/d/work', 'agy', 100);",
+        )
+        .unwrap();
+        set_meta(&c, "facts_version", "4").unwrap();
+        migrate(&c).unwrap();
+        let h: String = c
+            .query_row(
+                "SELECT harness FROM seats WHERE seat = '0123456789abcdef'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(h, "agy");
+        c.execute(
+            "INSERT INTO seats(seat, label, dir, seen_at, harness) VALUES ('fedcba9876543210', 'codex', '/c', 1, 'codex')",
+            [],
+        )
+        .unwrap();
         assert!(!migrate(&c).unwrap());
     }
 

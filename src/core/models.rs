@@ -69,11 +69,15 @@ pub fn split_effort_suffix(model: &str) -> (&str, Option<&str>) {
 }
 
 /// Context window in tokens: 1M for current Claude and Gemini models, 200K for Haiku 4.5 and older
-/// Claude models, 128K for GPT-4o, 400K for GPT-5.
+/// Claude models, 128K for GPT-4o, 272K for GPT-5.6 and GPT-6 as Codex runs them (its model list
+/// says `context_window: 272000`), 400K for older GPT-5.
 pub fn context_window(model: &str) -> u64 {
     let m = model.to_ascii_lowercase();
     if m.contains("gpt-4o") || m.contains("gpt-4-") {
         return 128_000;
+    }
+    if m.contains("gpt-6") || m.contains("gpt-5.6") {
+        return 272_000;
     }
     if m.contains("gpt-5") {
         return 400_000;

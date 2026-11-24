@@ -1,7 +1,7 @@
 //! Agent harnesses (clients/runtimes) swarmy reads from disk.
 //!
 //! A seat is one config/data directory of a harness (for example `~/.claude`, `~/.claude-work`,
-//! `~/.gemini/antigravity-cli`). Model providers (Anthropic, Google, OpenAI) are separate from
+//! `~/.gemini/antigravity-cli`, `~/.codex`). Model providers (Anthropic, Google, OpenAI) are separate from
 //! harnesses: Antigravity and OpenCode can run models from several providers.
 
 use std::fmt;
@@ -28,19 +28,22 @@ pub enum Harness {
     #[default]
     Claude,
     Agy,
+    /// OpenAI's Codex CLI.
+    Codex,
 }
 
 impl Harness {
     /// Every harness swarmy knows, in display order.
-    pub const ALL: [Harness; 2] = [Harness::Claude, Harness::Agy];
+    pub const ALL: [Harness; 3] = [Harness::Claude, Harness::Agy, Harness::Codex];
 
     /// Stable key stored in SQLite (`seats.harness`), JSON output and CLI flags.
-    pub const TAGS: [&'static str; 2] = ["claude", "agy"];
+    pub const TAGS: [&'static str; 3] = ["claude", "agy", "codex"];
 
     pub fn key(self) -> &'static str {
         match self {
             Harness::Claude => Self::TAGS[0],
             Harness::Agy => Self::TAGS[1],
+            Harness::Codex => Self::TAGS[2],
         }
     }
 
@@ -49,6 +52,7 @@ impl Harness {
         match self {
             Harness::Claude => "cc",
             Harness::Agy => "agy",
+            Harness::Codex => "cdx",
         }
     }
 
@@ -56,6 +60,7 @@ impl Harness {
         match self {
             Harness::Claude => "Claude Code",
             Harness::Agy => "Antigravity",
+            Harness::Codex => "Codex",
         }
     }
 
@@ -70,6 +75,7 @@ impl Harness {
         match self {
             Harness::Claude => &["claude-code"],
             Harness::Agy => &["antigravity"],
+            Harness::Codex => &["openai-codex", "codex-cli"],
         }
     }
 
@@ -77,6 +83,7 @@ impl Harness {
     pub fn supports_vault(self) -> bool {
         match self {
             Harness::Claude | Harness::Agy => true,
+            Harness::Codex => false,
         }
     }
 
@@ -84,7 +91,7 @@ impl Harness {
     pub fn supports_limits(self) -> bool {
         match self {
             Harness::Claude => true,
-            Harness::Agy => false,
+            Harness::Agy | Harness::Codex => false,
         }
     }
 
@@ -92,7 +99,7 @@ impl Harness {
     pub fn supports_statusline(self) -> bool {
         match self {
             Harness::Claude => true,
-            Harness::Agy => false,
+            Harness::Agy | Harness::Codex => false,
         }
     }
 
@@ -100,7 +107,8 @@ impl Harness {
     pub fn has_transcript_retention(self) -> bool {
         match self {
             Harness::Claude => true,
-            Harness::Agy => false,
+            // Codex keeps its rollouts until the user deletes or archives them.
+            Harness::Agy | Harness::Codex => false,
         }
     }
 }

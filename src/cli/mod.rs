@@ -121,7 +121,7 @@ pub struct FilterArgs {
     /// Only this seat (its label, or its id from `swarmy doctor`).
     #[arg(long)]
     pub seat: Option<String>,
-    /// Only this harness (`claude`, `agy`).
+    /// Only this harness (`claude`, `agy`, `codex`).
     #[arg(long, value_enum)]
     pub harness: Option<crate::core::harness::Harness>,
     /// Only this project (name or path).
@@ -240,7 +240,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             // Saved logins, so the VAULT screen has something to show.
             {
                 let mut v = crate::vault::Vault::open(&ctx.dirs.vault_dir())?;
-                for s in &ctx.seats {
+                for s in ctx.seats.iter().filter(|s| s.harness.supports_vault()) {
                     v.edit(|tx| tx.capture(s, Some(&format!("alex-{}", s.label))))?;
                 }
                 let spare = crate::claude::credentials::Secret::new(serde_json::json!({

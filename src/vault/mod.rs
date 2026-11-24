@@ -130,6 +130,11 @@ pub fn unavailable(harness: Harness) -> Option<VaultError> {
 fn unavailable_on(harness: Harness, os: &str) -> Option<VaultError> {
     match (harness, os) {
         (Harness::Claude, "macos") => Some(VaultError::Keychain),
+        // Not kept yet: OpenAI may rotate the refresh token on use, so one login in two seats
+        // could sign each other out (to be verified before it is).
+        (Harness::Codex, _) => Some(VaultError::Unsupported(
+            Harness::Codex.display_name().into(),
+        )),
         (Harness::Claude | Harness::Agy, _) => None,
     }
 }
@@ -144,6 +149,10 @@ fn claude_logins_are_unavailable_on_macos_only() {
     assert!(unavailable_on(Harness::Claude, "linux").is_none());
     assert!(unavailable_on(Harness::Claude, "windows").is_none());
     assert!(unavailable_on(Harness::Agy, "macos").is_none());
+    assert!(matches!(
+        unavailable_on(Harness::Codex, "linux"),
+        Some(VaultError::Unsupported(_))
+    ));
 }
 
 pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
@@ -159,6 +168,9 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
                     return Err(VaultError::Keyring(seat.harness.display_name().into()).into());
                 }
                 Harness::Claude | Harness::Agy => {}
+                Harness::Codex => {
+                    return Err(VaultError::Unsupported(seat.harness.display_name().into()).into());
+                }
             }
             None
         }
@@ -171,6 +183,7 @@ pub fn read_seat(seat: &Seat) -> anyhow::Result<SeatLogin> {
         .and_then(|m| m.modified().ok())
         .map(DateTime::<Utc>::from);
     match seat.harness {
+        Harness::Codex => Err(VaultError::Unsupported(seat.harness.display_name().into()).into()),
         Harness::Claude => {
             let secret = text
                 .as_deref()
@@ -217,6 +230,8 @@ pub fn new_login_recipe(h: Harness) -> (&'static str, &'static str) {
     match h {
         Harness::Claude => ("claude", "Run /login, choose the account, then /exit."),
         Harness::Agy => ("agy", "Sign in with Google when agy asks, then quit agy."),
+        // Not offered: Codex logins are not kept (`Harness::supports_vault`).
+        Harness::Codex => ("codex", "Run `codex login`, sign in, then return."),
     }
 }
 
@@ -243,6 +258,10 @@ pub fn new_login(h: Harness, label: &str, scratch: &Path) -> (std::process::Comm
                 format!("scratch-{label}"),
                 scratch.join(".gemini").join("antigravity-cli"),
             )
+        }
+        Harness::Codex => {
+            cmd.env("CODEX_HOME", scratch).arg("login");
+            Seat::codex(format!("scratch-{label}"), scratch.to_path_buf())
         }
     };
     (cmd, seat)

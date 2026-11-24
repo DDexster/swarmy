@@ -94,6 +94,7 @@ pub(super) fn worker(
     let mut fleet_last: Option<crate::fleet::Fleet> = None;
     let mut slow: Option<SlowParts> = None;
     let mut agy_live = crate::agy::live::AgyLiveCache::default();
+    let mut codex_live = crate::codex::live::CodexLiveCache::default();
     loop {
         let tick_start = Instant::now();
         let mut marks: Vec<(&str, Instant)> = Vec::new();
@@ -112,6 +113,7 @@ pub(super) fn worker(
                     .flat_map(|st| registry::session_pids(&st.sessions_dir()))
                     .collect();
                 pids.extend(agy_live.tracked_pids());
+                pids.extend(codex_live.tracked_pids());
                 ctx.procs = ProcTable::for_pids(s, &pids);
             }
         }
@@ -164,6 +166,14 @@ pub(super) fn worker(
                         live_sessions.extend(crate::agy::live::build_live_sessions(
                             &s.id, &locked, &metas, &agy_live, &ctx.procs, ctx.now,
                         ));
+                    }
+                }
+                Harness::Codex => {
+                    let open = codex_live.open_threads(&s.dir);
+                    if !open.is_empty() {
+                        codex_live.resolve_procs(&s.dir, &open);
+                        live_sessions
+                            .extend(codex_live.live_sessions(&s.id, &s.dir, &open, ctx.now));
                     }
                 }
             }

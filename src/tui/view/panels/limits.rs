@@ -155,10 +155,21 @@ pub fn limits_seats(f: &mut Frame, app: &mut App, area: Rect, detail: bool) {
                         format!(" {}", fit("not saved · c", login_w)),
                         th.bold(th.warn),
                     ),
-                    // Not readable here (Claude Code on macOS: the Keychain), not logged out.
-                    (None, None) if crate::vault::unavailable(h).is_some() => {
-                        Span::styled(format!(" {}", fit("in Keychain", login_w)), dim(app))
-                    }
+                    // Not readable here (Claude Code on macOS: the Keychain), not logged out;
+                    // a harness whose logins the vault does not keep: nothing to say.
+                    (None, None) if crate::vault::unavailable(h).is_some() => Span::styled(
+                        format!(
+                            " {}",
+                            fit(
+                                match crate::vault::unavailable(h) {
+                                    Some(crate::errors::VaultError::Keychain) => "in Keychain",
+                                    Some(_) | None => "·",
+                                },
+                                login_w
+                            )
+                        ),
+                        dim(app),
+                    ),
                     (None, None) => {
                         Span::styled(format!(" {}", fit("(logged out)", login_w)), dim(app))
                     }
@@ -463,15 +474,21 @@ fn section_head(app: &App, h: Harness, rows: &[LimitsRow]) -> Line<'static> {
 }
 
 /// How an account is named on screen: the limit report's name (Anthropic accounts), else the
-/// email an agy account is keyed by, else a short id.
+/// email an agy account is keyed by, else the email a seat's login names (Codex), else a short
+/// id.
 fn account_name(app: &App, id: &str) -> String {
     if app.analytics.limits.iter().any(|r| r.account_uuid == id) {
         return app.account_label(id);
     }
-    match id.strip_prefix("agy:") {
-        Some(email) => email.to_string(),
-        None => app.account_label(id),
+    if let Some(email) = id.strip_prefix("agy:") {
+        return email.to_string();
     }
+    app.analytics
+        .seats
+        .iter()
+        .find(|s| s.account.as_deref() == Some(id))
+        .and_then(|s| s.email.clone())
+        .unwrap_or_else(|| app.account_label(id))
 }
 
 /// Where each account's week went: projects with their share of the used limit.

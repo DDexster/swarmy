@@ -116,8 +116,14 @@ fn seat<'a>(ctx: &'a Ctx, key: &str) -> anyhow::Result<&'a Seat> {
 
 /// Claude Code processes using this seat right now.
 fn live_in(ctx: &Ctx, s: &Seat) -> usize {
-    if s.harness == crate::core::harness::Harness::Agy {
-        return crate::agy::live::locked_conversations_once(&s.dir).len();
+    match s.harness {
+        crate::core::harness::Harness::Agy => {
+            return crate::agy::live::locked_conversations_once(&s.dir).len();
+        }
+        crate::core::harness::Harness::Codex => {
+            return crate::codex::live::open_threads_once(&s.dir).len();
+        }
+        crate::core::harness::Harness::Claude => {}
     }
     let registered = registry::live_sessions(&s.id, &s.sessions_dir(), &ctx.procs).len();
     let by_env = ctx
@@ -219,6 +225,8 @@ pub fn run(ctx: &Ctx, a: &AccountsArgs) -> anyhow::Result<()> {
                     crate::core::harness::Harness::Agy => {
                         "A running agy keeps the login it loaded until it restarts (it does not write its old token back)."
                     }
+                    // Refused by the vault (`VaultError::Unsupported`) before anything is read.
+                    crate::core::harness::Harness::Codex => "",
                 };
                 bail!(
                     "{} is running in seat '{}' ({live} session(s)). {how} Close them first, or pass --force.",
@@ -445,7 +453,12 @@ fn list(ctx: &Ctx, v: &mut Vault) -> anyhow::Result<()> {
                         format!("not saved: swarmy accounts capture {}", s.label),
                         Tone::Warn,
                     ),
-                    (None, None) if vault::unavailable(h).is_some() => {
+                    (None, None)
+                        if matches!(
+                            vault::unavailable(h),
+                            Some(crate::errors::VaultError::Keychain)
+                        ) =>
+                    {
                         Cell::tone("in the Keychain", Tone::Dim)
                     }
                     (None, None) => Cell::tone("(logged out)", Tone::Dim),

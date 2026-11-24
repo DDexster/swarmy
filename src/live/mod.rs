@@ -683,8 +683,12 @@ fn order_forest(mut agents: Vec<Agent>) -> Vec<Agent> {
 pub fn last_message(idx: &Index, a: &Agent) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let path = idx.transcript_path(key_of(a)).ok().flatten()?;
-    if a.harness == Harness::Agy {
-        return crate::agy::transcript::last_message(std::path::Path::new(&path));
+    match a.harness {
+        Harness::Agy => {
+            return crate::agy::transcript::last_message(std::path::Path::new(&path));
+        }
+        Harness::Codex => return crate::codex::rollout::last_message(std::path::Path::new(&path)),
+        Harness::Claude => {}
     }
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();

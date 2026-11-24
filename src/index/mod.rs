@@ -16,6 +16,8 @@ pub mod archive;
 pub(crate) mod archive_scenarios;
 #[cfg(test)]
 mod checkout_scenarios;
+#[cfg(test)]
+mod codex_scenarios;
 pub mod compact;
 #[cfg(test)]
 mod compact_scenarios;

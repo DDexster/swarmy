@@ -7,6 +7,7 @@ pub mod agy;
 pub mod app;
 pub mod claude;
 pub mod cli;
+pub mod codex;
 pub mod config;
 pub mod core;
 pub mod demo;

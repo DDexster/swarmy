@@ -23,7 +23,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         println!(
             "{}",
             warn(
-                "no agent config dir found (looked for ~/.claude*, ~/.gemini/antigravity-cli; add [[seat]] to config.toml)"
+                "no agent config dir found (looked for ~/.claude*, ~/.gemini/antigravity-cli, ~/.codex*; add [[seat]] to config.toml)"
             )
         );
     }
@@ -32,6 +32,7 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
         println!("{}", warn(problem));
     }
     let mut agy_cache = crate::agy::live::AgyLiveCache::default();
+    let mut codex_cache = crate::codex::live::CodexLiveCache::default();
     let mut live_by_seat: std::collections::HashMap<crate::core::ids::SeatId, Vec<LiveSession>> =
         Default::default();
     for s in &ctx.seats {
@@ -44,6 +45,11 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
                 crate::agy::live::build_live_sessions(
                     &s.id, &locked, &metas, &agy_cache, &ctx.procs, ctx.now,
                 )
+            }
+            Harness::Codex => {
+                let open = codex_cache.open_threads(&s.dir);
+                codex_cache.resolve_procs(&s.dir, &open);
+                codex_cache.live_sessions(&s.id, &s.dir, &open, ctx.now)
             }
         };
         live_by_seat.insert(s.id.clone(), sessions);
@@ -284,7 +290,10 @@ pub fn run(ctx: &Ctx) -> anyhow::Result<()> {
     let unknown: Vec<(&str, u64)> = ps
         .unknown_types()
         .into_iter()
-        .filter(|(t, _)| !crate::agy::transcript::KNOWN_TYPES.contains(t))
+        .filter(|(t, _)| {
+            !crate::agy::transcript::KNOWN_TYPES.contains(t)
+                && !crate::codex::rollout::KNOWN_TYPES.contains(t)
+        })
         .collect();
     if unknown.is_empty() {
         println!("{}", ok("every transcript record type is recognised"));

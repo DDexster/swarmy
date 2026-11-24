@@ -6,6 +6,8 @@
 //!   `expiresAt` in ms, `refreshTokenExpiresAt`, `subscriptionType`, `rateLimitTier`, `scopes`).
 //! - Antigravity: the whole `antigravity-oauth-token` file (`token.refresh_token`,
 //!   `token.expiry` as RFC 3339, `auth_method`, `id_token_email`).
+//! - Codex: the whole `auth.json` (`tokens.refresh_token`, `tokens.access_token` whose JWT `exp`
+//!   is its expiry, `tokens.id_token` whose claims name the plan; or `OPENAI_API_KEY`).
 
 use std::fmt;
 
@@ -94,6 +96,7 @@ impl LoginMeta {
         match harness {
             Harness::Claude => claude_meta(v),
             Harness::Agy => agy_meta(v),
+            Harness::Codex => codex_meta(v),
         }
     }
 }
@@ -155,6 +158,46 @@ fn agy_meta(v: &Value) -> LoginMeta {
     }
 }
 
+fn codex_meta(v: &Value) -> LoginMeta {
+    let tokens = v.get("tokens");
+    let s = |k: &str| {
+        tokens
+            .and_then(|t| t.get(k))
+            .and_then(Value::as_str)
+            .filter(|x| !x.is_empty())
+    };
+    let claims = |jwt: Option<&str>| -> Value {
+        jwt.and_then(super::jwt::payload)
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or(Value::Null)
+    };
+    let id = claims(s("id_token"));
+    let access = claims(s("access_token"));
+    let api_key = v
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .filter(|x| !x.is_empty());
+    LoginMeta {
+        fingerprint: s("refresh_token")
+            .or_else(|| s("access_token"))
+            .or(api_key)
+            .map(fingerprint)
+            .unwrap_or_else(|| "none".into()),
+        subscription_type: id
+            .get("https://api.openai.com/auth")
+            .and_then(|a| a.get("chatgpt_plan_type"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        rate_limit_tier: None,
+        access_expires_at: access
+            .get("exp")
+            .and_then(Value::as_i64)
+            .and_then(|t| Utc.timestamp_opt(t, 0).single()),
+        refresh_expires_at: None,
+        scopes: Vec::new(),
+    }
+}
+
 pub fn fingerprint(token: &str) -> String {
     let d = Sha256::digest(token.as_bytes());
     hex::encode(&d[..8])
@@ -184,5 +227,29 @@ mod tests {
         );
         let dbg = format!("{s:?}");
         assert!(!dbg.contains("ya-a") && !dbg.contains("ya-r"), "{dbg}");
+    }
+
+    #[test]
+    fn codex_meta_reads_the_plan_and_the_access_expiry_from_the_tokens_claims() {
+        use crate::core::jwt::b64url;
+        let jwt = |claims: &str| format!("{}.{}.sig", b64url(b"{}"), b64url(claims.as_bytes()));
+        let s = Secret::of(
+            Harness::Codex,
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": jwt(r#"{"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}"#),
+                    "access_token": jwt(r#"{"exp":1795600000}"#),
+                    "refresh_token": "rt-secret",
+                }
+            }),
+        );
+        let m = s.meta();
+        assert_eq!(m.fingerprint, fingerprint("rt-secret"));
+        assert_eq!(m.subscription_type.as_deref(), Some("plus"));
+        assert_eq!(
+            m.access_expires_at.map(|t| t.timestamp()),
+            Some(1_795_600_000)
+        );
     }
 }

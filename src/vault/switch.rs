@@ -35,6 +35,9 @@ impl VaultTx<'_> {
             Err(crate::errors::VaultError::NoLogin(_)) => self.find(login_key).cloned()?,
             Err(e) => return Err(e.into()),
         };
+        if let Some(e) = super::unavailable(seat.harness) {
+            return Err(e.into());
+        }
         if target.harness != seat.harness {
             return Err(VaultError::WrongHarness {
                 login: target.label,
@@ -60,7 +63,7 @@ impl VaultTx<'_> {
             let cred_text = store::read_optional(&seat.credentials_file())?;
             let cj_text = match seat.harness {
                 Harness::Claude => store::read_optional(&seat.claude_json)?,
-                Harness::Agy => None,
+                Harness::Agy | Harness::Codex => None,
             };
             let before = read_seat(seat)?;
             if store::read_optional(&seat.credentials_file())? != cred_text {
@@ -109,6 +112,9 @@ impl VaultTx<'_> {
                     &[(crate::agy::credentials::TOKEN_FILE, cred_text.as_deref())],
                     SEAT_BACKUPS,
                 )?,
+                Harness::Codex => {
+                    return Err(VaultError::Unsupported(seat.harness.display_name().into()).into());
+                }
             }
 
             #[cfg(test)]
@@ -118,6 +124,9 @@ impl VaultTx<'_> {
             let new_creds = match seat.harness {
                 Harness::Claude => credentials::with_login(cred_text.as_deref(), &secret)?,
                 Harness::Agy => crate::agy::credentials::with_login(&secret)?,
+                Harness::Codex => {
+                    return Err(VaultError::Unsupported(seat.harness.display_name().into()).into());
+                }
             };
             if !store::replace_if_unchanged(
                 &seat.credentials_file(),

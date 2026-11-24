@@ -81,6 +81,19 @@ impl Seat {
         }
     }
 
+    /// A Codex seat of `dir` (a Codex home), its id derived from the path.
+    pub fn codex(label: impl Into<String>, dir: PathBuf) -> Seat {
+        Seat {
+            id: seat_id(&dir),
+            label: label.into(),
+            dir,
+            claude_json: PathBuf::new(),
+            is_default: false,
+            found_by: Vec::new(),
+            harness: Harness::Codex,
+        }
+    }
+
     pub fn projects_dir(&self) -> PathBuf {
         self.dir.join("projects")
     }
@@ -94,6 +107,10 @@ impl Seat {
         match self.harness {
             Harness::Claude => vec![self.projects_dir()],
             Harness::Agy => vec![self.dir.join("brain"), self.dir.join("conversations")],
+            Harness::Codex => vec![
+                self.dir.join("sessions"),
+                self.dir.join("archived_sessions"),
+            ],
         }
     }
 
@@ -101,6 +118,7 @@ impl Seat {
         match self.harness {
             Harness::Claude => self.dir.join(".credentials.json"),
             Harness::Agy => self.dir.join("antigravity-oauth-token"),
+            Harness::Codex => self.dir.join("auth.json"),
         }
     }
 

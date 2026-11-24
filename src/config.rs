@@ -168,7 +168,7 @@ impl Default for StorageConf {
 pub struct SeatConf {
     pub path: String,
     pub label: Option<String>,
-    /// Optional harness (`claude`, `agy`); auto-detected from the directory shape when omitted.
+    /// Optional harness (`claude`, `agy`, `codex`); auto-detected from the directory shape when omitted.
     #[serde(default)]
     pub harness: Option<Harness>,
 }

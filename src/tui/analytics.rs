@@ -180,6 +180,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 None
             },
             plan: si.account.as_ref().and_then(|a| a.plan_label()),
+            email: si.account.as_ref().and_then(|a| a.email.clone()),
             live: live.iter().filter(|l| l.seat == s.id).count(),
             today_cost,
             today_requests,

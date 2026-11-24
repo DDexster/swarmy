@@ -243,6 +243,8 @@ impl App {
             (_, Harness::Agy) => format!(
                 "\n\nagy runs there ({live} session{plural}): it keeps its current login until restarted (it does not write the old one back)."
             ),
+            // The vault keeps no Codex logins: no switch is offered there.
+            (_, Harness::Codex) => String::new(),
         };
         let others: Vec<String> = self
             .login_by_id(&login)
@@ -594,7 +596,7 @@ impl App {
         }
     }
 
-    /// Runs the harness (`claude`, `agy`) in a scratch seat to sign in, then saves the login.
+    /// Runs the harness (`claude`, `agy`; a harness the vault keeps) in a scratch seat to sign in, then saves the login.
     /// Called with the dashboard suspended (the terminal belongs to the harness meanwhile).
     pub fn run_add_login(&mut self, label: &str, harness: Harness) {
         let scratch = self

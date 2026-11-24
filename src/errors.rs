@@ -42,6 +42,8 @@ pub enum VaultError {
     Keychain,
     #[error("{0} keeps its login in the OS keyring here; the vault cannot read it")]
     Keyring(String),
+    #[error("the vault does not keep {0} logins")]
+    Unsupported(String),
     #[error(
         "{} kept changing while swarmy tried to write it (Claude Code is writing it); nothing was overwritten, try again",
         .0.display()
@@ -129,6 +131,7 @@ impl Coded for VaultError {
             VaultError::MissingSecret(_) => "vault-missing-secret",
             VaultError::Keychain => "vault-keychain",
             VaultError::Keyring(_) => "vault-keyring",
+            VaultError::Unsupported(_) => "vault-unsupported",
             VaultError::SeatBusy(_) => "vault-seat-busy",
             VaultError::SwitchIncomplete { .. } => "vault-switch-incomplete",
         }

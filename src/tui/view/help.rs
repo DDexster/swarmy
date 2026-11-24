@@ -273,12 +273,12 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         row(
             "today · 7d",
             th.dim,
-            "a seat whose harness has no local quota (Antigravity): its spend instead of limit gauges",
+            "a seat whose harness has no local quota (Antigravity, Codex): its spend instead of limit gauges",
         ),
         row(
-            "cc · agy",
+            "cc · agy · cdx",
             th.dim,
-            "harness (SWARM, PROJECTS and MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity",
+            "harness (SWARM, PROJECTS and MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity · Codex",
         ),
         row(
             "shop/fix-1",
@@ -331,7 +331,7 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         row(
             "seat",
             th.fg,
-            "a harness config/data dir (~/.claude, ~/.claude-work, ~/.gemini/antigravity-cli…)",
+            "a harness config/data dir (~/.claude, ~/.claude-work, ~/.gemini/antigravity-cli, ~/.codex…)",
         ),
         row(
             "login",

@@ -620,6 +620,7 @@ mod tests {
             account: account.map(String::from),
             login: login.map(String::from),
             plan: None,
+            email: None,
             live: 0,
             today_cost: 0.0,
             today_requests: 0,

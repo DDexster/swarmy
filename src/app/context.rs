@@ -10,6 +10,7 @@ use crate::claude::config_json;
 use crate::claude::procs::ProcTable;
 use crate::claude::project::Resolver;
 use crate::claude::seats::{self, Candidates, Seat, SeatId};
+use crate::codex::discovery::{self as codex_discovery, CodexCandidates};
 use crate::config::{Config, Dirs};
 use crate::core::harness::Harness;
 use crate::core::ids::AccountId;
@@ -47,19 +48,23 @@ impl Ctx {
         crate::index::use_temp_dir(&dirs.data.join("tmp"))?;
         let procs = ProcTable::snapshot();
         // `SWARMY_ISOLATED=1` (tests, demos): only dirs under $HOME and the config count, not the
-        // config dirs of running `claude` or `agy` processes, which belong to the real user.
+        // config dirs of running `claude`, `agy` or `codex` processes, which belong to the real
+        // user.
         let isolated = std::env::var_os("SWARMY_ISOLATED").is_some();
         let mut claude_cfg = Vec::new();
         let mut agy_cfg = Vec::new();
+        let mut codex_cfg = Vec::new();
         for (path, label, explicit) in config.seat_entries(&dirs.home) {
             let h = match explicit {
                 Some(h) => h,
                 None if agy_discovery::looks_like_agy_dir(&path) => Harness::Agy,
+                None if codex_discovery::looks_like_codex_dir(&path) => Harness::Codex,
                 None => Harness::Claude,
             };
             match h {
                 Harness::Claude => claude_cfg.push((path, label)),
                 Harness::Agy => agy_cfg.push((path, label)),
+                Harness::Codex => codex_cfg.push((path, label)),
             }
         }
         let mut seats = Vec::new();
@@ -90,6 +95,22 @@ impl Ctx {
                 home: &dirs.home,
                 env_dirs,
                 configured: agy_cfg,
+            }));
+        }
+        if config.harness_enabled(Harness::Codex) {
+            let mut env_dirs: Vec<PathBuf> = procs
+                .codex
+                .iter()
+                .filter(|_| !isolated)
+                .filter_map(|p| p.home.clone())
+                .collect();
+            if let Some(d) = std::env::var_os("CODEX_HOME").filter(|_| !isolated) {
+                env_dirs.push(PathBuf::from(d));
+            }
+            seats.extend(codex_discovery::discover(&CodexCandidates {
+                home: &dirs.home,
+                env_dirs,
+                configured: codex_cfg,
             }));
         }
         // Keep labels unique across harnesses (seat ids never change): a later duplicate takes
@@ -711,8 +732,13 @@ pub fn seat_info_of(
     data_dir: &std::path::Path,
     problems: &mut Vec<String>,
 ) -> (SeatInfo, Option<serde_json::Value>) {
-    if s.harness == Harness::Agy {
-        let account = match crate::agy::account::read_account(&s.dir) {
+    let other_harness = match s.harness {
+        Harness::Agy => Some(crate::agy::account::read_account(&s.dir)),
+        Harness::Codex => Some(crate::codex::account::read_account(&s.dir)),
+        Harness::Claude => None,
+    };
+    if let Some(read) = other_harness {
+        let account = match read {
             Ok(a) => a,
             Err(e) => {
                 let msg = format!("seat {}: {e}", s.label);

@@ -26,6 +26,7 @@ pub(super) fn list_seat_files(seat: &Seat) -> Vec<TranscriptFile> {
             let metas = agy_summaries::read_all(&seat.dir);
             crate::agy::meta::list_transcripts(&seat.id, &seat.dir, &metas)
         }
+        Harness::Codex => crate::codex::meta::list_transcripts(&seat.id, &seat.dir),
     }
 }
 
@@ -44,11 +45,13 @@ pub(super) fn read_transcript_chunk(
             };
             crate::agy::transcript::read_from(&f.path, offset, conv_id, f.default_cwd.as_deref())
         }
+        Harness::Codex => crate::codex::rollout::read_from(&f.path, offset, &f.session_id),
     }
 }
 
 /// Lists transcript files recently modified in the `files` table (`mtime >= since`), hydrating
-/// Antigravity files with targeted `conversation_summaries.db` metadata.
+/// Antigravity files with targeted `conversation_summaries.db` metadata and Codex files with
+/// their thread names.
 pub(super) fn recent_files(
     conn: &Connection,
     seats: &[Seat],
@@ -74,14 +77,24 @@ pub(super) fn recent_files(
                 .iter()
                 .find(|s| s.id == seat_id)
                 .map_or(Harness::Claude, |s| s.harness);
-            if harness == Harness::Agy {
-                let cid = if agent_id.is_empty() {
-                    session_id
-                } else {
-                    agent_id
-                };
-                agy_recent.entry(seat_id).or_default().push(cid);
-                continue;
+            match harness {
+                Harness::Agy => {
+                    let cid = if agent_id.is_empty() {
+                        session_id
+                    } else {
+                        agent_id
+                    };
+                    agy_recent.entry(seat_id).or_default().push(cid);
+                    continue;
+                }
+                Harness::Codex => {
+                    if let Some(seat) = seats.iter().find(|s| s.id == seat_id) {
+                        let titles = crate::codex::meta::titles(&seat.dir);
+                        out.extend(crate::codex::meta::transcript_file(&seat.id, path, &titles));
+                    }
+                    continue;
+                }
+                Harness::Claude => {}
             }
             out.push(TranscriptFile {
                 path,
@@ -121,9 +134,20 @@ pub(super) fn session_files(
     seat: &Seat,
     sid: &str,
 ) -> Vec<TranscriptFile> {
-    if seat.harness == Harness::Agy {
-        let metas = agy_summaries::read_all(&seat.dir);
-        return crate::agy::meta::list_session_transcripts(&seat.id, &seat.dir, sid, &metas);
+    match seat.harness {
+        Harness::Agy => {
+            let metas = agy_summaries::read_all(&seat.dir);
+            return crate::agy::meta::list_session_transcripts(&seat.id, &seat.dir, sid, &metas);
+        }
+        // A thread is one rollout, found once and remembered (`codex::meta::find_rollout`).
+        Harness::Codex => {
+            let titles = crate::codex::meta::titles(&seat.dir);
+            return crate::codex::meta::find_rollout(&seat.dir, sid)
+                .and_then(|p| crate::codex::meta::transcript_file(&seat.id, p, &titles))
+                .into_iter()
+                .collect();
+        }
+        Harness::Claude => {}
     }
     let key = (seat.id.clone(), sid.to_string());
     let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();

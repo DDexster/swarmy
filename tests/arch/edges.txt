@@ -4,9 +4,15 @@
 agy -> claude
 agy -> core
 agy -> fsutil
+# OpenAI Codex reader: shares normalized Seat, Event, LiveSession and ProcTable, and the lock
+# files of `fsutil::locks` with agy.
+codex -> claude
+codex -> core
+codex -> fsutil
 # The composition root (Ctx) reads seats, config, prices, the index and the vault's labels.
 app -> agy
 app -> claude
+app -> codex
 app -> config
 app -> core
 # A vault that cannot be read while resolving --account is reported on the debug channel.
@@ -26,6 +32,7 @@ claude -> errors
 cli -> agy
 cli -> app
 cli -> claude
+cli -> codex
 cli -> config
 cli -> core
 cli -> demo
@@ -49,6 +56,8 @@ config -> core
 # Coded failures from the error catalogue (src/errors.rs).
 config -> errors
 demo -> claude
+# The demo Codex login's unsigned tokens (core::jwt::b64url).
+demo -> core
 # The demo world's pseudo-randomness (ui::hash, shared with the boot animation).
 demo -> ui
 # The fleet summary names seats and sessions by their ids (core::ids).
@@ -59,6 +68,7 @@ fleet -> fsutil
 fsutil -> diag
 index -> agy
 index -> claude
+index -> codex
 index -> core
 # Coded failures from the error catalogue (src/errors.rs).
 index -> errors
@@ -70,6 +80,7 @@ limits -> core
 limits -> index
 live -> agy
 live -> claude
+live -> codex
 # The status line reads Claude Code's files through the reader layer (seat ids, the session
 # registry, a transcript's tail, `.claude.json`'s account).
 statusline -> claude
@@ -86,6 +97,7 @@ live -> core
 live -> index
 tui -> agy
 tui -> claude
+tui -> codex
 # The theme named in config.toml (config::ThemeName).
 tui -> config
 # The dashboard's worker starts from the composition root.

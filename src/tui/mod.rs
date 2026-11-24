@@ -112,6 +112,9 @@ pub struct SeatRow {
     pub login: Option<String>,
     /// Auth/plan hint for seats outside the Claude vault (e.g. `consumer`).
     pub plan: Option<String>,
+    /// The account's email, naming an account no limit report or login names (Codex);
+    /// `--mask` hides it when drawn.
+    pub email: Option<String>,
     pub live: usize,
     pub today_cost: f64,
     pub today_requests: u64,

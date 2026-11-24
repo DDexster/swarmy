@@ -1,4 +1,4 @@
-//! Claude Code's tools by what they mean here. One vocabulary for the transcript parser (which
+//! The harnesses' tools by what they mean here. One vocabulary for the transcript parser (which
 //! tools name a file), the agent lanes (waiting on the user, on subagents), the efficiency figures
 //! (questions, plans, commands, files edited) and the edit conflicts, so they cannot disagree.
 
@@ -48,6 +48,15 @@ const TOOLS: &[(&str, ToolClass)] = &[
     ("ask_question", ToolClass::AskUser),
     ("invoke_subagent", ToolClass::Agent),
     ("swarm", ToolClass::Agent),
+    // OpenAI Codex (`read_file` is shared with agy)
+    ("apply_patch", ToolClass::Edit),
+    ("view_image", ToolClass::Read),
+    ("shell", ToolClass::Shell),
+    ("local_shell", ToolClass::Shell),
+    ("exec_command", ToolClass::Shell),
+    ("shell_command", ToolClass::Shell),
+    ("request_user_input", ToolClass::AskUser),
+    ("spawn_agent", ToolClass::Agent),
 ];
 
 impl ToolClass {
@@ -98,8 +107,11 @@ mod tests {
                 "write_to_file",
                 "replace_file_content",
                 "multi_replace_file_content",
+                "apply_patch",
             ]
         );
+        assert_eq!(ToolClass::of("shell"), ToolClass::Shell);
+        assert!(ToolClass::of("request_user_input").waits_on_user());
         assert_eq!(ToolClass::of("run_command"), ToolClass::Shell);
         assert_eq!(ToolClass::of("read_file"), ToolClass::Read);
         assert!(ToolClass::of("ask_question").waits_on_user());

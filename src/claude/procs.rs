@@ -32,6 +32,19 @@ pub struct AgyProc {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CodexProc {
+    pub pid: u32,
+    pub parent: Option<u32>,
+    pub cwd: Option<PathBuf>,
+    /// The Codex home this process uses: `CODEX_HOME` of its environment, else
+    /// `$HOME/.codex`, when the environment is readable.
+    pub home: Option<PathBuf>,
+    pub start_time: u64,
+    pub cpu: f32,
+    pub memory: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ProcNode {
     pub pid: u32,
     pub parent: Option<u32>,
@@ -46,6 +59,7 @@ pub struct ProcNode {
 pub struct ProcTable {
     pub claude: Vec<ClaudeProc>,
     pub agy: Vec<AgyProc>,
+    pub codex: Vec<CodexProc>,
     pub nodes: HashMap<u32, ProcNode>,
     children: HashMap<u32, Vec<u32>>,
 }
@@ -71,6 +85,33 @@ fn is_claude(name: &str, cmd: &[String]) -> bool {
 
 fn is_agy(name: &str) -> bool {
     proc_base(name) == "agy"
+}
+
+/// Codex subcommands that run no agent (the app server, logins, MCP, completions…). The app
+/// server of Codex 0.172 is a `codex app-server` process of its own; the agent is the `codex`
+/// that started it.
+const CODEX_NON_AGENT: &[&str] = &[
+    "app-server",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "completion",
+    "sandbox",
+    "debug",
+    "apply",
+    "cloud",
+    "features",
+    "help",
+];
+
+/// The native `codex` binary running an agent (the npm wrapper is a `node` process whose child
+/// is that binary, so it is not counted twice).
+fn is_codex(name: &str, cmd: &[String]) -> bool {
+    proc_base(name) == "codex"
+        && !cmd
+            .get(1)
+            .is_some_and(|a| CODEX_NON_AGENT.contains(&a.as_str()))
 }
 
 impl ProcTable {
@@ -126,6 +167,7 @@ impl ProcTable {
         ProcTable {
             claude: Vec::new(),
             agy: Vec::new(),
+            codex: Vec::new(),
             nodes,
             children: HashMap::new(),
         }
@@ -135,6 +177,7 @@ impl ProcTable {
         ProcTable {
             claude: Vec::new(),
             agy: Vec::new(),
+            codex: Vec::new(),
             nodes: HashMap::new(),
             children: HashMap::new(),
         }
@@ -145,6 +188,7 @@ impl ProcTable {
         let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut claude = Vec::new();
         let mut agy = Vec::new();
+        let mut codex = Vec::new();
         for (pid, p) in sys.processes() {
             // Threads show up as processes on Linux; skip them.
             if p.thread_kind().is_some() {
@@ -191,6 +235,25 @@ impl ProcTable {
                     cpu: p.cpu_usage(),
                     memory: p.memory(),
                 });
+            } else if is_codex(&name, &cmd) {
+                let env = |key: &str| {
+                    p.environ().iter().find_map(|e| {
+                        let e = e.to_string_lossy();
+                        e.strip_prefix(key)
+                            .filter(|v| !v.is_empty())
+                            .map(PathBuf::from)
+                    })
+                };
+                let home = env("CODEX_HOME=").or_else(|| env("HOME=").map(|h| h.join(".codex")));
+                codex.push(CodexProc {
+                    pid,
+                    parent,
+                    cwd: cwd.clone(),
+                    home,
+                    start_time: p.start_time(),
+                    cpu: p.cpu_usage(),
+                    memory: p.memory(),
+                });
             }
             if let Some(pp) = parent {
                 children.entry(pp).or_default().push(pid);
@@ -210,9 +273,11 @@ impl ProcTable {
         }
         claude.sort_by_key(|c| c.start_time);
         agy.sort_by_key(|c| c.start_time);
+        codex.sort_by_key(|c| c.start_time);
         ProcTable {
             claude,
             agy,
+            codex,
             nodes,
             children,
         }
@@ -292,6 +357,27 @@ mod tests {
         assert!(!is_claude(
             "zsh",
             &["zsh".into(), "-c".into(), "claude".into()]
+        ));
+    }
+
+    #[test]
+    fn recognises_a_codex_agent_not_its_app_server() {
+        assert!(is_codex("codex", &["codex".into()]));
+        assert!(is_codex(
+            "codex",
+            &["codex".into(), "exec".into(), "fix the tests".into()]
+        ));
+        assert!(!is_codex(
+            "codex",
+            &["codex".into(), "app-server".into(), "--listen".into()]
+        ));
+        assert!(!is_codex("codex", &["codex".into(), "login".into()]));
+        assert!(!is_codex(
+            "node",
+            &[
+                "node".into(),
+                "/usr/lib/node_modules/@openai/codex/bin/codex.js".into()
+            ]
         ));
     }
 
