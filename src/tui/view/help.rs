@@ -278,7 +278,7 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         row(
             "cc · agy",
             th.dim,
-            "harness (SWARM HAR, MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity",
+            "harness (SWARM, PROJECTS and MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity",
         ),
         row(
             "shop/fix-1",

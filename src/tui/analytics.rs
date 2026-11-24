@@ -200,6 +200,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
     }
     // The period before, of the same length, for trends.
     let prev_span = (!matches!(period, Period::All)).then(|| span.previous());
+    let mut harness_cells: Option<Vec<(String, String, f64)>> = None;
     let mut projects: Vec<ProjectRow> = match reuse {
         Some(prev) => prev
             .projects
@@ -211,6 +212,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 requests: p.requests,
                 prev: p.prev,
                 in_worktrees: p.in_worktrees,
+                by_harness: p.by_harness.clone(),
                 ..Default::default()
             })
             .collect(),
@@ -249,6 +251,13 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 ),
                 &|p, r| p.in_worktrees = r.cost,
             );
+            // Which harnesses worked on each project (applied below, by project name).
+            if multi_harness {
+                harness_cells = Some(timed!(
+                    "project_harness",
+                    idx.matrix(Dim::Project, Dim::Harness, span, &f)?
+                ));
+            }
             match (prev_reuse, prev_span) {
                 (Some(l), _) => {
                     let rows: Vec<Row> = l
@@ -296,6 +305,17 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
             )?,
             &|p, r| p.hour = r.cost,
         );
+    }
+    if let Some(cells) = harness_cells {
+        for p in projects.iter_mut() {
+            let mut hs: Vec<(String, f64)> = cells
+                .iter()
+                .filter(|(name, _, c)| *name == p.name && *c > 0.0)
+                .map(|(_, h, c)| (h.clone(), *c))
+                .collect();
+            hs.sort_by(|a, b| b.1.total_cmp(&a.1));
+            p.by_harness = hs;
+        }
     }
     if dbg {
         eprintln!("  projects+vault {:?}", t_start.elapsed());

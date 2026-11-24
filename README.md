@@ -178,7 +178,7 @@ that (`L` switches by hand). Every panel can be zoomed (`z`).
 | **3 BURN** | dollars per hour, and per minute by model over the last hour |
 | **4 ATTENTION** | needs you, stalled, a limit about to run out, two agents editing one file, logins not saved or about to expire; the event log |
 | **5 AGENT** | the selected agent: card, last message, cost of each request, context growth, compactions, tool timeline |
-| **6 PROJECTS** | live agents, $/hour, today, the period with ▲▼ against the previous one, the share made in worktrees, share of the week |
+| **6 PROJECTS** | which clients worked on it (`cc+agy`), live agents, $/hour, today, the period with ▲▼ against the previous one, the share made in worktrees, share of the week |
 | **7 MODELS** | spend and trends per model, cache hits, thinking, effort, project × model |
 | **8 HISTORY** | 14 days stacked by model (`←→` picks a day), a weekday × hour heat map |
 | **9 EFFICIENCY** | where agent time goes (tools, slowest commands), how long agents waited for you, what a prompt costs, cache savings, agent types, fleet size, rate limits, file conflicts, what a subscription is worth |

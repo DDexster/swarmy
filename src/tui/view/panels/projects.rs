@@ -47,7 +47,26 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         0
     };
-    let fixed = name_w + live_w + hour_w + today_w + per_w + 6 + share_w + wt_w + pts_w + 7;
+    // Which harnesses worked on each project (`cc+agy`), with more than one.
+    let har_w = if app
+        .analytics
+        .projects
+        .iter()
+        .any(|p| !p.by_harness.is_empty())
+    {
+        8usize
+    } else {
+        0
+    };
+    let har_of = |p: &crate::tui::ProjectRow| -> String {
+        p.by_harness
+            .iter()
+            .filter_map(|(k, _)| crate::core::harness::Harness::from_key(k))
+            .map(|h| h.short())
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    let fixed = name_w + har_w + live_w + hour_w + today_w + per_w + 6 + share_w + wt_w + pts_w + 7;
     let bar_w = width.saturating_sub(fixed).min(40);
     let total: f64 = app
         .analytics
@@ -65,8 +84,13 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
         .max(1e-9);
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "{} {} {} {} {} {} {}{} {}",
+            "{}{} {} {} {} {} {} {}{} {}",
             fit("PROJECT", name_w),
+            if har_w > 0 {
+                fit(" HAR", har_w)
+            } else {
+                String::new()
+            },
             fit_right("LIVE", live_w),
             fit_right("$/HOUR", hour_w),
             fit_right("TODAY", today_w),
@@ -124,11 +148,18 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             p.name.clone()
         };
-        let mut sp = vec![
-            Span::styled(
-                fit(&name, name_w),
-                th.bold(if p.hour > 0.0 { th.fg } else { th.dim }),
-            ),
+        let mut sp = vec![Span::styled(
+            fit(&name, name_w),
+            th.bold(if p.hour > 0.0 { th.fg } else { th.dim }),
+        )];
+        if har_w > 0 {
+            // A fact about where the work ran, not a model: plain text, no colour.
+            sp.push(Span::styled(
+                format!(" {}", fit(&har_of(p), har_w - 1)),
+                Style::new().fg(th.dim),
+            ));
+        }
+        sp.extend([
             Span::styled(
                 format!(
                     " {}",
@@ -167,7 +198,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             trend_w(app, p.period, p.prev, 6),
             Span::raw(" "),
-        ];
+        ]);
         sp.extend(gauge(p.period / max, bar_w, th.fade(th.accent, 0.25), &th));
         sp.push(Span::styled(
             format!(

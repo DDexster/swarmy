@@ -96,6 +96,9 @@ pub struct ProjectRow {
     pub prev: f64,
     /// The part of `period` spent in linked git worktrees.
     pub in_worktrees: f64,
+    /// `period` per harness key (with more than one harness), the largest first: one project
+    /// worked on from Claude Code, Antigravity, ….
+    pub by_harness: Vec<(String, f64)>,
 }
 
 #[derive(Debug, Clone)]
