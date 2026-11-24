@@ -11,6 +11,10 @@ You run several Claude Code sessions, each with a crowd of subagents. swarmy sho
 them live on one screen, tells you the moment one needs you and takes you there, and shows where
 your weekly limit went and when it runs out.
 
+swarmy is an observer, not a launcher: it never starts, prompts or controls an agent. Keep running
+your agents the way you do now (plain terminals, tmux, [herdr](#how-it-compares), claude-squad,
+worktrees) and put swarmy in a spare terminal next to them.
+
 <p align="center">
   <img src="docs/img/boot.gif" width="812" alt="swarmy starting up: the swarm assembles into the dashboard">
 </p>
@@ -29,6 +33,9 @@ your weekly limit went and when it runs out.
   moved between config dirs are followed.
 - **Spend at API prices.** By project, account, model, effort, agent type, session, agent and day,
   with trends against the previous period, the model mix, cache hits and thinking.
+- **Worktrees and branches.** Each session shows the checkout it works in (`shop/fix-1` for a git
+  worktree) and its branch; `⇄2` warns when two live sessions edit the same checkout. Spend per
+  worktree and per branch, and how much of each project's work ran in worktrees.
 - **Google Antigravity too.** `agy` seats, conversations and subagents sit in the same tree,
   panels and reports as Claude Code's, Gemini models priced at Google's list prices; `--harness`
   and `--by harness` tell them apart.
@@ -46,6 +53,47 @@ your weekly limit went and when it runs out.
   <br><sub>A session asks for permission: it is marked in the tree, comes first in ATTENTION and fills the AGENT panel. (All media is from <code>swarmy demo</code>: made-up data.)</sub>
 </p>
 
+## How it compares
+
+People who run many agents usually also use one of two other kinds of tool. swarmy sits between
+them and works alongside either.
+
+- **Launchers and multiplexers**: [herdr](https://herdr.dev),
+  [claude-squad](https://github.com/smtg-ai/claude-squad),
+  [ccmanager](https://github.com/kbwo/ccmanager), [Conductor](https://www.conductor.build). They
+  start your agents, own their terminals, give each one a worktree, keep sessions across restarts
+  and let you prompt them. herdr in particular is a full terminal workspace for agents that also
+  marks each pane as working, blocked or done.
+- **Usage counters**: [ccusage](https://github.com/ccusage/ccusage),
+  [Claude Code Usage Monitor](https://github.com/Maciek-roboblog/Claude-Code-Usage-Monitor). They
+  turn the transcripts into tokens and dollars, and ccusage reads many more agent CLIs than swarmy.
+
+What swarmy adds:
+
+- **One live view of every agent, subagents included,** across all your Claude Code config dirs
+  and Antigravity, whoever started them: a launcher sees the panes it owns, not the twenty
+  subagents working inside one session.
+- **Money and limits next to the agents.** What each agent and session costs as it runs, where each
+  account's weekly limit went by project, and when it runs out at the current pace.
+- **Several accounts.** Every config dir is found on its own; a vault moves OAuth logins between
+  them without losing a token.
+- **Hands off.** No network, no telemetry, no hooks or wrappers around the agents, and no
+  automation that types into them. It only reads what Claude Code and Antigravity already write to
+  disk, so nothing changes in how you run them.
+
+| | swarmy | launchers (herdr, claude-squad, …) | usage counters (ccusage, …) |
+|---|---|---|---|
+| starts, prompts, keeps agents | no | yes | no |
+| worktree per agent | shows them | creates them | no |
+| live state of every agent | yes, with subagents | yes, per pane | no |
+| cost at API prices | live and in reports | no | in reports |
+| weekly limit per account and project | yes | no | partly (5-hour blocks) |
+| several accounts and config dirs | yes, with a login vault | no | merged or separate |
+
+What the others do better: a launcher runs the work (sessions that survive a reboot, worktrees on
+demand, remote machines), and ccusage covers far more agent CLIs. `J` jumps into tmux, Zellij,
+kitty, WezTerm and iTerm2 panes; herdr's own panes are not among them yet.
+
 ## Quick start
 
 Every [release](https://github.com/koorchik/swarmy/releases/latest) has one static binary per
@@ -54,7 +102,7 @@ platform, with the man page and shell completions. `SHA256SUMS` covers every fil
 **Linux** (any distribution, x86_64 or ARM):
 
 ```sh
-V=0.1.0 T=x86_64-unknown-linux-musl     # other targets in the table below
+V=0.2.0 T=x86_64-unknown-linux-musl     # other targets in the table below
 curl -fLO https://github.com/koorchik/swarmy/releases/download/v$V/swarmy-$V-$T.tar.gz
 tar xzf swarmy-$V-$T.tar.gz && install -m 755 swarmy-$V-$T/swarmy ~/.local/bin/
 ```
@@ -71,8 +119,8 @@ new. The `.deb` and `.rpm` packages wrap the same binary and are installed by ha
 `armhf` `.deb` carries the ARMv6 build, which runs on every 32-bit Raspberry Pi):
 
 ```sh
-sudo apt install ./swarmy_0.1.0-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
-sudo dnf install ./swarmy-0.1.0-1.x86_64.rpm      # Fedora, RHEL, openSUSE
+sudo apt install ./swarmy_0.2.0-1_amd64.deb       # Debian, Ubuntu, Raspberry Pi OS
+sudo dnf install ./swarmy-0.2.0-1.x86_64.rpm      # Fedora, RHEL, openSUSE
 ```
 
 **macOS** (one universal binary for Apple silicon and Intel), with Homebrew:
@@ -121,12 +169,12 @@ that (`L` switches by hand). Every panel can be zoomed (`z`).
 
 | Panel | What it shows |
 |---|---|
-| **1 SWARM** | live agents grouped by session, each with its state, activity, context and cost and a 30-minute activity lane (`v`: spend per 15 minutes instead); what finished recently |
+| **1 SWARM** | live agents grouped by session, each with its state, activity, context and cost and a 30-minute activity lane (`v`: spend per 15 minutes instead); each session's checkout (`shop/fix-1` in a worktree), branch, and `⇄N` when sessions share a checkout; what finished recently |
 | **2 LIMITS · SEATS** | each account's week used, 5-hour window, reset and "runs out in …"; seats and saved logins; the week as a curve per account with the projection to the reset; where each account's week went by project |
 | **3 BURN** | dollars per hour, and per minute by model over the last hour |
 | **4 ATTENTION** | needs you, stalled, a limit about to run out, two agents editing one file, logins not saved or about to expire; the event log |
 | **5 AGENT** | the selected agent: card, last message, cost of each request, context growth, compactions, tool timeline |
-| **6 PROJECTS** | live agents, $/hour, today, the period with ▲▼ against the previous one, share of the week |
+| **6 PROJECTS** | live agents, $/hour, today, the period with ▲▼ against the previous one, the share made in worktrees, share of the week |
 | **7 MODELS** | spend and trends per model, cache hits, thinking, effort, project × model |
 | **8 HISTORY** | 14 days stacked by model (`←→` picks a day), a weekday × hour heat map |
 | **9 EFFICIENCY** | where agent time goes (tools, slowest commands), how long agents waited for you, what a prompt costs, cache savings, agent types, fleet size, rate limits, file conflicts, what a subscription is worth |
@@ -153,7 +201,8 @@ The mouse works too: a click focuses a panel or selects an agent, the wheel scro
 
 ```sh
 swarmy limits                         # weekly / 5-hour limits: shares per project, when they run out
-swarmy report --by project            # spend; --by account|seat|model|effort|agent-type|session|agent|day|hour|weekday
+swarmy report --by project            # spend; --by worktree|branch|account|seat|harness|model|effort|agent-type|session|agent|day|hour|weekday
+swarmy report --by project --checkout worktrees   # only the work done in git worktrees (main: the rest)
 swarmy report -p 30d --by day --format csv
 swarmy models -p 7d                   # per model: cost, cache hits, thinking, effort mix, substitutions
 swarmy accounts                       # seats, saved logins and the limit left on each
@@ -162,8 +211,8 @@ swarmy jump                           # jump to the Claude Code that has waited 
 ```
 
 Periods: `today`, `yesterday`, `week` (the current limit window, the default), `month`, `all`,
-`24h`, `7d`, `YYYY-MM-DD`, `FROM..TO`. Reports take `--account`, `--seat`, `--project` and
-`--model` filters and `--format table|json|csv`. Every command takes `--mask`. `swarmy man` and
+`24h`, `7d`, `YYYY-MM-DD`, `FROM..TO`. Reports take `--account`, `--seat`, `--harness`,
+`--project`, `--model` and `--checkout` filters and `--format table|json|csv`. Every command takes `--mask`. `swarmy man` and
 `swarmy completions <shell>` print the man page and shell completions.
 
 ## The status line
