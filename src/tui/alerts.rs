@@ -549,6 +549,7 @@ mod tests {
             name: if id.is_empty() { "main" } else { id }.into(),
             agent_type: None,
             project: "shop".into(),
+            checkout: None,
             model: Some("claude-opus-5-5".into()),
             effort: None,
             state,

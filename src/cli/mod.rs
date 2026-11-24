@@ -130,6 +130,17 @@ pub struct FilterArgs {
     /// Only models whose id contains this.
     #[arg(long)]
     pub model: Option<String>,
+    /// Only work in linked git worktrees (`worktrees`) or outside them (`main`).
+    #[arg(long, value_enum)]
+    pub checkout: Option<CheckoutArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum CheckoutArg {
+    /// Linked git worktrees.
+    Worktrees,
+    /// Main checkouts (and dirs outside any repository).
+    Main,
 }
 
 impl FilterArgs {
@@ -154,6 +165,7 @@ impl FilterArgs {
             harness: self.harness,
             project: self.project.clone(),
             model: self.model.clone(),
+            in_worktree: self.checkout.map(|c| c == CheckoutArg::Worktrees),
         })
     }
 }

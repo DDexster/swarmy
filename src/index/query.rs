@@ -29,10 +29,27 @@ const AGENT_TYPE_OF_REQUEST: &str = concat!(
     " END"
 );
 
+/// The checkout a request ran in (`projects p`): the linked worktree's dir, else the project.
+const CHECKOUT_OF_REQUEST: &str = "COALESCE(p.worktree, p.key, r.cwd, '?')";
+/// Its label: the project, then `/` and the worktree's dir name for a linked worktree.
+const CHECKOUT_LABEL: &str = r"MAX(COALESCE(p.name, r.cwd, '(unknown)') || CASE WHEN p.worktree IS NULL THEN '' ELSE '/' || substr(p.worktree, length(rtrim(p.worktree, replace(replace(p.worktree, '/', ''), '\', ''))) + 1) END)";
+/// The git branch of a request (`requests r` or a rollup): the agent's latest `branches` row
+/// that started before the end of the request's quarter hour, so a raw request and its rollup
+/// get the same branch.
+macro_rules! branch_of_request {
+    () => {
+        "COALESCE((SELECT CASE b.branch WHEN 'HEAD' THEN 'detached HEAD' ELSE b.branch END FROM branches b WHERE b.seat = r.seat AND b.session_id = r.session_id AND b.agent_id = r.agent_id AND b.from_ts < (r.ts / 900000 + 1) * 900000 ORDER BY b.from_ts DESC LIMIT 1), '(none)')"
+    };
+}
+
 /// A grouping dimension for spend reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Serialize)]
 pub enum Dim {
     Project,
+    /// The checkout: a linked worktree of a project, or the project's main checkout.
+    Worktree,
+    /// The git branch, per project.
+    Branch,
     Account,
     Seat,
     Harness,
@@ -54,6 +71,18 @@ impl Dim {
             Dim::Project => (
                 "COALESCE(p.key, r.cwd, '?')",
                 "MAX(COALESCE(p.name, r.cwd, '(unknown)'))",
+            ),
+            Dim::Worktree => (CHECKOUT_OF_REQUEST, CHECKOUT_LABEL),
+            Dim::Branch => (
+                concat!(
+                    "COALESCE(p.key, r.cwd, '?') || ' ⎇ ' || ",
+                    branch_of_request!()
+                ),
+                concat!(
+                    "MAX(COALESCE(p.name, r.cwd, '(unknown)') || ' ⎇ ' || ",
+                    branch_of_request!(),
+                    ")"
+                ),
             ),
             Dim::Account => (
                 "COALESCE(r.account_uuid, '?')",
@@ -97,6 +126,8 @@ impl Dim {
     pub fn title(self) -> &'static str {
         match self {
             Dim::Project => "PROJECT",
+            Dim::Worktree => "CHECKOUT",
+            Dim::Branch => "BRANCH",
             Dim::Account => "ACCOUNT",
             Dim::Seat => "SEAT",
             Dim::Harness => "HARNESS",
@@ -113,9 +144,13 @@ impl Dim {
 
     /// Whether a row's key and label come only from the request and from tables that do not
     /// change for old requests, so a settled part can be kept (`settled`). Agent types, session
-    /// titles and agent descriptions may arrive after the requests they label.
+    /// titles and agent descriptions may arrive after the requests they label; so may a branch
+    /// (a file read again from the start).
     fn settles(self) -> bool {
-        !matches!(self, Dim::AgentType | Dim::Session | Dim::Agent)
+        !matches!(
+            self,
+            Dim::AgentType | Dim::Session | Dim::Agent | Dim::Branch
+        )
     }
 
     /// Chronological dimensions sort by key, the others by cost.
@@ -134,6 +169,8 @@ pub struct Filter {
     /// Matches the project name or key.
     pub project: Option<String>,
     pub model: Option<String>,
+    /// `Some(true)`: only requests in a linked git worktree; `Some(false)`: only those outside one.
+    pub in_worktree: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +245,11 @@ fn where_clause(plan: Plan, f: &Filter, args: &mut Vec<rusqlite::types::Value>) 
         w.push("(p.name = ? OR p.key = ?)".into());
         args.push(V::Text(p.clone()));
         args.push(V::Text(p.clone()));
+    }
+    match f.in_worktree {
+        Some(true) => w.push("p.worktree IS NOT NULL".into()),
+        Some(false) => w.push("p.worktree IS NULL".into()),
+        None => {}
     }
     if let Some(m) = &f.model {
         w.push("r.model LIKE ?".into());

@@ -139,6 +139,30 @@ pub fn agent(f: &mut Frame, app: &mut App, area: Rect) {
             Style::new().fg(th.fg),
         ),
     ]));
+    if let Some(c) = &a.checkout {
+        let mut sp = vec![
+            Span::styled(fit("checkout", kw), faint(app)),
+            Span::styled(c.label(&a.project), th.bold(th.dir)),
+            Span::styled(
+                if c.worktree.is_some() {
+                    " · git worktree"
+                } else {
+                    " · main checkout"
+                },
+                Style::new().fg(th.fg),
+            ),
+        ];
+        if let Some(b) = c.branch_label() {
+            sp.push(Span::styled(format!(" · ⎇ {b}"), Style::new().fg(th.fg)));
+        }
+        if c.is_shared() {
+            sp.push(Span::styled(
+                format!(" · ⇄{} live sessions in this checkout", c.sessions),
+                th.bold(th.warn),
+            ));
+        }
+        lines.push(Line::from(sp));
+    }
     let cost = if a.unpriced && (!a.is_main() || a.session_cost == 0.0) {
         format!("unpriced · {} requests", fmt::count(a.requests))
     } else if a.is_main() {

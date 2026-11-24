@@ -210,6 +210,7 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 period: p.period,
                 requests: p.requests,
                 prev: p.prev,
+                in_worktrees: p.in_worktrees,
                 ..Default::default()
             })
             .collect(),
@@ -237,6 +238,17 @@ pub fn analytics(i: Inputs) -> anyhow::Result<Analytics> {
                 p.period = r.cost;
                 p.requests = r.requests;
             });
+            let in_wt = Filter {
+                in_worktree: Some(true),
+                ..Filter::default()
+            };
+            upsert(
+                timed!(
+                    "worktree_projects",
+                    idx.spend_by(Dim::Project, span, &in_wt)?
+                ),
+                &|p, r| p.in_worktrees = r.cost,
+            );
             match (prev_reuse, prev_span) {
                 (Some(l), _) => {
                     let rows: Vec<Row> = l

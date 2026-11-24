@@ -88,7 +88,7 @@ logins. Users run it in a spare terminal, mostly on laptops.
   (`index::seats`, `vault::logins`), nothing is dropped.
 - The index schema (`src/index/schema.rs`) has raw tables (requests, tool calls, … dropped and
   read again from transcripts when `CACHE_VERSION` changes), dimension tables that label them and
-  outlive Claude Code's 30-day transcript retention (`sessions`, `agents`, `projects`,
+  outlive Claude Code's 30-day transcript retention (`sessions`, `agents`, `projects`, `branches`,
   `cost_states`: kept across a bump, merged into on a re-read), archive tables (quarter-hour
   rollups of raw rows that are gone, `ARCHIVE_VERSION`, never dropped), and fact tables that
   nothing else records (`seat_accounts`, `accounts`, `readings`, `observed_prices`, `seats`: migrated by
@@ -174,6 +174,12 @@ logins. Users run it in a spare terminal, mostly on laptops.
   `claude` processes' `CLAUDE_CONFIG_DIR`, so a fake `HOME` is NOT isolation — the real seats
   still show up. Set `SWARMY_ISOLATED=1` together with the fake `HOME` (and unset
   `CLAUDE_CONFIG_DIR`), and check the seat list before any `--yes`.
+- Checkouts: `projects.worktree` names the linked worktree a cwd is in (`.git` file); each
+  record's `gitBranch` is kept as `branches` rows (one per change, per agent; `HEAD` is a detached
+  HEAD), which label the rollups too (a branch is read by quarter hour, so raw and rolled-up
+  reports agree). `report --by worktree|branch`, `--checkout worktrees|main`, `g` in the
+  dashboard, `⇄N` on sessions sharing one checkout (`live/checkout.rs`, pure). Nothing is read
+  from disk per tick: the live view takes the cwd of the agent's last request and `projects`.
 - Projects: a cwd resolves to its git root; removed worktrees under `<repo>-wt/` fold into
   `<repo>`; a dir outside any repo (gone, or a scratch dir) takes the project of the session it ran
   in, or the session's own dir when it lies under it (never a home dir). Changing these rules means
@@ -243,6 +249,8 @@ tree is in start order, panel sizes do not depend on the agent count); colour on
 something; everything works from the keyboard.
 
 Words on screen (keep them, and the legend in `view/help.rs::legend_lines`, in sync):
+- **checkout** = where an agent works: a project's main checkout or one of its linked git
+  worktrees, shown as `project/worktree`; "⇄2" = two live sessions in one checkout.
 - **seat** = a Claude Code config dir; **login** = an OAuth sign-in (saved ones live in the vault);
   **account** = the Anthropic account behind a login, named after its saved login.
 - Limits: "week used N%", "runs out in 7h (Mon 03:34)", "limit reached"; shares as "% of week",

@@ -444,6 +444,8 @@ mod tests {
         ];
         let dims = [
             Dim::Project,
+            Dim::Worktree,
+            Dim::Branch,
             Dim::Account,
             Dim::Seat,
             Dim::Harness,

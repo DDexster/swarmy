@@ -93,6 +93,8 @@ pub(super) fn write_file(
     let mut account = w.account.clone();
     let mut last_ts = w.last_ts;
     let mut agg = FileAgg::default();
+    // The branch of the request before (a lookup only when it changes).
+    let mut branch: Option<String> = None;
     let mut ins_req = tx.prepare_cached(&format!(
         "INSERT INTO requests(msg_id, seat, session_id, agent_id, account_uuid, ts, model, requested_model, effort, fast, cwd,
                               input, cw5, cw1h, cread, output, thinking, web, rowid)
@@ -124,6 +126,12 @@ pub(super) fn write_file(
                 last_ts = last_ts.max(t);
                 agg.first_ts = Some(agg.first_ts.map_or(t, |x| x.min(t)));
                 agg.last_ts = Some(agg.last_ts.map_or(t, |x| x.max(t)));
+                if let Some(b) = r.git_branch.as_deref().filter(|b| !b.is_empty())
+                    && branch.as_deref() != Some(b)
+                {
+                    record_branch(tx, f, t, b)?;
+                    branch = Some(b.to_string());
+                }
                 if r.cwd.is_some() {
                     agg.cwd = r.cwd.clone();
                     if let Some(c) = &r.cwd
@@ -374,6 +382,33 @@ fn insert_tools(
             tu.summary,
             tu.target
         ])?;
+    }
+    Ok(())
+}
+
+/// Records that the agent of `f` worked on `branch` at `t`, unless the branch in force then is
+/// that one already. Rows are only added: a file read again in any order gives the same answer
+/// for every request (the latest row at or before it).
+fn record_branch(
+    tx: &rusqlite::Transaction,
+    f: &files::TranscriptFile,
+    t: i64,
+    branch: &str,
+) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+    let now: Option<String> = tx
+        .prepare_cached(
+            "SELECT branch FROM branches WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3
+             AND from_ts <= ?4 ORDER BY from_ts DESC LIMIT 1",
+        )?
+        .query_row(params![f.seat, f.session_id, f.agent_id, t], |r| r.get(0))
+        .optional()?;
+    if now.as_deref() != Some(branch) {
+        tx.prepare_cached(
+            "INSERT OR IGNORE INTO branches(seat, session_id, agent_id, from_ts, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?
+        .execute(params![f.seat, f.session_id, f.agent_id, t, branch])?;
     }
     Ok(())
 }

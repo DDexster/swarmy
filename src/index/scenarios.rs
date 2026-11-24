@@ -570,7 +570,7 @@ mod tests {
         drop(idx);
         Index::open(&path)
             .unwrap()
-            .set_meta("schema_version", "7")
+            .set_meta("schema_version", "8")
             .unwrap();
         let mut idx = Index::open(&path).unwrap();
         assert_eq!(

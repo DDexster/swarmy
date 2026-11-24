@@ -41,7 +41,13 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
     let (live_w, hour_w, today_w, per_w, share_w, pts_w) =
         (5usize, 9usize, 10usize, 10usize, 6usize, 10usize);
     let name_w = 18usize.min(width / 4).max(10);
-    let fixed = name_w + live_w + hour_w + today_w + per_w + 6 + share_w + pts_w + 7;
+    // The share of a project's spend made in linked git worktrees, once any was.
+    let wt_w = if app.analytics.projects.iter().any(|p| p.in_worktrees > 0.0) {
+        7usize
+    } else {
+        0
+    };
+    let fixed = name_w + live_w + hour_w + today_w + per_w + 6 + share_w + wt_w + pts_w + 7;
     let bar_w = width.saturating_sub(fixed).min(40);
     let total: f64 = app
         .analytics
@@ -59,7 +65,7 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
         .max(1e-9);
     let mut lines = vec![Line::from(Span::styled(
         format!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {}{} {}",
             fit("PROJECT", name_w),
             fit_right("LIVE", live_w),
             fit_right("$/HOUR", hour_w),
@@ -67,6 +73,11 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             fit_right(&format!("{}      ", period.to_uppercase()), per_w + 6),
             fit("", bar_w),
             fit_right("SHARE", share_w),
+            if wt_w > 0 {
+                format!(" {}", fit_right("IN WT", wt_w - 1))
+            } else {
+                String::new()
+            },
             fit_right("% OF WEEK", pts_w)
         ),
         faint(app),
@@ -165,6 +176,21 @@ pub fn projects(f: &mut Frame, app: &mut App, area: Rect) {
             ),
             dim(app),
         ));
+        if wt_w > 0 {
+            let wt = if p.in_worktrees > 0.0 && p.period > 0.0 {
+                fmt::pct(p.in_worktrees / p.period * 100.0)
+            } else {
+                "·".into()
+            };
+            sp.push(Span::styled(
+                format!(" {}", fit_right(&wt, wt_w - 1)),
+                Style::new().fg(if p.in_worktrees > 0.0 {
+                    th.dim
+                } else {
+                    th.faint
+                }),
+            ));
+        }
         sp.push(Span::styled(
             format!(
                 " {}",

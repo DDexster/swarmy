@@ -159,7 +159,7 @@ fn assistant(
     let who = agent.unwrap_or("main");
     let tool_id = format!("toolu_demo{seed:x}_{who}_{}", t.timestamp_millis());
     let mut v = json!({
-        "type": "assistant", "timestamp": ts(t), "cwd": cwd, "effort": effort, "requestedModel": model,
+        "type": "assistant", "timestamp": ts(t), "cwd": cwd, "gitBranch": branch_of(cwd), "effort": effort, "requestedModel": model,
         "message": {"id": format!("msg_demo{seed:x}"), "model": model,
                     "content": [{"type": "tool_use", "id": tool_id, "name": name, "input": {key: val}}],
                     "stop_reason": "tool_use", "usage": usage(seed, model)}
@@ -192,20 +192,80 @@ fn append(path: &Path, lines: &[serde_json::Value]) {
     }
 }
 
-fn project_dir(seat_dir: &Path, project: &str) -> PathBuf {
+/// Claude Code's transcript dir of a checkout's project.
+fn project_dir(seat_dir: &Path, checkout: &str) -> PathBuf {
     seat_dir
         .join("projects")
-        .join(format!("-home-dev-work-{project}"))
+        .join(format!("-home-dev-work-{}", project_of(checkout)))
 }
 
-fn cwd(project: &str) -> String {
-    format!("/home/dev/work/{project}")
+/// Where the demo's repositories are: `<root>/work`, set by [`start`].
+static WORK: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// Checkouts made on disk already.
+static MADE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// A demo checkout is `project` (the main checkout), `project/.claude/worktrees/<name>` (Claude
+/// Code's `--worktree`) or `project-wt/<name>` (a worktree next to the repository).
+fn project_of(checkout: &str) -> &str {
+    let first = checkout.split('/').next().unwrap_or(checkout);
+    first.strip_suffix("-wt").unwrap_or(first)
+}
+
+/// The branch Claude Code would record in a checkout.
+fn branch_of(cwd: &str) -> String {
+    if let Some((_, name)) = cwd.split_once("/.claude/worktrees/") {
+        return format!("worktree-{}", name.split('/').next().unwrap_or(name));
+    }
+    match cwd.split_once("-wt/") {
+        Some((_, name)) => format!("fix/{}", name.split('/').next().unwrap_or(name)),
+        None => "main".into(),
+    }
+}
+
+/// The working directory of a checkout, made on disk the first time (a repository with a
+/// `.git` dir; a linked worktree with the `.git` file git writes), so projects and worktrees
+/// resolve as they do on a real machine.
+fn cwd(checkout: &str) -> String {
+    let work = match WORK.lock() {
+        Ok(w) => w.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
+    .unwrap_or_else(|| PathBuf::from("/home/dev/work"));
+    let dir = work.join(checkout);
+    let mut made = match MADE.lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    if !made.iter().any(|m| m == checkout) {
+        let repo = work.join(project_of(checkout));
+        let _ = std::fs::create_dir_all(repo.join(".git"));
+        if dir != repo {
+            let name = dir
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let gitdir = repo.join(".git").join("worktrees").join(name);
+            let _ = std::fs::create_dir_all(&gitdir);
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(".git"), format!("gitdir: {}\n", gitdir.display()));
+        }
+        made.push(checkout.to_string());
+    }
+    dir.to_string_lossy().into_owned()
 }
 
 /// Builds the demo world under `root` (wiped first) and starts the agents.
 pub fn start(root: &Path, load: Load) -> anyhow::Result<Demo> {
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root)?;
+    match WORK.lock() {
+        Ok(mut w) => *w = Some(root.join("work")),
+        Err(p) => *p.into_inner() = Some(root.join("work")),
+    }
+    match MADE.lock() {
+        Ok(mut m) => m.clear(),
+        Err(p) => p.into_inner().clear(),
+    }
     let now = Utc::now();
     let mut seats = Vec::new();
     let defs = match load {
@@ -272,6 +332,12 @@ fn history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
             let seed0 = si * 10_000 + day as u64 * 100 + pi as u64;
             let sid = format!("{:08x}-demo-{}-{day}-{pi}", rnd(seed0, 7) as u32, s.label);
             let pdir = project_dir(dir, project);
+            // Every third session works in a worktree of its own.
+            let checkout = if (day as u64 + pi as u64 + si).is_multiple_of(3) {
+                format!("{project}/.claude/worktrees/task-{day}")
+            } else {
+                project.to_string()
+            };
             let start = if day == 0 {
                 now - Duration::minutes(55 + (rnd(seed0, 8) % 120) as i64)
             } else {
@@ -291,7 +357,7 @@ fn history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
                     t,
                     "claude-opus-5-5",
                     "high",
-                    &cwd(project),
+                    &cwd(&checkout),
                     None,
                     i as usize,
                 );
@@ -323,7 +389,7 @@ fn history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
                         t,
                         model,
                         effort,
-                        &cwd(project),
+                        &cwd(&checkout),
                         Some(&aid),
                         (k + i) as usize,
                     );
@@ -369,6 +435,11 @@ fn wall_history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
                 + k * 100_000_000;
             let sid = format!("{:08x}-wall-{}-{day}-{k}", rnd(seed0, 7) as u32, s.label);
             let pdir = project_dir(dir, project);
+            let checkout = if k == 1 && day % 2 == 0 {
+                format!("{project}/.claude/worktrees/wall-{day}")
+            } else {
+                project.to_string()
+            };
             let start =
                 now - Duration::days(day) - Duration::hours(11) + Duration::minutes(k as i64 * 20);
             let mut main = vec![
@@ -382,7 +453,7 @@ fn wall_history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
                     t,
                     "claude-opus-5-5",
                     "high",
-                    &cwd(project),
+                    &cwd(&checkout),
                     None,
                     i as usize,
                 );
@@ -411,7 +482,7 @@ fn wall_history(dir: &Path, s: &SeatDef, si: u64, now: DateTime<Utc>) {
                         t,
                         model,
                         effort,
-                        &cwd(project),
+                        &cwd(&checkout),
                         Some(&aid),
                         (g + i) as usize,
                     );
@@ -442,20 +513,44 @@ fn live(seat_dirs: Vec<PathBuf>, agy_dir: PathBuf, stop: Arc<AtomicBool>, load: 
     let pid = std::process::id();
     let start = proc_start_ticks(pid);
     let now = Utc::now();
-    let sessions = [
+    // (seat, checkout, session id, name): the storefront's main checkout has two live sessions
+    // (⇄2 on screen), the others work in worktrees.
+    let sessions: Vec<(usize, &str, &str, &str)> = [
         (
             0usize,
             "storefront",
             "a1b2c3d4-demo-live-storefront",
             "checkout-revamp",
         ),
-        (1, "payments-api", "e5f6a7b8-demo-live-payments", "refunds"),
-        (2, "ml-pipeline", "c9d0e1f2-demo-live-ml", "feature-store"),
-    ];
-    let sessions = &sessions[..seat_dirs.len().min(sessions.len())];
+        (
+            1,
+            "payments-api-wt/refund-retry",
+            "e5f6a7b8-demo-live-payments",
+            "refunds",
+        ),
+        (
+            2,
+            "ml-pipeline/.claude/worktrees/feature-store",
+            "c9d0e1f2-demo-live-ml",
+            "feature-store",
+        ),
+        (1, "storefront", "b3c4d5e6-demo-live-hotfix", "cart-hotfix"),
+    ]
+    .into_iter()
+    .filter(|s| s.0 < seat_dirs.len())
+    .collect();
+    let sessions = &sessions[..];
     // Main threads with a little recent history, and the registry entries.
-    for &(si, project, sid, name) in sessions {
+    // The registry is keyed by pid, so a second live session on one seat needs another live
+    // process: the demo's parent (the shell) stands in for it.
+    #[cfg(unix)]
+    let other_pid = std::os::unix::process::parent_id();
+    #[cfg(not(unix))]
+    let other_pid = 0;
+    let other_start = proc_start_ticks(other_pid);
+    for (k, &(si, project, sid, name)) in sessions.iter().enumerate() {
         let dir = &seat_dirs[si];
+        let second = sessions[..k].iter().any(|o| o.0 == si);
         let p = project_dir(dir, project).join(format!("{sid}.jsonl"));
         let mut lines = vec![
             json!({"type": "session-owner", "accountUuid": SEATS[si].account, "sessionId": sid}),
@@ -470,7 +565,7 @@ fn live(seat_dirs: Vec<PathBuf>, agy_dir: PathBuf, stop: Arc<AtomicBool>, load: 
                     500_000_000 + si as u64 * 10_000 + i
                 } else {
                     9_000 + i + si as u64 * 50
-                },
+                } + if second { 70_000_000 } else { 0 },
                 t,
                 "claude-opus-5-5",
                 "high",
@@ -482,7 +577,19 @@ fn live(seat_dirs: Vec<PathBuf>, agy_dir: PathBuf, stop: Arc<AtomicBool>, load: 
             lines.push(tool_result(t + Duration::seconds(30), &tid));
         }
         append(&p, &lines);
-        write_registry(dir, pid, start.as_deref(), sid, project, name, "busy");
+        if second {
+            write_registry(
+                dir,
+                other_pid,
+                other_start.as_deref(),
+                sid,
+                project,
+                name,
+                "idle",
+            );
+        } else {
+            write_registry(dir, pid, start.as_deref(), sid, project, name, "busy");
+        }
     }
     // A stalled agent from 40 minutes ago.
     {

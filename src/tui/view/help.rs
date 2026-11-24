@@ -280,6 +280,26 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
             th.dim,
             "harness (SWARM HAR, MODELS HAR, BURN today split; with more than one): Claude Code · Antigravity",
         ),
+        row(
+            "shop/fix-1",
+            th.dir,
+            "a project's linked git worktree (no suffix: the main checkout); g groups by checkout",
+        ),
+        row(
+            "⎇ branch",
+            th.faint,
+            "the git branch (left out for main/master, and when the worktree's name says it)",
+        ),
+        row(
+            "⇄2",
+            th.warn,
+            "live sessions working in the same checkout: their edits can collide (a worktree each avoids it)",
+        ),
+        row(
+            "IN WT",
+            th.dim,
+            "PROJECTS: share of the project's spend made in linked worktrees",
+        ),
         head("colours"),
         Line::from(vec![
             Span::styled(fit("limit", 16), th.bold(th.fg)),

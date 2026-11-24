@@ -15,7 +15,9 @@ use crate::core::tools::ToolClass;
 use crate::index::live::{AgentKey, AgentRow, DoneAgent};
 use crate::index::{Index, from_ms, ms};
 
+mod checkout;
 mod state;
+pub use checkout::Checkout;
 pub use state::{Options, State, StateInputs, agent_state};
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +34,8 @@ pub struct Agent {
     pub name: String,
     pub agent_type: Option<String>,
     pub project: String,
+    /// The git checkout it works in (worktree, branch, live sessions sharing it).
+    pub checkout: Option<Checkout>,
     pub model: Option<String>,
     pub effort: Option<String>,
     pub state: State,
@@ -111,6 +115,7 @@ struct AgentReads {
     totals: (u64, f64),
     tool: Option<crate::index::live::OpenTool>,
     done_ts: Option<i64>,
+    branch: Option<String>,
     /// USD per minute over the last 15 minutes, as of the read.
     spark: Vec<f64>,
 }
@@ -210,7 +215,7 @@ pub fn build(
             });
         }
     }
-    let projects = idx.project_names()?;
+    let projects = idx.project_dirs()?;
     let spark_start = now - Duration::minutes(15);
 
     let mut agents = Vec::new();
@@ -247,6 +252,7 @@ pub fn build(
                     totals: idx.agent_totals(key)?,
                     tool,
                     done_ts: idx.last_tool_done(key)?,
+                    branch: idx.agent_branch(key)?,
                     last_req,
                     spark,
                 }
@@ -259,6 +265,7 @@ pub fn build(
             tool,
             done_ts,
             spark,
+            branch,
             ..
         } = got;
         let unpriced = requests > 0 && cost == 0.0 && last_req.priced == Some(0);
@@ -296,13 +303,16 @@ pub fn build(
         let project = r
             .cwd
             .as_ref()
-            .and_then(|c| projects.get(c).cloned())
+            .and_then(|c| projects.get(c).map(|p| p.name.clone()))
             .unwrap_or_else(|| {
                 r.cwd
                     .as_deref()
                     .map(|c| c.rsplit('/').next().unwrap_or(c).to_string())
                     .unwrap_or_default()
             });
+        // The agent's own dir (a subagent may work in a worktree of its own), else the session's.
+        let cwd = last_req.cwd.as_deref().or(r.cwd.as_deref());
+        let checkout = Checkout::of(cwd, cwd.and_then(|c| projects.get(c)), branch);
         agents.push(Agent {
             seat: r.seat.clone(),
             seat_label: r.seat_label.clone(),
@@ -324,6 +334,7 @@ pub fn build(
                 .clone()
                 .or_else(|| (r.kind == "workflow").then(|| "workflow".to_string())),
             project,
+            checkout,
             model: last_req.model.or_else(|| r.requested_model.clone()),
             effort: last_req.effort.or_else(|| r.effort.clone()),
             state,
@@ -348,6 +359,30 @@ pub fn build(
     }
 
     reads.agents = next;
+
+    // Live sessions that work in the same checkout (no worktree between them); only those
+    // sessions' agents carry the count.
+    let at_work = |a: &Agent| {
+        live_keys.contains(&(a.seat.clone(), a.session_id.clone()))
+            && !matches!(a.state, State::Done | State::Gone)
+    };
+    let shared =
+        checkout::sessions_per_root(agents.iter().filter(|a| at_work(a)).filter_map(|a| {
+            let c = a.checkout.as_ref()?;
+            Some(((&a.seat, &a.session_id), c.root.as_str()))
+        }));
+    let counts: Vec<u32> = agents
+        .iter()
+        .map(|a| match (&a.checkout, at_work(a)) {
+            (Some(c), true) => shared.get(&c.root).copied().unwrap_or(0),
+            (Some(_), false) | (None, _) => 0,
+        })
+        .collect();
+    for (a, n) in agents.iter_mut().zip(counts) {
+        if let Some(c) = a.checkout.as_mut() {
+            c.sessions = n;
+        }
+    }
 
     // Main threads waiting on their background agents.
     for i in 0..agents.len() {
@@ -477,9 +512,14 @@ pub fn build(
                 cost,
                 model,
             } = d;
+            // A worktree is named after its project (`shop/fix-1`).
             let project = cwd
                 .as_ref()
-                .and_then(|c| projects.get(c).cloned())
+                .and_then(|c| projects.get(c))
+                .map(|p| match Checkout::of(None, Some(p), None) {
+                    Some(c) => c.label(&p.name),
+                    None => p.name.clone(),
+                })
                 .unwrap_or_else(|| {
                     cwd.as_deref()
                         .map(|c| c.rsplit('/').next().unwrap_or(c).to_string())
@@ -765,6 +805,7 @@ mod tests {
             name: id.into(),
             agent_type: None,
             project: "p".into(),
+            checkout: None,
             model: None,
             effort: None,
             state,

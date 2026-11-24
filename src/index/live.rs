@@ -57,6 +57,17 @@ pub struct LastRequest {
     pub account: Option<String>,
     /// `Some(1)` when priced, `Some(0)` when the model has no known price, `None` before pricing.
     pub priced: Option<i64>,
+    /// The working directory of the request.
+    pub cwd: Option<String>,
+}
+
+/// What `projects` says about a working directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectDir {
+    pub key: String,
+    pub name: String,
+    /// The linked worktree's root, when the dir is inside one.
+    pub worktree: Option<String>,
 }
 
 /// A tool call that has not finished.
@@ -194,16 +205,38 @@ impl Index {
         Ok(out)
     }
 
-    /// Project name by working directory.
-    pub fn project_names(&self) -> anyhow::Result<HashMap<String, String>> {
-        let mut st = self.conn.prepare_cached("SELECT cwd, name FROM projects")?;
-        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    /// The project (and worktree) of every working directory.
+    pub fn project_dirs(&self) -> anyhow::Result<HashMap<String, ProjectDir>> {
+        let mut st = self
+            .conn
+            .prepare_cached("SELECT cwd, key, name, worktree FROM projects")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                ProjectDir {
+                    key: r.get(1)?,
+                    name: r.get(2)?,
+                    worktree: r.get(3)?,
+                },
+            ))
+        })?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The git branch the agent works on now (its latest `branches` row).
+    pub fn agent_branch(&self, a: AgentKey) -> anyhow::Result<Option<String>> {
+        let mut st = self.conn.prepare_cached(
+            "SELECT branch FROM branches WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3
+             ORDER BY from_ts DESC LIMIT 1",
+        )?;
+        Ok(st
+            .query_row(params![a.seat, a.session_id, a.agent_id], |x| x.get(0))
+            .optional()?)
     }
 
     pub fn last_request(&self, a: AgentKey) -> anyhow::Result<Option<LastRequest>> {
         let mut st = self.conn.prepare_cached(
-            "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid, priced FROM requests
+            "SELECT model, effort, ts, input + cw5 + cw1h + cread, account_uuid, priced, cwd FROM requests
              WHERE seat = ?1 AND session_id = ?2 AND agent_id = ?3 AND model != '<synthetic>'
              ORDER BY ts DESC LIMIT 1",
         )?;
@@ -216,6 +249,7 @@ impl Index {
                     context_tokens: x.get(3)?,
                     account: x.get(4)?,
                     priced: x.get(5)?,
+                    cwd: x.get(6)?,
                 })
             })
             .optional()?)

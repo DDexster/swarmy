@@ -18,6 +18,11 @@ release workflow takes a release's notes from its section here.
   logins between agy seats; a login only goes into seats of its harness.
 - LIMITS · SEATS groups seats and logins per harness; MODELS shows which harness ran a model;
   BURN splits today's spend per harness.
+- **Worktrees and branches**: SWARM names a session's checkout (`shop/fix-1` for a linked git
+  worktree), its branch, and `⇄N` when several live sessions work in the same checkout; the
+  AGENT card has a checkout line; PROJECTS shows the share of spend made in worktrees (IN WT);
+  `g` groups by checkout; `report --by worktree`, `--by branch` and `--checkout worktrees|main`.
+  The index is read again once (cache version 7) to pick up the branches.
 - Accounts: the organization migration keeps parked organizations apart, finishes an
   interrupted re-attribution, and completes `session-owner` records that have no organization.
 

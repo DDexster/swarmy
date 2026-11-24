@@ -14,6 +14,8 @@ pub mod agy_summaries;
 pub mod archive;
 #[cfg(test)]
 pub(crate) mod archive_scenarios;
+#[cfg(test)]
+mod checkout_scenarios;
 pub mod compact;
 #[cfg(test)]
 mod compact_scenarios;

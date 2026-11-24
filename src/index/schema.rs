@@ -4,7 +4,8 @@
 //! When `CACHE_VERSION` changes they are dropped and read again from the transcripts.
 //!
 //! **Dimension tables** label the raw rows and outlive them: sessions (titles, compactions),
-//! agents (type, description, lifetime), the project of each working directory and Claude Code's
+//! agents (type, description, lifetime), the project of each working directory, the git branch
+//! each agent worked on and Claude Code's
 //! own cost totals. A `CACHE_VERSION` change keeps them, because Claude Code deletes transcripts
 //! after `cleanupPeriodDays` (30 by default) and nothing else knows what an old agent was; files
 //! read again merge into them (`COALESCE`, `MIN`, `MAX`, the larger total).
@@ -31,7 +32,7 @@ use crate::core::limits::WindowKind;
 
 /// Version of the raw tables; a change drops them and reads the transcripts again (never the
 /// dimensions or the facts).
-pub const CACHE_VERSION: &str = "6";
+pub const CACHE_VERSION: &str = "7";
 
 /// The first cache version whose dimension tables have today's shape: a database older than that
 /// drops them with the raw tables (they are rebuilt from the transcripts, as before the classes
@@ -55,9 +56,10 @@ pub const RAW_TABLES: &[&str] = &[
     "unreadable_files",
 ];
 
-/// What labels the raw rows (sessions, agents, projects, Claude Code's totals): kept across a
+/// What labels the raw rows (sessions, agents, projects, branches, Claude Code's totals): kept across a
 /// `CACHE_VERSION` change, merged into when a file is read again.
-pub const DIMENSION_TABLES: &[&str] = &["sessions", "agents", "projects", "cost_states"];
+pub const DIMENSION_TABLES: &[&str] =
+    &["sessions", "agents", "projects", "branches", "cost_states"];
 
 /// Version of the archive tables (`archive`); each step up has a migration in
 /// `migrate_archive`.
@@ -309,6 +311,17 @@ CREATE TABLE IF NOT EXISTS projects (
   key TEXT NOT NULL,
   name TEXT NOT NULL,
   worktree TEXT
+);
+
+-- The git branch an agent worked on, from `from_ts` (epoch ms) until its next row: one row per
+-- change of the transcripts' `gitBranch`, so it outlives the raw rows and labels the rollups.
+CREATE TABLE IF NOT EXISTS branches (
+  seat TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  from_ts INTEGER NOT NULL,
+  branch TEXT NOT NULL CHECK (branch != ''),
+  PRIMARY KEY (seat, session_id, agent_id, from_ts)
 );
 
 CREATE TABLE IF NOT EXISTS cost_states (
@@ -965,10 +978,10 @@ mod tests {
         // A cache of the current version written before the cost parts, the natural keys and
         // the compaction events existed: its rows stay (their transcripts may be gone).
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(
+        c.execute_batch(&format!(
             "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO meta VALUES ('schema_version', '6'), ('facts_version', '1'), ('price_fp', 'old');",
-        )
+             INSERT INTO meta VALUES ('schema_version', '{CACHE_VERSION}'), ('facts_version', '1'), ('price_fp', 'old');",
+        ))
         .unwrap();
         c.execute_batch(&cache_sql()).unwrap();
         c.execute_batch(
@@ -1152,6 +1165,7 @@ mod tests {
                 "INSERT OR IGNORE INTO sessions(seat, session_id, title) VALUES ('work', 's1', 'old work');
                  INSERT OR IGNORE INTO agents(seat, session_id, agent_id, kind, agent_type) VALUES ('work', 's1', 'a1', 'subagent', 'reviewer');
                  INSERT OR IGNORE INTO projects VALUES ('/w/shop', 'shop', 'shop', NULL);
+                 INSERT OR IGNORE INTO branches VALUES ('work', 's1', 'a1', 1, 'main');
                  INSERT OR IGNORE INTO cost_states VALUES ('work', 's1', 1.5, '{{}}');
                  INSERT OR REPLACE INTO meta VALUES ('projects_rev', 'r'), ('price_fp', 'p'), ('schema_version', '{version}');
                  INSERT OR IGNORE INTO prompts VALUES ('work', 's1', 1, 10);"
@@ -1174,7 +1188,7 @@ mod tests {
         );
         assert_eq!(
             dims(&c),
-            vec![1, 1, 1, 1],
+            vec![1, 1, 1, 1, 1],
             "every dimension table kept its rows"
         );
         assert_eq!(
@@ -1193,7 +1207,7 @@ mod tests {
         for old in ["5", "x"] {
             fill(&c, old);
             assert!(migrate(&c).unwrap());
-            assert_eq!(dims(&c), vec![0, 0, 0, 0], "version {old}");
+            assert_eq!(dims(&c), vec![0, 0, 0, 0, 0], "version {old}");
             assert_eq!(meta(&c, "projects_rev").unwrap(), None);
         }
     }

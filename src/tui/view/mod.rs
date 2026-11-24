@@ -748,6 +748,7 @@ mod tests {
             name: format!("agent {id}"),
             agent_type: None,
             project: "shop".into(),
+            checkout: None,
             model: Some("claude-opus-5-5".into()),
             effort: None,
             state,

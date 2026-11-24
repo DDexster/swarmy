@@ -3,8 +3,9 @@
 use super::*;
 
 const PERIODS: [&str; 4] = ["today", "7d", "30d", "all"];
-const GROUPS: [Dim; 7] = [
+const GROUPS: [Dim; 8] = [
     Dim::Project,
+    Dim::Worktree,
     Dim::Model,
     Dim::AgentType,
     Dim::Account,

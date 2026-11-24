@@ -62,14 +62,19 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
     let show_har = app.multi_harness();
     let har_w: usize = if show_har { 4 } else { 0 };
     let tree_w = |d: u32| if d == 0 { 0 } else { 2 * d as usize };
+    let wide = width >= 150;
     let longest = agents
         .iter()
         .map(|a| {
             tree_w(a.depth)
                 + w(&if a.is_main() {
-                    format!("{} · {}", a.name, a.project)
+                    let mut s = format!("{} · {}{}", a.name, where_label(a), shared_mark(a));
+                    if wide && let Some(b) = branch_note(a) {
+                        s.push_str(&b);
+                    }
+                    s
                 } else {
-                    a.name.clone()
+                    format!("{}{}", a.name, own_worktree(a, &agents).unwrap_or_default())
                 })
         })
         .max()
@@ -95,7 +100,7 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         + 1
         + cost_w
         + 1;
-    let mut name_w = (longest + 2).clamp(16, 52);
+    let mut name_w = (longest + 2).clamp(16, if width >= 250 { 64 } else { 52 });
     let mut act_w = width.saturating_sub(fixed + name_w);
     if act_w < 24 {
         name_w = name_w.saturating_sub(24 - act_w).max(12);
@@ -178,11 +183,6 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
                 if last_in_branch { "└ " } else { "├ " }
             )
         };
-        let name = if a.is_main() {
-            format!("{} · {}", a.name, a.project)
-        } else {
-            a.name.clone()
-        };
         let quiet = matches!(a.state, State::Done | State::Gone | State::Idle);
         let fg = if quiet { th.dim } else { th.fg };
         let elapsed = now - a.since;
@@ -234,21 +234,32 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         spans.push(Span::styled(tree.clone(), Style::new().fg(th.faint)));
         // A session row: its name, then the project in the directory colour.
         let nw = name_w.saturating_sub(w(&tree));
-        if a.is_main() {
-            let first = fit(&a.name, nw);
-            let first = first.trim_end().to_string();
-            let left = nw.saturating_sub(w(&first));
-            spans.push(Span::styled(first, th.bold(fg)));
-            spans.push(Span::styled(
-                fit(&format!(" · {}", a.project), left),
-                if quiet {
-                    Style::new().fg(th.fade(th.dir, 0.35))
-                } else {
-                    th.bold(th.dir)
-                },
-            ));
+        let dir_style = if quiet {
+            Style::new().fg(th.fade(th.dir, 0.35))
         } else {
-            spans.push(Span::styled(fit(&name, nw), Style::new().fg(fg)));
+            th.bold(th.dir)
+        };
+        if a.is_main() {
+            // Name, ` · project/worktree`, `⇄N` when other live sessions share the checkout,
+            // then the branch while there is room.
+            let mut parts = vec![
+                (a.name.clone(), th.bold(fg)),
+                (format!(" · {}", where_label(a)), dir_style),
+            ];
+            let mark = shared_mark(a);
+            if !mark.is_empty() {
+                parts.push((mark, th.bold(th.warn)));
+            }
+            if let Some(b) = branch_note(a) {
+                parts.push((b, Style::new().fg(th.faint)));
+            }
+            spans.extend(fill(parts, nw));
+        } else {
+            let mut parts = vec![(a.name.clone(), Style::new().fg(fg))];
+            if let Some(wt) = own_worktree(a, &agents) {
+                parts.push((wt, dir_style));
+            }
+            spans.extend(fill(parts, nw));
         }
         spans.extend([
             Span::styled(
@@ -394,4 +405,62 @@ pub fn swarm(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     put(f, inner, lines);
+}
+
+/// The project of a session, with its linked worktree (`shop/fix-1`).
+fn where_label(a: &crate::live::Agent) -> String {
+    match &a.checkout {
+        Some(c) => c.label(&a.project),
+        None => a.project.clone(),
+    }
+}
+
+/// ` ⇄N` when N live sessions work in this session's checkout.
+fn shared_mark(a: &crate::live::Agent) -> String {
+    match &a.checkout {
+        Some(c) if c.is_shared() => format!(" ⇄{}", c.sessions),
+        Some(_) | None => String::new(),
+    }
+}
+
+/// ` ⎇ branch`, unless the worktree's name says it.
+fn branch_note(a: &crate::live::Agent) -> Option<String> {
+    let b = a.checkout.as_ref()?.branch_to_show()?;
+    Some(format!(" ⎇ {b}"))
+}
+
+/// ` · worktree` for a subagent that works in another checkout than its session's main thread.
+fn own_worktree(a: &crate::live::Agent, agents: &[&crate::live::Agent]) -> Option<String> {
+    let c = a.checkout.as_ref()?;
+    let wt = c.worktree.as_deref()?;
+    let main = agents
+        .iter()
+        .find(|m| m.is_main() && m.seat == a.seat && m.session_id == a.session_id);
+    let same = main
+        .and_then(|m| m.checkout.as_ref())
+        .is_some_and(|mc| mc.root == c.root);
+    (!same).then(|| format!(" · {wt}"))
+}
+
+/// Pieces of text laid out in `width` columns: cut where the room ends, padded to it.
+fn fill(parts: Vec<(String, Style)>, width: usize) -> Vec<Span<'static>> {
+    let mut left = width;
+    let mut out = Vec::new();
+    for (i, (t, st)) in parts.into_iter().enumerate() {
+        if left == 0 {
+            break;
+        }
+        // Later pieces only when they fit whole; the first one is cut.
+        let piece = if w(&t) <= left {
+            t
+        } else if i <= 1 {
+            fit(&t, left).trim_end().to_string()
+        } else {
+            continue;
+        };
+        left = left.saturating_sub(w(&piece));
+        out.push(Span::styled(piece, st));
+    }
+    out.push(Span::raw(" ".repeat(left)));
+    out
 }

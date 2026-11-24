@@ -94,6 +94,8 @@ pub struct ProjectRow {
     pub requests: u64,
     /// Spend in the previous period of the same length.
     pub prev: f64,
+    /// The part of `period` spent in linked git worktrees.
+    pub in_worktrees: f64,
 }
 
 #[derive(Debug, Clone)]
