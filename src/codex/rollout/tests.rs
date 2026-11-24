@@ -311,6 +311,19 @@ fn the_tail_says_whether_a_turn_runs() {
 }
 
 #[test]
+fn a_patch_target_takes_the_separator_of_its_directory() {
+    assert_eq!(join_like("/w/shop", "src/lib.rs"), "/w/shop/src/lib.rs");
+    assert_eq!(
+        join_like("C:\\w\\shop\\", "src/lib.rs"),
+        "C:\\w\\shop\\src\\lib.rs"
+    );
+    assert!(is_relative("src/lib.rs"));
+    assert!(
+        !is_relative("/w/shop/a.rs") && !is_relative("C:\\w\\a.rs") && !is_relative("\\\\host\\a")
+    );
+}
+
+#[test]
 fn a_code_mode_script_is_named_after_the_tools_it_calls() {
     // Codex 0.172 runs tools from a script, as one `exec` call (seen on a real rollout).
     let script = "const r1 = await tools.exec_command({cmd:\"ls -la\",yield_time_ms:10000});\ntext(r1.output);\nconst r2 = await tools.exec_command({cmd:\"sleep 25 && wc -l notes.txt\",yield_time_ms:30000});\ntext(r2.output);";

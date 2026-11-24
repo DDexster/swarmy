@@ -1,7 +1,7 @@
 # Homebrew formula for the tap koorchik/homebrew-tap (`brew install koorchik/tap/swarmy`).
-# This file is the source of truth: the release workflow fills in @VERSION@, @REPO@ and the
-# @SHA256_*@ checksums from the release's SHA256SUMS (`tools/dist.sh formula`) and commits the
-# result to the tap as Formula/swarmy.rb. Do not edit the tap's copy by hand.
+# This file is the source of truth: the release workflow fills in its placeholders (the version,
+# the repository and the checksums from the release's SHA256SUMS, `tools/dist.sh formula`) and
+# commits the result to the tap as Formula/swarmy.rb. Do not edit the tap's copy by hand.
 class Swarmy < Formula
   desc "Live swarm, spend and limits of Claude Code, Antigravity and Codex agents"
   homepage "@REPO@"

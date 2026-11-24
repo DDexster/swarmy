@@ -124,9 +124,6 @@ impl VaultTx<'_> {
         moving: bool,
     ) -> anyhow::Result<SwitchReport> {
         let target = self.target_for(seat, login_key)?;
-        if let Some(e) = super::unavailable(seat.harness) {
-            return Err(e.into());
-        }
         if target.harness != seat.harness {
             return Err(VaultError::WrongHarness {
                 login: target.label,

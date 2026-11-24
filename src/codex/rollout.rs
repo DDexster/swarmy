@@ -309,6 +309,28 @@ fn summarize_tool(name: &str, args: &Value, input: Option<&str>) -> (String, Opt
     (summary, target)
 }
 
+/// Whether a path a rollout names is relative, whatever system wrote it (`/w`, `C:\\w` and
+/// `\\\\host` are not).
+fn is_relative(p: &str) -> bool {
+    let b = p.as_bytes();
+    !(p.starts_with(['/', '\\']) || (b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()))
+}
+
+/// `rel` under `cwd`, with `cwd`'s separator throughout, so a file a patch names reads the same
+/// as the same file named by another tool (an edit conflict is found by the path).
+fn join_like(cwd: &str, rel: &str) -> String {
+    let sep = if cwd.contains('\\') && !cwd.contains('/') {
+        '\\'
+    } else {
+        '/'
+    };
+    let rel: String = rel
+        .chars()
+        .map(|c| if c == '/' || c == '\\' { sep } else { c })
+        .collect();
+    format!("{}{sep}{rel}", cwd.trim_end_matches(['/', '\\']))
+}
+
 /// A code-mode script (`const r = await tools.exec_command({cmd: "ls -la"}); …`): the tool it
 /// calls (`exec` when it calls several kinds) and its commands, `; `-joined (else the tools).
 /// `None` when it calls no tool.
@@ -554,9 +576,7 @@ fn response_item(
             };
             // `apply_patch` names files relative to the turn's directory.
             let target = match (target, ctx.cwd.as_deref()) {
-                (Some(t), Some(cwd)) if Path::new(&t).is_relative() => {
-                    Some(Path::new(cwd).join(t).to_string_lossy().into_owned())
-                }
+                (Some(t), Some(cwd)) if is_relative(&t) => Some(join_like(cwd, &t)),
                 (t, Some(_) | None) => t,
             };
             ctx.pending_tools.push(ToolUse {
